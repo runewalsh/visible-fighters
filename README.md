@@ -1,2 +1,2 @@
 # Файтеры здоровой девочки-волшебницы
-Coming soon this fall on /dr/.
+Coming this New Year's Eve on /dr/.
