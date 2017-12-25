@@ -1,4 +1,4 @@
-﻿import os, string, pickle, textwrap, math, random, traceback, tempfile, time
+﻿import os, string, pickle, textwrap, math, random, traceback, tempfile, time, bisect
 from collections import namedtuple, OrderedDict
 version = (0, 2)
 
@@ -44,8 +44,27 @@ def plural(n, fmt):
 	# None вместо self вроде работает, не хочу объект создавать
 	return "".join(literal + handle(bracketed) for literal, bracketed, _, _ in string.Formatter.parse(None, fmt))
 
-def clamp(n, a, b):
-	return n if (n >= a) and (n <= b) else b if n > b else a
+class Gender:
+	UNKNOWN, MALE, FEMALE, TOTAL = -1, 0, 1, 2
+
+	# заглушка... можно https://habrahabr.ru/post/120194/ и захардкодить результаты обучения (в bytes-литерал :D), но мне лень искать рефы
+	@staticmethod
+	def detect(name):
+		name = name.lower()
+		if name.endswith(('а', 'я')):
+			return Gender.MALE if name[0] in 'рк' or len(name) >= 2 and name[-2] in 'х' else Gender.FEMALE
+		else:
+			return Gender.MALE
+
+def genderize(g, fmt):
+	def handle(piece): return "" if not piece else piece.split('/', Gender.TOTAL)[g if g != Gender.UNKNOWN else Gender.MALE]
+	return "".join(literal + handle(bracketed) for literal, bracketed, _, _ in string.Formatter.parse(None, fmt))
+
+def clamp(x, a, b): # эти странные конструкции — (бессмысленная) оптимизация общего случая (a <= x <= b) и паранойя x=NaN.
+	return x if (x >= a) and (x <= b) else b if x > b else a
+
+def cut_prefix(s, prefix):
+	return s[len(prefix):] if s.startswith(prefix) else s
 
 # округляет 8.2 до 8 с шансом 80% или 9 с шансом 20%
 def rand_round(x):
@@ -103,10 +122,10 @@ class Test:
 	class Failed(Exception): pass
 	def setup(self): pass
 	def teardown(self): pass
-	def describe(self, *desc): return ""
 
 	cases = None
 	def one(self, *args): raise NotImplementedError("one(*cases[i])")
+	def describe(self, *desc): return ""
 
 	def expect_equal(self, got, expected, name, *desc):
 		desc = self.describe(*desc)
@@ -158,7 +177,6 @@ class Commands:
 					if nodes: new_nodes.extend(node.add(one, func) for node in nodes)
 				node, nodes = None, new_nodes
 
-	# Засрал всё до магии, которую сам с трудом понимаю, зато теперь угадывает "hit body strong" по "h b s", даже если есть другие команды на "h" или "h b".
 	def guess(self, input):
 		def suggestions(matches):
 			# Развернуть детей? Например, развернёт матч "hit body" в гипотетические "hit body strong" и "hit body weak"
@@ -167,7 +185,7 @@ class Commands:
 			# В корне потенциально много команд, так что подсказывать только для частично введённых, т. е. имеющих node.parent.
 			return [node.backtrack() for match in matches for node in (match.childs.values() if match.childs and match.parent and unfold else (match,)) if node.parent]
 
-		matches = [self.root]
+		matches = [self.root] # ведение такого списка позволяет угадать "hit body strong" по "h b s", даже если есть другие команды на "h" или "h b".
 		for subcommand in Commands.split(input):
 			new_matches = []
 			for node in matches:
@@ -203,7 +221,8 @@ class Commands:
 	def classify_sym(sym): return (
 		-1 if sym in string.whitespace else
 		0 if sym in string.ascii_letters or sym in string.digits else
-		1)
+		1 if sym == '?' else
+		2)
 
 	class node:
 		def __init__(self, name, parent):
@@ -245,9 +264,6 @@ class DummyCommands:
 	def add(*args): pass
 
 class CommandsTest(Test):
-	def describe(self, adds, query):
-		return str(adds) + ", " + query
-
 	cases = \
 		(
 			(
@@ -264,6 +280,188 @@ class CommandsTest(Test):
 		for add in adds: cmds.add(*add)
 		for query, expect in queries:
 			self.expect_equal(cmds.guess(query), expect, "guess", adds, query)
+
+	def describe(self, adds, query): return str(adds) + ", " + query
+
+class MultipadMarkupError(Exception): pass
+
+# ОЧЕ МАГИЧЕСКАЯ ФУНКЦИЯ (будет смешно, если такая есть готовая и более удобная).
+# Выравнивает строки по именованным маркерам вида [имя].
+#
+# multipad([
+#     "STR [A]5[B] -> [C]10[D]   [E]$100[F] / [G]1[H]",
+#     "INT [A]10[B] -> [C]15[D]   [E]$150[F] / [G]1[H]",
+#     "SPEED [A]15[B] -> [C]1000[D]   [E]$9999[F] / [G]99[H]"])
+# ->
+#    ["STR    5 ->   10    $100 /  1",
+#     "INT   10 ->   15    $150 /  1",
+#     "SPEED 15 -> 1000   $9999 / 99"]
+#
+# Если перед маркером нет пробела, текст перед ним выравнивается по правому краю.
+# [ эскейпается как [[.
+def multipad(lines):
+	# двусвязный список-реестр маркеров
+	# (...наверное, учитывая, что для has_after сейчас всё равно выполняется линейный обход, можно было бы сделать обычный массив с тем же успехом)
+	first_marker = last_marker = None
+	markers = dict() # отображение имени маркера в узел списка
+
+	# в каждом маркере:
+	# next, prev — следующий и предыдущий элементы списка
+	# occurrences — список фрагментов, заканчивающихся этим маркером (т. е. у которых он в marker)
+	# markers_after_this — только для того, чтобы отловить невыполнимый порядок маркеров, например, в multipad(["[B]zxc[A]vbn[C]", "[A]qwe[B]rty[C]"])
+	# (в принципе, проверку невыполнимости можно вообще убрать, будет просто кривой результат)
+	class Marker:
+		__slots__ = ('next', 'prev', 'occurrences', 'markers_after_this')
+		def __init__(self):
+			self.next, self.prev, self.occurrences, self.markers_after_this = None, None, [], []
+
+		def has_after(self, marker):
+			m = self
+			while m:
+				m = m.next
+				if m is marker: return True
+
+		@property # имя только для ошибок, поэтому лучше не хранить, а искать медленно при необходимости
+		def name(self): return next(name for name, marker in markers.items() if marker is self)
+
+	# фрагмент строки
+	# marker — маркер ПОСЛЕ него
+	# marker_pos — отмеченное маркером место в исходной строке
+	# fragment_index — индекс себя в списке фрагментов
+	class Fragment:
+		__slots__ = ('data', 'marker', 'marker_pos', 'line_index', 'fragment_index')
+		def __init__(self, data, marker, marker_pos, line_index, fragment_index):
+			self.data, self.marker, self.marker_pos, self.line_index, self.fragment_index = data, marker, marker_pos, line_index, fragment_index
+
+	def make_marker_come_after(marker, after):
+		after.markers_after_this.append(marker)
+		if after in marker.markers_after_this:
+			raise MultipadMarkupError(f"Циклическая зависимость между маркерами [{marker.name}] и [{after.name}].")
+		if after.has_after(marker): return
+
+		nonlocal first_marker, last_marker
+		# удалить marker из списка
+		if marker.prev:
+			marker.prev.next = marker.next
+		else:
+			assert marker is first_marker and marker is not last_marker
+			first_marker = marker.next
+			first_marker.prev = None
+
+		if marker.next:
+			marker.next.prev = marker.prev
+		else:
+			assert marker is last_marker and marker is not first_marker
+			last_marker = marker.prev
+			last_marker.next = None
+
+		# вставить marker в список после after
+		marker.next = after.next
+		marker.prev = after
+		after.next  = marker
+		if not marker.next:
+			assert after is last_marker
+			last_marker = marker
+
+	# soup[i] = список фрагментов (Fragment), соответствующих lines[i]
+	soup = []
+
+	for line_index, line in enumerate(lines):
+		i, start, fragments, prev_marker = 0, 0, [], None
+		while i < len(line):
+			if line[i] == '[':
+				if i + 1 < len(line) and line[i + 1] == '[': line = line[:i + 1] + line[i + 2:]; i += 1
+				else:
+					marker_end = line.index(']', i + 1)
+					if marker_end < 0: raise RuntimeError("неэкранированный [: " + line)
+
+					marker_name = line[i+1:marker_end]
+					line = line[:i] + line[marker_end + 1:]
+
+					marker = markers.get(marker_name, None)
+					if not marker:
+						marker = Marker()
+						markers[marker_name] = marker
+						marker.prev = last_marker
+						if last_marker:
+							last_marker.next = marker
+						else:
+							first_marker = marker
+						last_marker = marker
+
+					fragment = Fragment(line[start:i], marker, i, line_index, len(fragments))
+					marker.occurrences.append(fragment)
+					fragments.append(fragment)
+					if prev_marker: make_marker_come_after(marker, prev_marker)
+					prev_marker = marker
+					start = i
+			else:
+				i += 1
+		fragments.append(Fragment(line[start:], None, 0, 0, 0)) # см. (**1)
+		soup.append(fragments)
+
+	# Теперь нужно пройтись по списку маркеров и все их выровнять.
+	marker = first_marker
+	while marker:
+		target_pos = max(fragment.marker_pos for fragment in marker.occurrences)
+
+		for fragment in marker.occurrences:
+			pad_delta = target_pos - fragment.marker_pos
+			if pad_delta == 0: continue
+
+			# эвристика :\ так-то можно было бы управлять какими-нибудь спецсимволами в маркерах...
+			if fragment.data and fragment.data[-1] in ' .': # точка для тестов
+				fragment.data = fragment.data + ' ' * pad_delta
+			else:
+				fragment.data = ' ' * pad_delta + fragment.data
+
+			# -1 — после последних фрагментов строк, т. е. тех, которые Fragment(line[start:], None, 0, 0, 0) (**1),
+			# маркеров нет, а значит, и смещения корректировать не у чего
+			for i in range(fragment.fragment_index, len(soup[fragment.line_index]) - 1):
+				soup[fragment.line_index][i].marker_pos += pad_delta
+
+		marker = marker.next
+
+	return ["".join(frag.data for frag in fragments) for fragments in soup]
+
+def multipad_escape(line):
+	i = 0
+	while i < len(line):
+		if line[i] == '[': line = line[:i+1] + line[i:]; i += 2
+		else: i += 1
+	return line
+
+class MultipadTest(Test):
+	cases = \
+		(
+			(
+				["STR [A]5[B] -> [C]10[D]   [E]$100[F] / [G]1[H]",
+				 "INT [A]10[B] -> [C]15[D]   [E]$150[F] / [G]1[H]",
+				 "SPEED [A]15[B] -> [C]1000[D]   [E]$9999[F] / [G]99[H]"],
+
+				["STR    5 ->   10    $100 /  1",
+				 "INT   10 ->   15    $150 /  1",
+				 "SPEED 15 -> 1000   $9999 / 99"]
+			),
+			(
+				["STR.[A]5[B].->.[C]10[D]...[E]$100[F]./.[G]1[H]",
+				 "INT.[C]10[E].->.[I]15",
+				 "SPEED.[B]15[C].->.....[D]1000[E]....[I]$9999"],
+
+				["STR. 5.->.      10... $100./.1",
+				 "INT.                10.->.15",
+				 "SPEED.  15.->.....1000....$9999"],
+			),
+			(["1[A]2[B]3", "4[B]5[A]6"], ["MultipadMarkupError"])
+		)
+	def one(self, input, expect):
+		try:
+			output = multipad(input)
+		except MultipadMarkupError as e:
+			output = [e.__class__.__name__]
+		self.expect_equal("\n\n" + "\n".join(output), "\n\n" + "\n".join(expect), "output", "\n\n" + "\n".join(input))
+
+	def describe(self, input): return input
 
 def cls():
 	os.system('cls' if os.name == 'nt' else 'clear')
@@ -290,8 +488,7 @@ class Hex:
 		self.applied = True
 
 	def unapply(self):
-		check(self.applied, "not applied", self.ran_out, "not ran_out",
-			self in self.victim.hexes, "hex not in self.hexes", self in self.master.caused_hexes, "hex not in master.caused_hexes")
+		check(self.applied, "not applied", self.ran_out, "not ran_out")
 		self.master.caused_hexes.remove(self)
 		self.victim.hexes.remove(self)
 
@@ -329,8 +526,7 @@ class Hex:
 	def detail(self): return self.do_detail()
 	def do_detail(self): raise NotImplementedError("do_detail")
 
-	def cmd(self): return self.do_cmd()
-	def do_cmd(self): raise NotImplementedError("do_cmd")
+	def cmd(self): raise NotImplementedError("cmd")
 
 	npower = property(lambda self: self.power / self.BASELINE_POWER)
 	BASELINE_POWER = 100
@@ -356,18 +552,18 @@ class RageHex(Hex):
 	def do_detail(self): return \
 		"Увеличивает физическую атаку (x{0}) и любой получаемый урон (x{1}).".format(round(self.physdam_x, 1), round(self.backlash_x, 1))
 
-	def do_cmd(self): return 'rage'
+	def cmd(self): return 'rage'
 
 class RageHexTest(Test):
 	def __init__(self): self.dummy = None
 	def setup(self): self.dummy = RageHex.__new__(RageHex)
-	def describe(self, *desc): return f"power = {self.dummy.power}"
 
 	cases = ((-1000, 1.2, 1.1), (0, 1.2, 1.1), (Hex.BASELINE_POWER, 1.5, 1.2), (1100, 4.5, 2.2), (1267, 5, 2.2), (9999, 5, 2.2))
 	def one(self, power, ref_physdam_x, ref_backlash_x):
 		self.dummy.power = power
 		self.expect_equal(round(self.dummy.physdam_x, 1), ref_physdam_x, "physdam_x")
 		self.expect_equal(round(self.dummy.backlash_x, 1), ref_backlash_x, "backlash_x")
+	def describe(self, *desc): return f"power = {self.dummy.power}"
 
 class DeathWordHex(Hex):
 	def do_finish(self):
@@ -380,7 +576,7 @@ class DeathWordHex(Hex):
 		"Гарантированная смерть через {turns}.\n"\
 		"Вы можете снять этот хекс с помощью Развеивания либо убив мага, наложившего заклинание.".format(turns = plural(self.turns, "{N} ход{/а/ов}"))
 
-	def do_cmd(self): return 'deathword'
+	def cmd(self): return 'deathword'
 	dispellable = True
 
 class Bleeding(Hex):
@@ -402,7 +598,7 @@ class Bleeding(Hex):
 		self.precise_power = Bleeding.decay_power(self.precise_power)
 		self.power = max(1, round(self.precise_power))
 
-	def do_cmd(self): return 'bleeding'
+	def cmd(self): return 'bleeding'
 
 	@staticmethod
 	def decay_power(power): return power * Bleeding.POWER_DECAY
@@ -414,8 +610,20 @@ class Bleeding(Hex):
 	precise_dex_debuff = property(lambda self: 3 * self.npower**0.5)
 	POWER_DECAY = 0.9
 
+# По инстансу на каждое запомненное заклинание у каждого бойца.
 class Spell:
-	pass
+	LIST_ORDER = None
+	@classmethod
+	def name(cls): raise NotImplementedError("name")
+
+	@classmethod
+	def cmd(cls): raise NotImplementedError("cmd")
+
+	@classmethod
+	def mp_cost(cls, self): return cls.do_mp_cost()
+
+	@classmethod
+	def do_mp_cost(cls): raise NotImplementedError("do_mp_cost")
 
 class Upgrade:
 	TARGET_CLASS = property(lambda self: Living)
@@ -446,10 +654,13 @@ class Upgrade:
 	def do_apply(self, target): pass
 	def do_revert(self, target): pass
 
+	def apply_message(self, target): pass
+	def revert_message(self, target): pass
+
 	# Проверяет физическую возможность добавить апгрейд (но не цену в золоте).
 	@classmethod
-	def allow(cls, target):
-		return cls.do_allow(target) and target.enough_ap_for(cls)
+	def allow(cls, target, ignore_ap_cost=None):
+		return cls.do_allow(target) and (ignore_ap_cost or target.enough_ap_for(cls))
 
 	# По умолчанию апгрейд полагается уникальным.
 	@classmethod
@@ -459,9 +670,12 @@ class Upgrade:
 	@classmethod
 	def find(cls, target): return next(cls.find_all(target), None)
 
+	@classmethod
+	def last(cls, target): return next(cls.find_all(target, reverse=True), None)
+
 	# Находит все апгрейды этого типа среди апгрейдов target (например, апгрейды статов можно взять несколько раз)
 	@classmethod
-	def find_all(cls, target): return (up for up in target.upgrades if isinstance(up, cls))
+	def find_all(cls, target, reverse=False): return (up for up in (reversed(target.upgrades) if reverse else target.upgrades) if isinstance(up, cls))
 
 	@classmethod
 	def count(cls, target): return sum(1 for up in cls.find_all(target))
@@ -481,10 +695,20 @@ class Upgrade:
 	def do_gold_cost(cls, target): raise NotImplementedError("do_gold_cost")
 
 	@classmethod
-	def cmd(cls): return cls.do_cmd()
+	def cmd(cls): raise NotImplementedError("cmd")
+
+	def refund(self):
+		check(self.applied, "not applied")
+		return max(1, int(0.5 * self.gold_taken))
 
 	@classmethod
-	def do_cmd(cls): raise NotImplementedError("do_cmd")
+	def sell_accusative(cls, target): raise NotImplementedError("sell_accusative")
+
+	@classmethod
+	def cost_preface(cls, target): raise NotImplementedError("cost_preface")
+
+	@classmethod
+	def shop_label(cls, target): raise NotImplementedError("shop_label")
 
 class FighterUpgrade(Upgrade):
 	TARGET_CLASS = property(lambda self: Fighter)
@@ -502,12 +726,12 @@ class StatUpgrade(FighterUpgrade):
 
 	def do_apply(self, target):
 		rv = target.save_relative_vitals()
-		setattr(target, 'base_' + self.stat, getattr(target, 'base_' + self.stat) + self.amount)
+		setattr(target, 'base_' + self.stat, self.get_base_stat(target) + self.amount)
 		target.restore_relative_vitals(rv)
 
 	def do_revert(self, target):
 		rv = target.save_relative_vitals()
-		setattr(target, 'base_' + self.stat, getattr(target, 'base_' + self.stat) - self.amount)
+		setattr(target, 'base_' + self.stat, self.get_base_stat(target) - self.amount)
 		target.restore_relative_vitals(rv)
 
 	@classmethod
@@ -517,7 +741,25 @@ class StatUpgrade(FighterUpgrade):
 	def do_ap_cost(cls, target): return 1
 
 	@classmethod
-	def do_cmd(cls): return cls.STAT
+	def cmd(cls): return cls.STAT
+
+	@classmethod
+	def get_base_stat(cls, target): return getattr(target, 'base_' + cls.STAT)
+
+	@classmethod
+	def sell_accusative(cls, target): return "({0} -> {1})".format(cls.get_base_stat(target), cls.get_base_stat(target) - cls.AMOUNT)
+
+	@classmethod
+	def genitive_stat(cls): raise NotImplementedError("genitive_stat")
+
+	@classmethod
+	def cost_preface(cls, target):
+		return "Тренировка " + cls.genitive_stat() + " с " + str(cls.get_base_stat(target)) + " до " + str(cls.get_base_stat(target) + cls.AMOUNT) + " стоит"
+
+	@classmethod
+	def shop_label(cls, target):
+		return cls.STAT.upper() + " [cur]" + str(cls.get_base_stat(target)) + "[/cur]" + \
+			(" -> [upd]" + str(cls.get_base_stat(target) + cls.AMOUNT) + "[/upd]" if cls.allow(target, ignore_ap_cost=True) else "") + " "
 
 class StrUpgrade(StatUpgrade):
 	STAT, AMOUNT, LIMIT = 'str', 5, 20
@@ -525,11 +767,27 @@ class StrUpgrade(StatUpgrade):
 	@classmethod
 	def do_gold_cost(cls, target): return 120 + 30 * cls.count(target)
 
+	def apply_message(self, target): return "Ваши мускулы наливаются силой."
+	def revert_message(self, target): return "Ваши мускулы слабеют."
+
+	@classmethod
+	def sell_accusative(cls, target): return "часть своей силы " + super().sell_accusative(target)
+	@classmethod
+	def genitive_stat(cls): return "силы"
+
 class IntUpgrade(StatUpgrade):
 	STAT, AMOUNT, LIMIT = 'int', 5, 20
 
 	@classmethod
 	def do_gold_cost(cls, target): return 135 + 35 * cls.count(target)
+
+	def apply_message(self, target): return "Ваш ум заостряется."
+	def revert_message(self, target): return "Вы начинаете хуже соображать."
+
+	@classmethod
+	def sell_accusative(cls, target): return "часть своего интеллекта " + super().sell_accusative(target)
+	@classmethod
+	def genitive_stat(cls): return "интеллекта"
 
 class DexUpgrade(StatUpgrade):
 	STAT, AMOUNT, LIMIT = 'dex', 5, 20
@@ -537,23 +795,145 @@ class DexUpgrade(StatUpgrade):
 	@classmethod
 	def do_gold_cost(cls, target): return 70 + 25 * cls.count(target)
 
+	def apply_message(self, target): return "Ваши рефлексы улучшаются."
+	def revert_message(self, target): return "Вы чувствуете себя {0}.".format(genderize(target.gender, "неповоротлив{ым/ой}"))
+
+	@classmethod
+	def sell_accusative(cls, target): return "часть своей ловкости " + super().sell_accusative(target)
+
+	@classmethod
+	def genitive_stat(cls): return "ловкости"
+
 class SpeedUpgrade(StatUpgrade):
 	STAT, AMOUNT, LIMIT = 'spd', 30, 150
 
 	@classmethod
 	def do_gold_cost(cls, target): return 150 + 50 * sum(1 for up in cls.find_all(target))
 
+	def apply_message(self, target): return "Ваша кровь бурлит!"
+	def revert_message(self, target): return "Ваша кровь остывает..."
+
+	@classmethod
+	def sell_accusative(cls, target): return "часть своей скорости " + super().sell_accusative(target)
+
+	@classmethod
+	def genitive_stat(cls): return "скорости"
+
+class Firestorm(Spell):
+	LIST_ORDER = 0
+	@classmethod
+	def name(cls): return "Огн. шторм"
+
+	@classmethod
+	def cmd(cls): return 'fstorm'
+
+	@classmethod
+	def do_mp_cost(cls): return 5
+
+class Dispell(Spell):
+	LIST_ORDER = 1
+	@classmethod
+	def name(cls): return "Развеять"
+
+	@classmethod
+	def cmd(cls): return 'dispell'
+
+	@classmethod
+	def do_mp_cost(cls, self): return 2
+
+class Frailness(Spell):
+	LIST_ORDER = 2
+	@classmethod
+	def name(cls): return "Хрупкость"
+
+	@classmethod
+	def cmd(cls): return 'frailness'
+
+	@classmethod
+	def do_mp_cost(cls): return 3
+
 class SpellUpgrade(FighterUpgrade):
-	def __init__(self, spell):
+	SPELL_CLASS = Spell
+	def __init__(self):
 		super().__init__()
-		self.spell = check(spell, isinstance(spell, Spell), "spell?!")
+		self.spell = None
 		self.applied = None
 
 	def do_apply(self, target):
+		check(not self.spell)
+		spell_class = check(self.SPELL_CLASS, issubclass(self.SPELL_CLASS, Spell) and self.SPELL_CLASS is not Spell, "SPELL_CLASSs?!")
+		self.spell = spell_class()
 		target.learn_spell(self.spell)
 
 	def do_revert(self, target):
 		target.forget_spell(self.spell)
+		self.spell = None
+
+	@classmethod
+	def cmd(cls): return 'sp.' + cls.SPELL_CLASS.cmd()
+
+	@classmethod
+	def shop_label(cls, target): return "Заклинание: " + cls.SPELL_CLASS.name()
+
+	@classmethod
+	def sell_accusative(cls, target): return "ваше " + cls.SPELL_CLASS.__name__
+
+	@classmethod
+	def cost_preface(cls, target): return cls.SPELL_CLASS.__name__ + " стоит"
+
+class FirestormSpellUpgrade(SpellUpgrade):
+	SPELL_CLASS = Firestorm
+
+	@classmethod
+	def do_gold_cost(cls, target): return 150
+
+	@classmethod
+	def do_ap_cost(cls, target): return 2
+
+	@classmethod
+	def sell_accusative(cls, target): return "вашу магию Огненного шторма"
+
+	@classmethod
+	def cost_preface(cls, target): return "Вы научитесь применять Огненный шторм за"
+
+	def apply_message(self, target): return "Теперь вы можете обрушить на врагов мощный шторм!"
+	def revert_message(self, target): return "Вы больше не можете управлять огненным вихрем."
+
+class DispellSpellUpgrade(SpellUpgrade):
+	SPELL_CLASS = Dispell
+
+	@classmethod
+	def do_gold_cost(cls, target): return 100
+
+	@classmethod
+	def do_ap_cost(cls, target): return 2
+
+	@classmethod
+	def sell_accusative(cls, target): return "вашу магию Развеивания"
+
+	@classmethod
+	def cost_preface(cls, target): return "Вы научитесь развеивать заклинания за"
+
+	def apply_message(self, target): return "Вы обучаетесь Развеиванию!"
+	def revert_message(self, target): return "Вы больше не можете развеивать заклинания."
+
+class FrailnessSpellUpgrade(SpellUpgrade):
+	SPELL_CLASS = Frailness
+
+	@classmethod
+	def do_gold_cost(cls, target): return 200
+
+	@classmethod
+	def do_ap_cost(cls, target): return 3
+
+	@classmethod
+	def sell_accusative(cls, target): return "вашу магию Хрупкости"
+
+	@classmethod
+	def cost_preface(cls, target): return "Вы научитесь накладывать хрупкость на врагов за"
+
+	def apply_message(self, target): return "Вы обучаетесь заклинанию Хрупкости!"
+	def revert_message(self, target): return "Вы больше не можете ослаблять врагов."
 
 class Ammunition:
 	LIST_ORDER = None
@@ -596,8 +976,7 @@ class Ammunition:
 		if prev:
 			prev.secondary_installations.append(self)
 		else:
-			self.weapon.ammos.append(self)
-			self.weapon.ammos.sort(key=lambda ammo: ammo.LIST_ORDER)
+			self.weapon.ammos.insert(bisect.bisect_right([ammo.LIST_ORDER for ammo in self.weapon.ammos], self.LIST_ORDER), self)
 
 	def uninstall(self, target, upgrade):
 		check(self.weapon, "not installed", self.weapon == target, "target?!", self.upgrade == upgrade, "upgrade?!")
@@ -617,37 +996,62 @@ class Ammunition:
 			self.weapon.ammos.remove(self)
 		self.weapon = self.upgrade = None
 
-	def short_name(self): return self.do_short_name()
-	def do_short_name(self): raise NotImplementedError("do_short_name")
+	def times(self): return 1 + len(self.secondary_installations)
 
-	def cmd(self): return self.do_cmd()
-	def do_cmd(self): raise NotImplementedError("do_cmd")
+	@staticmethod
+	def human_times(times): return times
+
+	@classmethod
+	def name(cls, target): raise NotImplementedError("name")
+	@classmethod
+	def name_up(cls, target, up): return None
+	def short_name(self): raise NotImplementedError("short_name")
+
+	@classmethod
+	def cmd(cls): raise NotImplementedError("cmd")
 
 class IncendiaryAmmunition(Ammunition):
 	LIST_ORDER = 0
 	MAX_CHARGES = Ammunition.INFINITE_CHARGES
 
-	def times(self):
-		return 1 + (len(self.secondary_installations) if self.secondary_installations else 0)
+	@staticmethod
+	def human_times(times): return 3 * times
 
-	def do_short_name(self): return f"заж.+{3 * self.times()}"
-	def do_cmd(self): return 'shoot'
+	@classmethod
+	def name(cls, target): return "зажиг. патроны" + (cls.name_up(target, 0) or "")
+	@classmethod
+	def name_up(cls, target, up):
+		ammo = cls.find(target)
+		times = cls.human_times((ammo.times() if ammo else 0) + up)
+		if times: return f"+{times}"
+	def short_name(self): return f"заж.+{self.human_times(self.times)}"
+
+	@classmethod
+	def cmd(cls): return 'incendiary'
 
 class SilenceAmmunition(Ammunition):
 	LIST_ORDER = 1
 	MAX_CHARGES = 5
 
 	def do_recharge_cost(self): return 50
-	def do_short_name(self): return "тиш."
-	def do_cmd(self): return 'silence'
+	@classmethod
+	def name(cls, target): return "тишина"
+	def short_name(self): return "тиш."
+
+	@classmethod
+	def cmd(cls): return 'silence'
 
 class TimestopAmmunition(Ammunition):
 	LIST_ORDER = 2
 	MAX_CHARGES = 2
 
 	def do_recharge_cost(self): return 100
-	def do_short_name(self): return "врем."
-	def do_cmd(self): return 'timestop'
+	@classmethod
+	def name(cls, target): return "ост. времени"
+	def short_name(self): return "врем."
+
+	@classmethod
+	def cmd(cls): return 'timestop'
 
 class AmmunitionUpgrade(WeaponUpgrade):
 	AMMUNITION_CLASS = Ammunition
@@ -666,6 +1070,31 @@ class AmmunitionUpgrade(WeaponUpgrade):
 		check(self.ammo, "ammo")
 		self.ammo.uninstall(target, self)
 
+	@classmethod
+	def cmd(cls): return 'b.' + cls.AMMUNITION_CLASS.cmd()
+
+	@classmethod
+	def genitive_ammunition_module_name(cls): raise NotImplementedError("genitive_ammunition_module_name")
+
+	@classmethod
+	def sell_accusative(cls, target):
+		return ("снятие усовершенствования модуля " if cls.count(target) > 1 else "модуль ") + cls.genitive_ammunition_module_name()
+
+	@classmethod
+	def cost_preface(cls, target):
+		ammo = cls.AMMUNITION_CLASS.find(target)
+		name_up = ammo and ammo.name_up(target, +1)
+		return ("Усовершенствование" if ammo else "Установка") + " модуля " + cls.genitive_ammunition_module_name() + \
+			(" до " + name_up if name_up else "") + " обойдётся в"
+
+	@classmethod
+	def shop_label(cls, target):
+		name = multipad_escape(target.name) + ": " + cls.AMMUNITION_CLASS.name(target)
+		if cls.allow(target, ignore_ap_cost=True):
+			name_up = cls.AMMUNITION_CLASS.name_up(target, up=+1)
+			if name_up: name += (" -> " if cls.AMMUNITION_CLASS.name_up(target, up=0) else "") + name_up
+		return name
+
 class IncendiaryAmmunitionUpgrade(AmmunitionUpgrade):
 	AMMUNITION_CLASS = IncendiaryAmmunition
 
@@ -679,7 +1108,7 @@ class IncendiaryAmmunitionUpgrade(AmmunitionUpgrade):
 	def do_gold_cost(cls, target): return 100 + 30 * cls.count(target)
 
 	@classmethod
-	def do_cmd(cls): return 'incendiary'
+	def genitive_ammunition_module_name(cls): return "зажигательных патронов"
 
 class SilenceAmmunitionUpgrade(AmmunitionUpgrade):
 	AMMUNITION_CLASS = SilenceAmmunition
@@ -691,7 +1120,7 @@ class SilenceAmmunitionUpgrade(AmmunitionUpgrade):
 	def do_gold_cost(cls, target): return 200
 
 	@classmethod
-	def do_cmd(cls): return 'silence'
+	def genitive_ammunition_module_name(cls): return "патронов тишины"
 
 class TimestopAmmunitionUpgrade(AmmunitionUpgrade):
 	AMMUNITION_CLASS = TimestopAmmunition
@@ -702,11 +1131,7 @@ class TimestopAmmunitionUpgrade(AmmunitionUpgrade):
 	def do_gold_cost(cls, target): return 350
 
 	@classmethod
-	def do_cmd(cls): return 'timestop'
-
-class Gender:
-	MALE   = 0
-	FEMALE = 1
+	def genitive_ammunition_module_name(cls): return "патронов остановки времени"
 
 class Living:
 	ap_limit = property(lambda self: 1 + 2*(self.xl - 1))
@@ -716,13 +1141,18 @@ class Living:
 		self.xl = 1
 		self.ap_used = 0
 		self.name = "Баг"
+		self.gender = Gender.UNKNOWN
 		self.upgrades = []
 
 	def receive_xp(self, amount):
 		self.xp += amount
-		while self.xp >= self.xp_for_levelup(self.xl) and self.xl < self.LEVEL_CAP:
-			self.xp -= self.xp_for_levelup(self.xl)
-			self.level_up()
+		def will_levelup(): return self.xp >= self.xp_for_levelup(self.xl) and self.xl < self.LEVEL_CAP
+		if will_levelup():
+			rv = self.save_relative_vitals()
+			while will_levelup():
+				self.xp -= self.xp_for_levelup(self.xl)
+				self.level_up()
+			self.restore_relative_vitals(rv)
 		if self.xl == self.LEVEL_CAP: self.xp = 0
 
 	def drain_xp(self, amount):
@@ -752,12 +1182,30 @@ class Living:
 
 		return self.ap_used + ap_cost <= self.ap_limit
 
+	def next_percentage(self):
+		return math.floor(self.xp / self.xp_for_levelup(self.xl) * 1000) / 10 if self.xl < self.LEVEL_CAP else None
+
+	def living_desc(self, for_multipad=False):
+		name = self.name + ": "
+		return "{name}{xl}, {ap_mp}умения: {0.ap_used}/{0.ap_limit}".format(
+			self, xl = self.xl_desc(self.xl, self.next_percentage()), name = multipad_escape(name) if for_multipad else name,
+			ap_mp = "[ap]" if for_multipad else "")
+
+	@staticmethod
+	def xl_desc(xl, next_percentage, short=None):
+		lv_word = "lv." if short else "уровень "
+		nx_word = "" if short else "след. "
+		return f"{lv_word}{xl}" + (f" ({nx_word}{next_percentage:.0f}%)" if next_percentage is not None else "")
+
+	def living_desc_pad(self):
+		return len(self.name) + 2
+
 	def save_relative_vitals(self): return None
 	def restore_relative_vitals(self, saved): pass
 
 class Fighter(Living):
 	hp    = property(lambda self: self.cur_hp)
-	mhp   = property(lambda self: max(1, round(self.base_mhp * (1 + (self.str - 10) / 10))))
+	mhp   = property(lambda self: max(1, round((self.base_mhp + 1.5 * (self.xl - 1)) * (1 + (self.str - 10) / 10))))
 	dead  = property(lambda self: self.death_cause)
 	alive = property(lambda self: not self.dead)
 	mp    = property(lambda self: self.cur_mp)
@@ -772,7 +1220,6 @@ class Fighter(Living):
 
 	def __init__(self):
 		Living.__init__(self)
-		self.name     = "Баг"
 		self.base_mhp = 10
 		self.base_mmp = 10
 		self.base_str = 10
@@ -782,11 +1229,11 @@ class Fighter(Living):
 		self.base_ac = 0
 		self.base_ev = 10
 		self.death_cause = None
-		self.gender = Gender.MALE
 
 		self.hexes = set()
 		self.caused_hexes = set()
 		self.weapon = None
+		self.spells = []
 
 		self.cur_hp = self.mhp
 		self.cur_mp = self.mmp
@@ -825,6 +1272,15 @@ class Fighter(Living):
 		self.weapon = weapon
 		if self.weapon: self.weapon.owner = self
 
+	def learn_spell(self, spell):
+		check(spell not in self.spells, "already in spells",
+			all(not isinstance(spell, type(sp)) for sp in self.spells), "duplicate spell",
+			all(not isinstance(sp, type(spell)) for sp in self.spells), "duplicate spell 2")
+		self.spells.insert(bisect.bisect_right([spell.LIST_ORDER for spell in self.spells], spell.LIST_ORDER), spell)
+
+	def forget_spell(self, spell):
+		self.spells.remove(spell)
+
 	# сохранить соотношения HP/MP к максимумам, если какое-то действие потенциально изменит их лимит.
 	relative_vitals = namedtuple('relative_vitals', 'hp, mp')
 	def save_relative_vitals(self): return self.relative_vitals(self.hp / self.mhp, self.mp / self.mmp)
@@ -838,7 +1294,6 @@ class Weapon(Living):
 
 	def __init__(self):
 		Living.__init__(self)
-		self.name = "Баг"
 		self.owner = None
 		self.ammos = []
 
@@ -847,9 +1302,10 @@ class Arena:
 
 class Con:
 	# На данный момент сделано так, что чуть больше нуля даёт [#....] и чуть меньше максимума — [####.]
+	# Также с текущей формулой на [#....] придётся вдвое больше пространства cur, чем на остальные деления (кроме [#####]), ну и ладно, мне лень думать
 	@staticmethod
 	def vital_bar(cur, max, divs=10, fillchar='#', emptychar='.'):
-		fill = int(clamp(divs * (cur / max), 0 if cur <= 0 else 1, divs))
+		fill = int(clamp(divs * (cur / (max or 1)), 0 if cur <= 0 else 1, divs))
 		return "[{0}{1}]".format(fillchar * fill, emptychar * (divs - fill))
 
 	@staticmethod
@@ -857,11 +1313,10 @@ class Con:
 		return fillchar * cur + emptychar * (max - cur)
 
 class VitalBarTest(Test):
-	def describe(self, cur, max): return f"HP = {cur}/{max}"
-
 	cases = ((0, 5, 5, 0), (1, 5, 5, 1), (2, 5, 5, 2), (3, 5, 5, 3), (4, 5, 5, 4), (5, 5, 5, 5), (0.001, 5, 5, 1), (4.999, 5, 5, 4), (1.4, 5, 5, 1))
 	def one(self, cur, max, divs, expect_bars):
 		self.expect_equal(Con.vital_bar(cur, max, divs), "[{0}{1}]".format('#' * expect_bars, '.' * (divs - expect_bars)), "vital_bar", cur, max)
+	def describe(self, cur, max): return f"HP = {cur}/{max}"
 
 class Mode:
 	def __init__(self):
@@ -871,7 +1326,7 @@ class Mode:
 	def process(self):
 		self.do_process()
 
-	def render(self, cmds, emergency=None):
+	def render(self, cmds):
 		self.do_render(cmds)
 		if self.do_prompt: print('\n> ', end='')
 
@@ -924,21 +1379,8 @@ class MainMenu(Mode):
 		game = Game()
 		game.gold = 300
 		game.player = Fighter()
-		game.player.name = "Рика"
 		game.player.set_weapon(Weapon())
-		game.player.weapon.name = "<gun of genocide>"
-		game.player.receive_xp(160)
-		StrUpgrade().apply(game.player, 1, 1)
-		IntUpgrade().apply(game.player, 1, 1)
-		DexUpgrade().apply(game.player, 1, 1)
 		game.next_level = 1
-
-		game.player.weapon.receive_xp(100)
-		TimestopAmmunitionUpgrade().apply(game.player.weapon, 1, 1)
-		IncendiaryAmmunitionUpgrade().apply(game.player.weapon, 1, 1)
-		SilenceAmmunitionUpgrade().apply(game.player.weapon, 1, 1)
-		IncendiaryAmmunitionUpgrade().apply(game.player.weapon, 1, 1)
-
 		self.switch_to(AskName(game))
 
 	Help = \
@@ -951,7 +1393,8 @@ class MainMenu(Mode):
 		                   "на три ваших действия будут приходиться два действия противника.\n"\
 		"\n"\
 		"Между боями вы можете тратить золото на апгрейды в пределах полученного опыта. Золото за даунгрейд компенсируется частично.\n"\
-		"В игре 10 уровней. Сохранение в основной сейв выполняется автоматически, можно переключиться на новый файл скрытой командой backup.\n"\
+		"Сохранение выполняется автоматически. Скрытая команда backup оставляет прежнее сохранение в покое и переключается на новый файл.\n"\
+		"В игре 10 уровней.\n"\
 		"\n"\
 		"Можно сокращать команды до префиксов: heal hp -> h h, b.fire? -> b.f?.\n"\
 		"                                                            ^       ^\n"\
@@ -966,7 +1409,7 @@ class LoadGame(Mode):
 		self.step = None
 
 		name2namesakes = dict()
-		for pv in self.previews:
+		for pv in reversed(self.previews):
 			namesakes = name2namesakes.get(pv.player_name, None)
 			if not namesakes:
 				namesakes = dict()
@@ -980,13 +1423,12 @@ class LoadGame(Mode):
 
 	def do_process(self):
 		# пессимистическая оценка... можно смотреть по точному числу строк, но это будет сложнее
-		# - 10 — число дополнительных строк на экране, помимо описаний
+		# - 10 — число дополнительных строк на экране, помимо описаний (в т. ч. в подтверждении)
 		# LINES + 1 — между описаниями пустая строка
 		# - 1 — в подтверждениях описание сейва дублируется
 		self.step = max(3, (self.term_height - 10) // (Game.Preview.LOAD_SCREEN_DESC_LINES + 1) - 1)
 		if not self.previews:
-			self.revert()
-			self.session.mode.more("Нет сохранений.", do_cls=self.had_previews)
+			self.revert().more("Нет сохранений.", do_cls=self.had_previews)
 
 		if self.first >= self.step and self.first - self.step + self.num_to_show(self.first - self.step) >= self.first + self.num_to_show(self.first):
 			self.first -= self.step
@@ -1006,9 +1448,8 @@ class LoadGame(Mode):
 				try:
 					print(("\n" if index > self.first or self.first > 0 else "") + self.indexed_save_desc(index, desc_pad))
 					break
-				except:
-					print(traceback.format_exc())
-					self.previews[index].bad = True
+				except Exception as e:
+					self.previews[index].bad = e
 			if pv.bad:
 				cmds.add(str(1 + index), self.create_remove_request_handler(index, desc_pad), '?', lambda: self.more("Удалить это сохранение."))
 			else:
@@ -1017,6 +1458,8 @@ class LoadGame(Mode):
 		remove_inscriptions = ['remove <номер>']
 		cmds.add('remove', self.create_remove_by_number_handler(desc_pad),
 			'?', lambda: self.more("Удалить сохранение{0}.".format(" (спросит номер)" if len(self.previews) > 1 else "")))
+		for index in range(self.first, end):
+			cmds.add('remove ' + str(1 + index), self.create_remove_request_handler(index, desc_pad), '?', lambda: self.more("Удалить это сохранение."))
 
 		if len(self.previews) > 1:
 			cmds.add('remove all', self.create_batch_remove_handler(None, "Все"), '?', lambda: self.more("Удалить все сохранения."))
@@ -1024,10 +1467,8 @@ class LoadGame(Mode):
 
 		if any(pv.bad for pv in self.previews):
 			remove_inscriptions.append('remove bad')
-			cmds.add('remove bad', self.create_batch_remove_handler(lambda pv: pv.bad, "Повреждённые"), '?', lambda: self.more("Удалить повреждённые сохранения."))
-
-		for index in range(self.first, end):
-			cmds.add('remove ' + str(1 + index), self.create_remove_request_handler(index, desc_pad), '?', lambda: self.more("Удалить это сохранение."))
+			cmds.add('remove bad', self.create_batch_remove_handler(lambda pv: pv.bad, "Повреждённые", default_yes=True),
+				'?', lambda: self.more("Удалить повреждённые сохранения."))
 
 		if end < len(self.previews):
 			print("\n({0}) (down)".format(f"{1 + end}–{1 + end + self.num_to_show(end) - 1}"))
@@ -1069,7 +1510,7 @@ class LoadGame(Mode):
 	def create_load_request_handler(self, index, desc_pad):
 		pv = self.previews[index]
 		def confirm_load(input, mode):
-			if not input or input.lower() == 'y':
+			if not input or 'yes'.startswith(input):
 				try:
 					with open(pv.save_file_path, 'rb') as f:
 						game = Game.load(f, pv)
@@ -1087,7 +1528,7 @@ class LoadGame(Mode):
 	def create_remove_request_handler(self, index, desc_pad, extra_reverts=0):
 		pv = self.previews[index]
 		def confirm_remove(input, mode):
-			if not input and pv.bad or input.lower() == 'y':
+			if not input and pv.bad or input and 'yes'.startswith(input):
 				if not self.remove_save(index, 1 + extra_reverts): return
 				mode.more("Сохранение удалено.").reverts(2 + extra_reverts)
 			else:
@@ -1113,7 +1554,7 @@ class LoadGame(Mode):
 					else:
 						raise ValueError("Неверный ввод.")
 				except ValueError:
-					mode.more("???").reverts(2)
+					mode.more("Нет таких.").reverts(2)
 
 			if len(self.previews) == 1:
 				self.create_remove_request_handler(0, desc_pad)()
@@ -1121,11 +1562,11 @@ class LoadGame(Mode):
 				self.switch_to(Prompt(f"Какое сохранение удалить? ({1 + self.first} – {1 + self.first + self.num_to_show(self.first) - 1}) ", handle_answer))
 		return remove_by_number
 
-	def create_batch_remove_handler(self, predicate, capitalized_saves_desc):
+	def create_batch_remove_handler(self, predicate, capitalized_saves_desc, default_yes=False):
 		def remove():
 			count = sum(1 for pv in self.previews if not predicate or predicate(pv))
 			def confirm(input, mode):
-				if input.lower() == 'y':
+				if (not input and default_yes) or input and 'yes'.startswith(input):
 					for index in reversed(range(len(self.previews))):
 						if not self.remove_save(index, 1): return
 					mode.more("{0} сохранения удалены.".format(capitalized_saves_desc)).reverts(2)
@@ -1164,12 +1605,13 @@ class MoreMessage(Mode):
 	input_comes = False
 
 class Prompt(MoreMessage):
-	def __init__(self, msg, callback):
+	def __init__(self, msg, callback, lowercase_input=True):
 		super().__init__(msg)
-		self.callback = callback
+		self.callback, self.lowercase_input = callback, lowercase_input
 
 	def do_handle_command(self, cmd):
-		self.callback(cmd.strip(), self)
+		cmd = cmd.strip()
+		self.callback(cmd.lower() if self.lowercase_input else cmd, self)
 		return True
 	input_comes = True
 
@@ -1188,8 +1630,14 @@ class Game:
 		self.player         = None
 		self.next_level     = None
 
+	def enough_gold_for(self, cost):
+		return self.gold >= cost
+
+	def give_gold(self, amount):
+		self.gold += amount
+
 	def take_gold(self, amount):
-		check(self.gold >= amount, "not enough gold")
+		check(self.enough_gold_for(amount), "not enough gold")
 		self.gold -= amount
 
 	@staticmethod
@@ -1206,10 +1654,10 @@ class Game:
 			self.order_key      = order_key or game and game.order_key
 			self.player_name    = game and game.player.name
 			self.player_level   = game and game.player.xl
-			self.player_next    = game and Respite.next_percentage(game.player)
+			self.player_next    = game and game.player.next_percentage()
 			self.weapon_name    = game and game.player.weapon.name
 			self.weapon_level   = game and game.player.weapon.xl
-			self.weapon_next    = game and Respite.next_percentage(game.player.weapon)
+			self.weapon_next    = game and game.player.weapon.next_percentage()
 			self.gold           = game and game.gold
 			self.next_level     = game and game.next_level
 			self.timestamp      = game and time.localtime()
@@ -1228,7 +1676,7 @@ class Game:
 		@staticmethod
 		def from_dict(d):
 			pv = Game.Preview()
-			if not isinstance(d, dict) or len(d) != len(Game.Preview.store_fields) or 'version' not in d:
+			if not isinstance(d, dict) or 'version' not in d or len(d) != len(Game.Preview.store_fields):
 				raise Game.corrupted_save_error()
 
 			if d['version'] != version or d.keys() != Game.Preview.store_fields.keys():
@@ -1249,15 +1697,14 @@ class Game:
 					bad_msg = "Файл повреждён." + (("\n" + pad + bad_msg) if bad_msg else "")
 				return "{0}\n{pad}[{1}]".format(bad_msg, self.save_file_path, pad = pad)
 			else:
-				player_next_desc = f" ({self.player_next:.0f}%)" if self.player_next is not None else ""
-				weapon_next_desc = f" ({self.weapon_next:.0f}%)" if self.weapon_next is not None else ""
 				dup_desc = f"-{self.dup_suffix}" if self.dup_suffix else ""
 				return ("{ts}\n" +
-					"{pad}{pn}{dd} Lv.{pl}{pnx}\n" +
-					"{pad}{wn} Lv.{wl}{wnx}\n{pad}D:{coming} ${gold}").format(
+					"{pad}{pn}{dd} {pl}\n" +
+					"{pad}{wn} {wl}\n" +
+					"{pad}D:{coming} ${gold}").format(
 					ts = time.asctime(self.timestamp),
-					pn = self.player_name, dd = dup_desc, pl = self.player_level, pnx = player_next_desc,
-					wn = self.weapon_name, wl = self.weapon_level, wnx = weapon_next_desc,
+					pn = self.player_name, dd = dup_desc, pl = Living.xl_desc(self.player_level, self.player_next, short=True),
+					wn = self.weapon_name, wl = Living.xl_desc(self.weapon_level, self.weapon_next, short=True),
 					coming = self.next_level, gold = self.gold,
 					pad = pad)
 
@@ -1280,6 +1727,8 @@ class Game:
 			# Папки не существовало
 			pass
 
+		# Более новые сохранения (с большим order_key) будут наверху.
+		result = list(reversed(result)) # а это на случай наличия повреждённых — те, что walk вернула позже, тоже будут выше
 		start = 0
 		for i in range(1, len(result) + 1):
 			if i == len(result) or result[i].bad != result[start].bad:
@@ -1294,10 +1743,7 @@ class Game:
 
 	@staticmethod
 	def generate_order_key():
-		k = -1
-		for pv in Game.load_previews():
-			k = max(k, pv.order_key)
-		return k + 1
+		return max((pv.order_key for pv in Game.load_previews()), default = -1) + 1
 
 	# Придумать основу имени файла. НУЖНО ПОАККУРАТНЕЕ, если игрок назвался чем-то типа ..\
 	def base_filename(self):
@@ -1408,10 +1854,14 @@ class Game:
 		return { k: getattr(self, k) for k in Game.preview_complement_fields }
 
 	@staticmethod
-	def from_preview_and_complement(preview, complement, save_file_path):
+	def load_complement(file):
+		complement = pickle.load(file)
 		if not isinstance(complement, dict): raise Game.corrupted_save_error('complement')
 		if complement.keys() != Game.preview_complement_fields.keys(): raise Game.corrupted_save_error('complement')
+		return complement
 
+	@staticmethod
+	def from_preview_and_complement(preview, complement, save_file_path):
 		g = Game()
 		g.character_uid = preview.character_uid
 		g.order_key     = preview.order_key
@@ -1425,15 +1875,15 @@ class Game:
 		return g
 
 	def save_to(self, file, order_key):
-		preview = Game.Preview(self, order_key=order_key)
-		pickle.dump(preview.to_dict(), file)
-		complement = self.to_complement()
-		pickle.dump(complement, file)
+		pickle.dump(Game.Preview(self, order_key=order_key).to_dict(), file)
+		pickle.dump(self.to_complement(), file)
 
 	@staticmethod
 	def load(file, preview):
+		# чтобы нельзя было читерить на несоответствии preview и complement, заменяя физический сейв при открытом экране загрузки :P
+		# (как вариант, вообще не использовать preview на этом этапе, дублируя всю нужную информацию в complement)
 		true_preview = Game.load_preview(file)
-		complement = pickle.load(file)
+		complement = Game.load_complement(file)
 		return Game.from_preview_and_complement(true_preview, complement, preview.save_file_path)
 
 # Экран между боями.
@@ -1442,22 +1892,10 @@ class Respite(Mode):
 		super().__init__()
 		self.game = game
 
-	@staticmethod
-	def next_percentage(being):
-		return math.floor(being.xp / being.xp_for_levelup(being.xl) * 1000) / 10 if being.xl < being.LEVEL_CAP else None
-
-	def describe_living(self, being):
-		next = Respite.next_percentage(being)
-		desc = "{0.name}: уровень {0.xl}{1}, умения: {0.ap_used}/{0.ap_limit}".format(being, f" ({next:.0f}%)" if next is not None else "")
-		return desc
-
-	def describe_player(self, player, cmds):
-		desc = self.describe_living(player)
-		name_pad = " " * (min(len(player.name), len(player.weapon.name)) + 2)
+	def describe_player(self, player, cmds, pad):
+		desc = player.living_desc()
 
 		need_heal_hp = player.hp < player.mhp
-		need_heal_mp = player.mp < player.mmp
-
 		def dhp_func(d):
 			def modify():
 				if d <= 0:
@@ -1468,97 +1906,100 @@ class Respite(Mode):
 		cmds.add('hp+', dhp_func(+1))
 		cmds.add('hp-', dhp_func(-1))
 
-		def dmp_func(d):
-			def modify():
-				player.cur_mp = clamp(player.cur_mp + d, 0, player.mmp)
-			return modify
-		cmds.add('mp+', dmp_func(+1))
-		cmds.add('mp-', dmp_func(-1))
-
 		desc += "\n" +\
-			name_pad + "HP: " + Con.vital_bar(player.hp, player.mhp) + f" {player.hp}/{player.mhp}"
+			pad + "HP: " + Con.vital_bar(player.hp, player.mhp) + f" {player.hp}/{player.mhp}"
 		if need_heal_hp:
 			cost = clamp(round((1 - player.hp / player.mhp) * 30 + 0.25 * (player.mhp - player.hp)), 1, 50)
 			desc += " восстановить: ${0}".format(cost)
-			if self.game.gold >= cost:
+			if self.game.enough_gold_for(cost):
 				desc += " (heal hp)"
 				def heal_hp():
 					self.game.take_gold(cost)
 					player.cur_hp = player.mhp
+					self.session.cls_once().mode.more("Ваши раны исцелены.")
 				cmds.add('heal hp', heal_hp, '?', lambda: self.more("Полностью восстановить очки здоровья."))
 			else:
 				desc += " :("
 
-		desc += "\n" +\
-			name_pad + "MP: " + Con.vital_bar(player.mp, player.mmp) + f" {player.mp}/{player.mmp}"
-		if need_heal_mp:
-			cost = clamp(round((1 - player.mp / player.mmp) * 20 + 0.25 * (player.mmp - player.mp)), 1, 70)
-			desc += " восстановить: ${0}".format(cost)
-			if self.game.gold >= cost:
-				desc += " (heal mp)"
-				def heal_mp():
-					self.game.take_gold(cost)
-					player.cur_mp = player.mmp
-				cmds.add('heal mp', heal_mp, '?', lambda: self.more("Полностью восстановить ману."))
-			else:
-				desc += " :("
+		if player.spells:
+			def dmp_func(d):
+				def modify():
+					player.cur_mp = clamp(player.cur_mp + d, 0, player.mmp)
+					return modify
+			cmds.add('mp+', dmp_func(+1))
+			cmds.add('mp-', dmp_func(-1))
+
+			need_heal_mp = player.mp < player.mmp
+			desc += "\n" +\
+				pad + "MP: " + Con.vital_bar(player.mp, player.mmp) + f" {player.mp}/{player.mmp}"
+			if need_heal_mp:
+				cost = clamp(round((1 - player.mp / player.mmp) * 20 + 0.25 * (player.mmp - player.mp)), 1, 70)
+				desc += " восстановить: ${0}".format(cost)
+				if self.game.enough_gold_for(cost):
+					desc += " (heal mp)"
+					def heal_mp():
+						self.game.take_gold(cost)
+						player.cur_mp = player.mmp
+						self.session.cls_once().mode.more("Ваша магическая энергия восстановлена.")
+					cmds.add('heal mp', heal_mp, '?', lambda: self.more("Полностью восстановить ману."))
+				else:
+					desc += " :("
 		return desc
 
-	def describe_weapon(self, weapon, cmds):
-		desc = self.describe_living(weapon)
-		name_pad = " " * (min(len(weapon.name), len(weapon.owner.name)) + 2)
+	def describe_weapon(self, weapon, cmds, pad):
+		desc = weapon.living_desc()
 
-		max_short_name_len    = 0
-		max_bullet_bar_len    = 0
-		max_recharge_cost_len = 0
+		lines = []
+		for ammo in weapon.ammos:
+			if ammo.finite_charges:
+				line = "{pad}{bullet_name} [bullets]{bullets} [/bullets]".format(pad = pad,
+					bullet_name = ammo.short_name(),
+					bullets = Con.bullet_bar(ammo.charges, ammo.MAX_CHARGES))
 
-		for pass_ in range(2):
-			for ammo in weapon.ammos:
-				if ammo.finite_charges:
-					if pass_ == 0:
-						max_short_name_len    = max(max_short_name_len, len(ammo.short_name()))
-						max_bullet_bar_len    = max(max_bullet_bar_len, ammo.MAX_CHARGES)
-						if ammo.needs_recharging():
-							max_recharge_cost_len = max(max_recharge_cost_len, len(str(ammo.recharge_cost())))
+				cmd = ammo.cmd()
+				if ammo.has_charges():
+					def make_shoot_func(ammo):
+						def shoot():
+							ammo.draw_charge()
+						return shoot
+					cmds.add('shoot ' + cmd, make_shoot_func(ammo))
+
+				if ammo.needs_recharging():
+					line += "перезарядка: [recharge_cost]${0}[/recharge_cost]".format(ammo.recharge_cost())
+					if self.game.enough_gold_for(ammo.recharge_cost()):
+						def make_reload_func(ammo):
+							def reload():
+								self.game.take_gold(ammo.recharge_cost())
+								ammo.recharge()
+							return reload
+						line += f" [reload_cmd](reload {cmd})"
+						cmds.add('reload ' + cmd, make_reload_func(ammo))
 					else:
-						desc += "\n{pad}{bullet_name} {bullets}".format(
-							pad = name_pad,
-							bullet_name = ammo.short_name().ljust(max_short_name_len),
-							bullets = Con.bullet_bar(ammo.charges, ammo.MAX_CHARGES).ljust(max_bullet_bar_len))
-
-						cmd = ammo.cmd()
-						if ammo.has_charges():
-							def make_shoot_func(ammo):
-								def shoot():
-									ammo.draw_charge()
-								return shoot
-							cmds.add('shoot ' + cmd, make_shoot_func(ammo))
-
-						if ammo.needs_recharging():
-							pad_cost = " " * (max_recharge_cost_len - len(str(ammo.recharge_cost())))
-							desc += " перезарядка: ${0}".format(ammo.recharge_cost()) + pad_cost
-							if self.game.gold >= ammo.recharge_cost():
-								def make_reload_func(ammo):
-									def reload():
-										self.game.take_gold(ammo.recharge_cost())
-										ammo.recharge()
-									return reload
-								desc += f" (reload {cmd})"
-								cmds.add('reload ' + cmd, make_reload_func(ammo))
-							else:
-								desc += " :("
+						line += " :("
+				lines.append(line)
+		if lines: desc += "\n" + "\n".join(multipad(lines))
 		return desc
+
+	def do_process(self):
+		if self.game.player.hp > self.game.player.mhp: self.game.player.cur_hp = self.game.player.mhp
+		if self.game.player.mp > self.game.player.mmp: self.game.player.cur_mp = self.game.player.mmp
 
 	def do_render(self, cmds):
 		game   = self.game
 		player = game.player
+		print("ЛАГЕРЬ")
 		print(f"Золото: ${game.gold} (shop)\n")
-		cmds.add('shop', lambda: self.more("Магазин: TODO"), '?', lambda: self.more("Магазин, где вы можете приобрести или продать апгрейды."))
+		cmds.add('shop', lambda: self.switch_to(Shop(game)), '?', lambda: self.more("Магазин, где вы можете приобрести или продать апгрейды."))
+		cmds.add('gold+', lambda: game.give_gold(100))
+		cmds.add('xp+', lambda: player.receive_xp(10))
+		cmds.add('xp-', lambda: player.drain_xp(10))
+		cmds.add('wxp+', lambda: player.weapon.receive_xp(10))
+		cmds.add('wxp-', lambda: player.weapon.drain_xp(10))
 
-		print(self.describe_player(player, cmds))
-
+		pad = " " * min(player.living_desc_pad(), player.weapon.living_desc_pad())
+		print(self.describe_player(player, cmds, pad))
 		if player.weapon:
-			print("\n" + self.describe_weapon(player.weapon, cmds))
+			print("\n" + self.describe_weapon(player.weapon, cmds, pad))
 
 		print("\nследующий уровень (next)"
 			  "\nвыйти             (quit)")
@@ -1575,46 +2016,144 @@ class Respite(Mode):
 
 	def quit(self):
 		default_yes = self.last_input == 'quit'
+		allow_suicide = self.game.save_file_path
 		def handle_confirmation(input, mode):
-			if input.lower() == 'y' or not input and default_yes:
+			if input and 'yes'.startswith(input) or not input and default_yes:
 				self.game.save_nothrow(mode, then=lambda success, mode: mode.switch_to(MainMenu()))
-			elif input and 'suicide'.startswith(input.lower()):
+			elif input and 'quit'.startswith(input):
+				self.switch_to(MainMenu())
+			elif allow_suicide and input and 'suicide'.startswith(input):
 				if self.game.save_file_path:
 					try:
 						Game.remove_save(self.game.save_file_path)
 						mode.switch_to(MainMenu())
 					except Exception as e:
 						mode.more("Не удалось удалить сохранение.\n" + exception_msg(e)).then(lambda mode: mode.switch_to(MainMenu()))
+			elif input == '?':
+				lines = [
+					"{0}[pad] — выйти с сохранением".format("<enter>" if default_yes else "(y)es"),
+					"(q)uit[pad] — выйти без сохранения (т. е. не запоминать изменения с последнего боя)"]
+				if allow_suicide:
+					lines.append(
+						"(s)uicide[pad] — выйти и стереть сохранение [[{0}]".format(
+							multipad_escape(cut_prefix(self.game.save_file_path, self.game.SAVE_BASE + os.sep))))
+				if not default_yes: lines.append("иначе[pad] — продолжить игру")
+				self.more("\n".join(multipad(lines)))
 			else:
 				mode.revert()
 
-		msg = "Выйти из игры? ({0}/{1}, suicide — не оставлять сохранение) ".format('Y' if default_yes else 'y', 'n' if default_yes else 'N')
+		msg = "Выйти из игры? ({y}/{n}/?) ".format(y = 'Y' if default_yes else 'y', n = 'n' if default_yes else 'N')
 		self.switch_to(Prompt(msg, handle_confirmation))
 
-class AskName(Prompt):
-	def __init__(self, game=None, who=None, cr=True):
-		if not game: game = Game()
-		if not who: who = game.player
-
-		prompt = (
-			"Вам нужно зарегистрироваться, прежде чем вас официально освободят.\nКак вас зовут? " if who == game.player else
-			"{0}Назовите свой автомат, {1}: ".format("\n" if cr else "", game.player.name) if who == game.player.weapon else
-			internalerror(who, "who"))
-		super().__init__(prompt, self.handle_name_input)
+class Shop(Mode):
+	prev_mode = True
+	def __init__(self, game):
+		super().__init__()
 		self.game = game
-		self.who = who
-		self.cr_next = True
+
+	def do_render(self, cmds):
+		game, player, weapon = self.game, self.game.player, self.game.player.weapon
+		print("МАГАЗИН\n" +
+			f"Золото: ${self.game.gold}\n" +
+			"\n".join(multipad([player.living_desc(for_multipad=True), weapon.living_desc(for_multipad=True)])) +
+			"\n")
+
+		print("Апгрейды:")
+
+		def add_upgrade(lines, up, target):
+			line = "    " + up.shop_label(target) + " [/label]"
+			if up.allow(target, ignore_ap_cost=True):
+				gold_cost = up.gold_cost(target)
+				ap_cost   = up.ap_cost(target)
+				enough_gold = game.enough_gold_for(gold_cost)
+				enough_ap   = target.enough_ap_for(ap_cost)
+				def parenthesize_if(str, cond): return f"({str})" if cond else str
+
+				line += parenthesize_if(f"${gold_cost}[/gold]", not enough_gold) + \
+					" [sep]/ [ap]" + \
+					parenthesize_if(str(ap_cost) + "[/ap]", not enough_ap) + \
+					"[/costs] "
+
+			cmd_list = []
+			if up.allow(target) and game.enough_gold_for(gold_cost):
+				cmd = up.cmd() + '+'
+				cmd_list.append(cmd)
+				cmds.add(cmd, self.buy_upgrade_func(target, up), '?', lambda: self.more("Приобрести этот апгрейд."))
+
+			last = up.last(target)
+			if last:
+				cmd = up.cmd() + '-'
+				cmd_list.append(cmd)
+				cmds.add(cmd, self.sell_upgrade_func(target, last), '?', lambda: self.more("Отказаться от этого апгрейда."))
+
+			line += "[cmds]"
+			if cmd_list: line += "(" + ", ".join(cmd_list) + ")"
+			lines.append(line)
+
+		def upgrades_section(ups, target):
+			lines = []
+			for up in ups:
+				add_upgrade(lines, up, target)
+			print("\n".join(multipad(lines)))
+
+		upgrades_section((StrUpgrade, IntUpgrade, DexUpgrade, SpeedUpgrade), player)
+		print()
+		upgrades_section((IncendiaryAmmunitionUpgrade, SilenceAmmunitionUpgrade, TimestopAmmunitionUpgrade), weapon)
+		print()
+		upgrades_section((FirestormSpellUpgrade, DispellSpellUpgrade, FrailnessSpellUpgrade), player)
+
+		print("\nВернуться в лагерь (quit)")
+		cmds.add('quit', lambda: self.revert(), '?', lambda: self.more("Вернуться в лагерь."))
+
+	def buy_upgrade_func(self, target, up_cls):
+		def buy():
+			gold = up_cls.gold_cost(target)
+			def confirm(input, mode):
+				if input and 'yes'.startswith(input):
+					self.game.take_gold(gold)
+					up = up_cls()
+					up.apply(target)
+					self.more(up.apply_message(target) or "Апгрейд приобретён за ${0}.".format(gold)).reverts(2)
+				else:
+					mode.revert()
+			self.switch_to(Prompt("{0} ${1}. Продолжить? (y/N) ".format(up_cls.cost_preface(target), gold), confirm))
+		return buy
+
+	def sell_upgrade_func(self, target, up):
+		def sell():
+			gold = up.refund()
+			def confirm(input, mode):
+				if input and 'yes'.startswith(input):
+					up.revert(target)
+					self.game.give_gold(gold)
+					self.more(up.revert_message(target) or "Апгрейд продан за ${0}.".format(gold)).reverts(2)
+				else:
+					mode.revert()
+			self.switch_to(Prompt("В обмен на {what} вы получите ${gold}. Продолжить? (y/N) ".format(what=up.sell_accusative(target), gold=gold), confirm))
+		return sell
+
+class AskName(Prompt):
+	def __init__(self, game, who=None):
+		self.game, self.who = game, who or game.player
+		prompt = (
+			"Вам нужно зарегистрироваться, прежде чем вас официально освободят.\nКак вас зовут? " if self.who == self.game.player else
+			"\nНазовите свой автомат, {0}: ".format(self.game.player.name) if self.who == self.game.player.weapon else
+			internalerror(self.who, "who"))
+		super().__init__(prompt, self.handle_name_input, lowercase_input=False)
 
 	def handle_name_input(self, input, mode):
 		MIN, MAX = 3, 20
+		gender = Gender.UNKNOWN
 		if not input or MIN <= len(input) <= MAX:
 			if input:
 				name = input[0].capitalize() + input[1:]
-				if input == name:
-					self.cr_next = False
-					return self.complete(name)
+				if input == name: return self.complete_name(name, gender)
 			else:
-				name = self.who.name
+				if self.who == self.game.player:
+					name, gender = "Рика", Gender.FEMALE
+				elif self.who == self.game.player.weapon:
+					name, gender = "Хуец" if self.game.player.gender == Gender.FEMALE else "GAU-17", Gender.MALE
+				else: internalerror(self.who, "who")
 
 			mode.switch_to(Prompt(
 				"{0} {1} (Y/n/q) ".format(
@@ -1622,28 +2161,52 @@ class AskName(Prompt):
 					(f"В ваших руках {name}." if input else f"Имя вашего автомата — {name}.") if self.who == self.game.player.weapon else
 					internalerror(self.who, "who"),
 					"Всё верно?" if input else "Продолжить?"),
-				lambda input, mode: self.handle_name_confirmation(input, mode, name)))
+				lambda input, mode: self.handle_name_confirmation(input, mode, name, gender)))
 		else:
 			mode.more("{0}. Длина имени должна быть от {1} до {2}.".format(
 				plural(len(input), "Введ{ён/ено/ено} {N} символ{/а/ов}"), MIN, plural(MAX, "{N} символ{/а/ов}")))
 
-	def handle_name_confirmation(self, input, mode, name):
-		if not input or input.lower() == 'y':
-			self.complete(name)
-		elif 'quit'.startswith(input.lower()):
+	def handle_name_confirmation(self, input, mode, name, gender):
+		if not input or 'yes'.startswith(input):
+			self.complete_name(name, gender)
+		elif 'quit'.startswith(input):
 			mode.switch_to(MainMenu())
 		else:
 			mode.revert()
 
-	def complete(self, name):
+	def complete_name(self, name, gender):
+		if gender == Gender.UNKNOWN and self.who == self.game.player:
+			default_gender = Gender.detect(name)
+			self.session.switch_to(Prompt(
+				"Вы мальчик или девочка? ({m}/{f}) ".format(
+					m = 'M' if default_gender == Gender.MALE else 'm', f = 'F' if default_gender == Gender.FEMALE else 'f'),
+				lambda input, mode: self.handle_gender_answer(input, mode, name, default_gender)))
+		else:
+			self.complete(name, gender)
+
+	def handle_gender_answer(self, input, mode, name, default_gender):
+		check(self.who == self.game.player, "not player?!")
+		gender = (Gender.MALE if input and 'male'.startswith(input) else
+			Gender.FEMALE if input and 'female'.startswith(input) else
+			default_gender if not input and default_gender != Gender.UNKNOWN else
+			None)
+
+		if gender is not None:
+			self.complete(name, gender)
+		else:
+			mode.revert()
+
+	def complete(self, name, gender):
+		self.who.name, self.who.gender = name, gender
 		if self.who == self.game.player:
-			self.game.player.name = name
-			self.session.switch_to(AskName(self.game, self.game.player.weapon, self.cr_next))
+			self.ask_about_weapon()
 		elif self.who == self.game.player.weapon:
-			self.game.player.weapon.name = name
 			self.game.save_nothrow(self, then=lambda success, mode: mode.switch_to(Respite(self.game)))
 		else:
 			internalerror(self.who, "who")
+
+	def ask_about_weapon(self):
+		self.session.switch_to(AskName(self.game, self.game.player.weapon))
 
 # Ввод-вывод и стек экранов.
 class Session:
@@ -1724,6 +2287,7 @@ class Session:
 
 	def cls_once(self):
 		self.cls_once_requested = True
+		return self
 
 	# Чтобы, например, вложенные more-сообщения корректно убирались, оставляя предыдущие,
 	# экран очищается и всё, что на нём должно было быть — перерисовывается.
@@ -1748,11 +2312,10 @@ def selftest():
 			try:
 				one(*case)
 			except Exception as e:
-				fails.append("Тест {0} #{1} {2}. {3}".format(name, count,
-					"провален" if isinstance(e, Test.Failed) else "упал",
-					''.join(e.args) if isinstance(e, Test.Failed) else traceback.format_exc()))
+				fails.append("Тест {0} #{1} {2}. {3}".format(name, count, "провален" if isinstance(e, Test.Failed) else "упал",
+					str(e) if isinstance(e, Test.Failed) else traceback.format_exc()))
 			count += 1
-		if account: tests.append(name + f" x{count}" if count > 1 else "")
+		if account: tests.append(name + (f" x{count}" if count > 1 else ""))
 
 	if account:
 		ticks = time.clock()
