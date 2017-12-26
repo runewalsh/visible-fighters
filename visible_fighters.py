@@ -1,6 +1,6 @@
-﻿import os, string, pickle, textwrap, math, random, traceback, tempfile, time, bisect
+﻿import sys, os, string, pickle, pickletools, textwrap, math, random, traceback, tempfile, time, bisect, lzma
 from collections import namedtuple, OrderedDict
-version = (0, 2)
+version, save_version = (0, 2), 0
 
 class config:
 	min_term_width, min_term_height = 80, 25
@@ -116,7 +116,7 @@ def wrap(text, width):
 	return '\n'.join(lines)
 
 def exception_msg(e):
-	return str(e) or repr(e)
+	return traceback.format_exc() or str(e) or repr(e)
 
 class Test:
 	class Failed(Exception): pass
@@ -186,21 +186,25 @@ class Commands:
 			return [node.backtrack() for match in matches for node in (match.childs.values() if match.childs and match.parent and unfold else (match,)) if node.parent]
 
 		matches = [self.root] # ведение такого списка позволяет угадать "hit body strong" по "h b s", даже если есть другие команды на "h" или "h b".
-		for subcommand in Commands.split(input):
-			new_matches = []
-			for node in matches:
-				child = node.childs.get(subcommand, None) # точное совпадение
-				if child:
-					new_matches.append(child)
-				else:
-					new_matches.extend(child for cmd, child in node.childs.items() if cmd.startswith(subcommand)) # неточные совпадения
-
+		path = Commands.split(input)
+		for subcommand in path:
+			new_matches = [child for node in matches for cmd, child in node.childs.items() if cmd.startswith(subcommand)]
 			if not new_matches: # введено a b c, когда есть только a b → возврат подсказок по a b
 				return None, None, suggestions(matches) or None
 			matches = new_matches
 
 		for i in range(len(matches)):
 			matches[i] = matches[i].down_to_unambiguous() # однозначные продолжения команды, например, введено hit и есть только hit body
+
+		# Если в какой-то (не промежуточной) команде набралось больше точных совпадений, чем в остальных, выбрать её.
+		# Без этого проваливаются тесты на тему sp- и sp.frailness.
+		best_score, best_index = 0, -1
+		for index, match in enumerate(matches):
+			if match.func:
+				score = match.score(path)
+				if score >= best_score:
+					best_score, best_index = score, index if score > best_score else -1 # больше одного максимума — фейл
+		if best_index >= 0: matches = [matches[best_index]]
 
 		# "or None" — чтобы в тестах можно было проверять на равенство, не заботясь о False или [].
 		return len(matches) == 1 and matches[0].func or None, (len(matches) > 1 or not matches[0].func) and suggestions(matches) or None, None
@@ -240,14 +244,15 @@ class Commands:
 					node.childs[subcommand] = child
 				node = child
 			if node.func: raise RuntimeError("Команда {0} уже определена.".format(node.backtrack()))
-			node.func = func
+			node.func = check(func, func, cmd)
 			return node
 
-		def backtrack(self):
+		def backtrack(self, raw=False):
 			node, path = self, []
 			while node.parent:
 				path.append(node.name)
 				node = node.parent
+			if raw: return path
 
 			# в command? пробел не нужен (можно, но не смотрится), в command subcommand — нужен
 			def choose_separator_before(i):
@@ -258,6 +263,10 @@ class Commands:
 			node = self
 			while not node.func and len(node.childs) == 1 and node.parent: node = next(node for node in node.childs.values())
 			return node
+
+		def score(self, path):
+			track = self.backtrack(raw=True)
+			return sum(int(track[-1-i] == path[i]) for i in range(min(len(track), len(path)))) # количество точных совпадений фрагментов команды
 
 class DummyCommands:
 	@staticmethod
@@ -274,11 +283,13 @@ class CommandsTest(Test):
 					("o t s", ("136", None, None)),
 				)
 			),
+			((("spd-", "A"), ("sp.frailness", "B")), ("sp-", ("A", None, None))),
+			((("sp-", "A"), ("spd-", "B"), ("sp.frailness", "C")), ("sp-", ("A", None, None)))
 		)
 	def one(self, adds, queries):
 		cmds = Commands()
 		for add in adds: cmds.add(*add)
-		for query, expect in queries:
+		for query, expect in queries if isinstance(queries[0], tuple) else (queries,):
 			self.expect_equal(cmds.guess(query), expect, "guess", adds, query)
 
 	def describe(self, adds, query): return str(adds) + ", " + query
@@ -372,7 +383,7 @@ def multipad(lines):
 			if line[i] == '[':
 				if i + 1 < len(line) and line[i + 1] == '[': line = line[:i + 1] + line[i + 2:]; i += 1
 				else:
-					marker_end = line.index(']', i + 1)
+					marker_end = line.find(']', i + 1)
 					if marker_end < 0: raise RuntimeError("неэкранированный [: " + line)
 
 					marker_name = line[i+1:marker_end]
@@ -526,12 +537,23 @@ class Hex:
 	def detail(self): return self.do_detail()
 	def do_detail(self): raise NotImplementedError("do_detail")
 
-	def cmd(self): raise NotImplementedError("cmd")
+	def cmd(self): return self.do_cmd()
+	def do_cmd(self): raise NotImplementedError("do_cmd")
 
 	npower = property(lambda self: self.power / self.BASELINE_POWER)
 	BASELINE_POWER = 100
 	dispellable = False
 	time_based = True
+
+	def __getstate__(self):
+		check(self.applied, "not applied?!")
+		return {k:v for k,v in self.__dict__.items() if k not in ('applied', 'master', 'victim')}
+
+	def __setstate__(self, state):
+		self.__dict__.update(state)
+		self.applied = True
+		self.master.caused_hexes.add(self)
+		self.victim.hexes.add(self)
 
 class RageHex(Hex):
 	#  мин. 1.2x @ pow → 0
@@ -552,7 +574,7 @@ class RageHex(Hex):
 	def do_detail(self): return \
 		"Увеличивает физическую атаку (x{0}) и любой получаемый урон (x{1}).".format(round(self.physdam_x, 1), round(self.backlash_x, 1))
 
-	def cmd(self): return 'rage'
+	def do_cmd(self): return 'rage'
 
 class RageHexTest(Test):
 	def __init__(self): self.dummy = None
@@ -576,7 +598,7 @@ class DeathWordHex(Hex):
 		"Гарантированная смерть через {turns}.\n"\
 		"Вы можете снять этот хекс с помощью Развеивания либо убив мага, наложившего заклинание.".format(turns = plural(self.turns, "{N} ход{/а/ов}"))
 
-	def cmd(self): return 'deathword'
+	def do_cmd(self): return 'deathword'
 	dispellable = True
 
 class Bleeding(Hex):
@@ -598,7 +620,7 @@ class Bleeding(Hex):
 		self.precise_power = Bleeding.decay_power(self.precise_power)
 		self.power = max(1, round(self.precise_power))
 
-	def cmd(self): return 'bleeding'
+	def do_cmd(self): return 'bleeding'
 
 	@staticmethod
 	def decay_power(power): return power * Bleeding.POWER_DECAY
@@ -614,10 +636,14 @@ class Bleeding(Hex):
 class Spell:
 	LIST_ORDER = None
 	@classmethod
-	def name(cls): raise NotImplementedError("name")
+	def name(cls): return cls.do_name()
+	@classmethod
+	def do_name(cls): raise NotImplementedError("do_name")
 
 	@classmethod
-	def cmd(cls): raise NotImplementedError("cmd")
+	def cmd(cls): return cls.do_cmd()
+	@classmethod
+	def do_cmd(cls): raise NotImplementedError("do_cmd")
 
 	@classmethod
 	def mp_cost(cls, self): return cls.do_mp_cost()
@@ -695,20 +721,36 @@ class Upgrade:
 	def do_gold_cost(cls, target): raise NotImplementedError("do_gold_cost")
 
 	@classmethod
-	def cmd(cls): raise NotImplementedError("cmd")
+	def cmd(cls): return cls.do_cmd()
+	@classmethod
+	def do_cmd(cls): raise NotImplementedError("do_cmd")
 
 	def refund(self):
 		check(self.applied, "not applied")
 		return max(1, int(0.5 * self.gold_taken))
 
 	@classmethod
-	def sell_accusative(cls, target): raise NotImplementedError("sell_accusative")
+	def sell_accusative(cls, target): return cls.do_sell_accusative(target)
+	@classmethod
+	def do_sell_accusative(cls, target): raise NotImplementedError("do_sell_accusative")
 
 	@classmethod
-	def cost_preface(cls, target): raise NotImplementedError("cost_preface")
+	def cost_preface(cls, target): return cls.do_cost_preface(target)
+	@classmethod
+	def do_cost_preface(cls, target): raise NotImplementedError("do_cost_preface")
 
 	@classmethod
-	def shop_label(cls, target): raise NotImplementedError("shop_label")
+	def shop_label(cls, target): return cls.do_shop_label(target)
+	@classmethod
+	def do_shop_label(cls, target): raise NotImplementedError("do_shop_label")
+
+	def __getstate__(self):
+		check(self.applied, "not applied?!")
+		return {k:v for k,v in self.__dict__.items() if k not in ('applied', 'target')}
+
+	def __setstate__(self, state):
+		self.__dict__.update(state)
+		self.applied = True
 
 class FighterUpgrade(Upgrade):
 	TARGET_CLASS = property(lambda self: Fighter)
@@ -741,19 +783,19 @@ class StatUpgrade(FighterUpgrade):
 	def do_ap_cost(cls, target): return 1
 
 	@classmethod
-	def cmd(cls): return cls.STAT
+	def do_cmd(cls): return cls.STAT
 
 	@classmethod
 	def get_base_stat(cls, target): return getattr(target, 'base_' + cls.STAT)
 
 	@classmethod
-	def sell_accusative(cls, target): return "({0} -> {1})".format(cls.get_base_stat(target), cls.get_base_stat(target) - cls.AMOUNT)
+	def do_sell_accusative(cls, target): return "({0} -> {1})".format(cls.get_base_stat(target), cls.get_base_stat(target) - cls.AMOUNT)
 
 	@classmethod
 	def genitive_stat(cls): raise NotImplementedError("genitive_stat")
 
 	@classmethod
-	def cost_preface(cls, target):
+	def do_cost_preface(cls, target):
 		return "Тренировка " + cls.genitive_stat() + " с " + str(cls.get_base_stat(target)) + " до " + str(cls.get_base_stat(target) + cls.AMOUNT) + " стоит"
 
 	@classmethod
@@ -771,7 +813,7 @@ class StrUpgrade(StatUpgrade):
 	def revert_message(self, target): return "Ваши мускулы слабеют."
 
 	@classmethod
-	def sell_accusative(cls, target): return "часть своей силы " + super().sell_accusative(target)
+	def do_sell_accusative(cls, target): return "часть своей силы " + super().do_sell_accusative(target)
 	@classmethod
 	def genitive_stat(cls): return "силы"
 
@@ -785,7 +827,7 @@ class IntUpgrade(StatUpgrade):
 	def revert_message(self, target): return "Вы начинаете хуже соображать."
 
 	@classmethod
-	def sell_accusative(cls, target): return "часть своего интеллекта " + super().sell_accusative(target)
+	def do_sell_accusative(cls, target): return "часть своего интеллекта " + super().do_sell_accusative(target)
 	@classmethod
 	def genitive_stat(cls): return "интеллекта"
 
@@ -799,7 +841,7 @@ class DexUpgrade(StatUpgrade):
 	def revert_message(self, target): return "Вы чувствуете себя {0}.".format(genderize(target.gender, "неповоротлив{ым/ой}"))
 
 	@classmethod
-	def sell_accusative(cls, target): return "часть своей ловкости " + super().sell_accusative(target)
+	def do_sell_accusative(cls, target): return "часть своей ловкости " + super().do_sell_accusative(target)
 
 	@classmethod
 	def genitive_stat(cls): return "ловкости"
@@ -814,7 +856,7 @@ class SpeedUpgrade(StatUpgrade):
 	def revert_message(self, target): return "Ваша кровь остывает..."
 
 	@classmethod
-	def sell_accusative(cls, target): return "часть своей скорости " + super().sell_accusative(target)
+	def do_sell_accusative(cls, target): return "часть своей скорости " + super().do_sell_accusative(target)
 
 	@classmethod
 	def genitive_stat(cls): return "скорости"
@@ -822,10 +864,10 @@ class SpeedUpgrade(StatUpgrade):
 class Firestorm(Spell):
 	LIST_ORDER = 0
 	@classmethod
-	def name(cls): return "Огн. шторм"
+	def do_name(cls): return "Огн. шторм"
 
 	@classmethod
-	def cmd(cls): return 'fstorm'
+	def do_cmd(cls): return 'fstorm'
 
 	@classmethod
 	def do_mp_cost(cls): return 5
@@ -833,10 +875,10 @@ class Firestorm(Spell):
 class Dispell(Spell):
 	LIST_ORDER = 1
 	@classmethod
-	def name(cls): return "Развеять"
+	def do_name(cls): return "Развеять"
 
 	@classmethod
-	def cmd(cls): return 'dispell'
+	def do_cmd(cls): return 'dispell'
 
 	@classmethod
 	def do_mp_cost(cls, self): return 2
@@ -844,10 +886,10 @@ class Dispell(Spell):
 class Frailness(Spell):
 	LIST_ORDER = 2
 	@classmethod
-	def name(cls): return "Хрупкость"
+	def do_name(cls): return "Хрупкость"
 
 	@classmethod
-	def cmd(cls): return 'frailness'
+	def do_cmd(cls): return 'frailness'
 
 	@classmethod
 	def do_mp_cost(cls): return 3
@@ -870,16 +912,16 @@ class SpellUpgrade(FighterUpgrade):
 		self.spell = None
 
 	@classmethod
-	def cmd(cls): return 'sp.' + cls.SPELL_CLASS.cmd()
+	def do_cmd(cls): return 'sp.' + cls.SPELL_CLASS.cmd()
 
 	@classmethod
 	def shop_label(cls, target): return "Заклинание: " + cls.SPELL_CLASS.name()
 
 	@classmethod
-	def sell_accusative(cls, target): return "ваше " + cls.SPELL_CLASS.__name__
+	def do_sell_accusative(cls, target): return "ваше " + cls.SPELL_CLASS.__name__
 
 	@classmethod
-	def cost_preface(cls, target): return cls.SPELL_CLASS.__name__ + " стоит"
+	def do_cost_preface(cls, target): return cls.SPELL_CLASS.__name__ + " стоит"
 
 class FirestormSpellUpgrade(SpellUpgrade):
 	SPELL_CLASS = Firestorm
@@ -891,10 +933,10 @@ class FirestormSpellUpgrade(SpellUpgrade):
 	def do_ap_cost(cls, target): return 2
 
 	@classmethod
-	def sell_accusative(cls, target): return "вашу магию Огненного шторма"
+	def do_sell_accusative(cls, target): return "вашу магию Огненного шторма"
 
 	@classmethod
-	def cost_preface(cls, target): return "Вы научитесь применять Огненный шторм за"
+	def do_cost_preface(cls, target): return "Вы научитесь применять Огненный шторм за"
 
 	def apply_message(self, target): return "Теперь вы можете обрушить на врагов мощный шторм!"
 	def revert_message(self, target): return "Вы больше не можете управлять огненным вихрем."
@@ -909,10 +951,10 @@ class DispellSpellUpgrade(SpellUpgrade):
 	def do_ap_cost(cls, target): return 2
 
 	@classmethod
-	def sell_accusative(cls, target): return "вашу магию Развеивания"
+	def do_sell_accusative(cls, target): return "вашу магию Развеивания"
 
 	@classmethod
-	def cost_preface(cls, target): return "Вы научитесь развеивать заклинания за"
+	def do_cost_preface(cls, target): return "Вы научитесь развеивать заклинания за"
 
 	def apply_message(self, target): return "Вы обучаетесь Развеиванию!"
 	def revert_message(self, target): return "Вы больше не можете развеивать заклинания."
@@ -927,10 +969,10 @@ class FrailnessSpellUpgrade(SpellUpgrade):
 	def do_ap_cost(cls, target): return 3
 
 	@classmethod
-	def sell_accusative(cls, target): return "вашу магию Хрупкости"
+	def do_sell_accusative(cls, target): return "вашу магию Хрупкости"
 
 	@classmethod
-	def cost_preface(cls, target): return "Вы научитесь накладывать хрупкость на врагов за"
+	def do_cost_preface(cls, target): return "Вы научитесь накладывать хрупкость на врагов за"
 
 	def apply_message(self, target): return "Вы обучаетесь заклинанию Хрупкости!"
 	def revert_message(self, target): return "Вы больше не можете ослаблять врагов."
@@ -998,36 +1040,52 @@ class Ammunition:
 
 	def times(self): return 1 + len(self.secondary_installations)
 
-	@staticmethod
-	def human_times(times): return times
+	@classmethod
+	def human_times(cls, times): return cls.do_human_times(times)
+	@classmethod
+	def do_human_times(cls, times): return f"+{times}"
 
 	@classmethod
-	def name(cls, target): raise NotImplementedError("name")
+	def name(cls, target): return cls.do_name(target)
 	@classmethod
-	def name_up(cls, target, up): return None
-	def short_name(self): raise NotImplementedError("short_name")
+	def do_name(cls, target): raise NotImplementedError("do_name")
 
 	@classmethod
-	def cmd(cls): raise NotImplementedError("cmd")
+	def name_up(cls, target, up): return cls.do_name_up(target, up)
+	@classmethod
+	def do_name_up(cls, target, up): pass
+
+	def short_name(self): return self.do_short_name()
+	def do_short_name(self): raise NotImplementedError("do_short_name")
+
+	@classmethod
+	def cmd(cls): return cls.do_cmd()
+	@classmethod
+	def do_cmd(cls): raise NotImplementedError("do_cmd")
+
+	def __getstate__(self):
+		return {k:v for k, v in self.__dict__.items() if k not in ('weapon',)}
 
 class IncendiaryAmmunition(Ammunition):
 	LIST_ORDER = 0
 	MAX_CHARGES = Ammunition.INFINITE_CHARGES
 
-	@staticmethod
-	def human_times(times): return 3 * times
+	@classmethod
+	def do_human_times(cls, times): return f"+{3 * times}"
 
 	@classmethod
-	def name(cls, target): return "зажиг. патроны" + (cls.name_up(target, 0) or "")
+	def do_name(cls, target): return "зажиг. патроны" + (cls.name_up(target, 0) or "")
+
 	@classmethod
-	def name_up(cls, target, up):
+	def do_name_up(cls, target, up):
 		ammo = cls.find(target)
-		times = cls.human_times((ammo.times() if ammo else 0) + up)
-		if times: return f"+{times}"
-	def short_name(self): return f"заж.+{self.human_times(self.times)}"
+		times = (ammo.times() if ammo else 0) + up
+		return times and cls.human_times(times)
+
+	def do_short_name(self): return f"заж.+{self.human_times(self.times)}"
 
 	@classmethod
-	def cmd(cls): return 'incendiary'
+	def do_cmd(cls): return 'incendiary'
 
 class SilenceAmmunition(Ammunition):
 	LIST_ORDER = 1
@@ -1035,11 +1093,11 @@ class SilenceAmmunition(Ammunition):
 
 	def do_recharge_cost(self): return 50
 	@classmethod
-	def name(cls, target): return "тишина"
-	def short_name(self): return "тиш."
+	def do_name(cls, target): return "тишина"
+	def do_short_name(self): return "тиш."
 
 	@classmethod
-	def cmd(cls): return 'silence'
+	def do_cmd(cls): return 'silence'
 
 class TimestopAmmunition(Ammunition):
 	LIST_ORDER = 2
@@ -1047,11 +1105,11 @@ class TimestopAmmunition(Ammunition):
 
 	def do_recharge_cost(self): return 100
 	@classmethod
-	def name(cls, target): return "ост. времени"
-	def short_name(self): return "врем."
+	def do_name(cls, target): return "ост. времени"
+	def do_short_name(self): return "врем."
 
 	@classmethod
-	def cmd(cls): return 'timestop'
+	def do_cmd(cls): return 'timestop'
 
 class AmmunitionUpgrade(WeaponUpgrade):
 	AMMUNITION_CLASS = Ammunition
@@ -1071,28 +1129,34 @@ class AmmunitionUpgrade(WeaponUpgrade):
 		self.ammo.uninstall(target, self)
 
 	@classmethod
-	def cmd(cls): return 'b.' + cls.AMMUNITION_CLASS.cmd()
+	def do_cmd(cls): return 'b.' + cls.AMMUNITION_CLASS.cmd()
 
 	@classmethod
 	def genitive_ammunition_module_name(cls): raise NotImplementedError("genitive_ammunition_module_name")
 
 	@classmethod
-	def sell_accusative(cls, target):
-		return ("снятие усовершенствования модуля " if cls.count(target) > 1 else "модуль ") + cls.genitive_ammunition_module_name()
+	def do_sell_accusative(cls, target):
+		msg = ("снятие усовершенствования модуля " if cls.count(target) > 1 else "ваш модуль ") + cls.genitive_ammunition_module_name()
+		cur = cls.AMMUNITION_CLASS.name_up(target, 0)
+		targ = cls.AMMUNITION_CLASS.name_up(target, -1)
+		if cur and targ: msg += " (" + cur + " -> " + targ + ")"
+		elif cur: msg += cur
+		return msg
 
 	@classmethod
-	def cost_preface(cls, target):
+	def do_cost_preface(cls, target):
 		ammo = cls.AMMUNITION_CLASS.find(target)
-		name_up = ammo and ammo.name_up(target, +1)
+		cur  = ammo and ammo.name_up(target, 0)
+		targ = ammo and ammo.name_up(target, +1)
 		return ("Усовершенствование" if ammo else "Установка") + " модуля " + cls.genitive_ammunition_module_name() + \
-			(" до " + name_up if name_up else "") + " обойдётся в"
+			((" с " + cur if cur else "") + " до " + targ if targ else "") + " обойдётся в"
 
 	@classmethod
 	def shop_label(cls, target):
 		name = multipad_escape(target.name) + ": " + cls.AMMUNITION_CLASS.name(target)
 		if cls.allow(target, ignore_ap_cost=True):
-			name_up = cls.AMMUNITION_CLASS.name_up(target, up=+1)
-			if name_up: name += (" -> " if cls.AMMUNITION_CLASS.name_up(target, up=0) else "") + name_up
+			targ = cls.AMMUNITION_CLASS.name_up(target, up=+1)
+			if targ: name += (" -> " if cls.AMMUNITION_CLASS.name_up(target, up=0) else "") + targ
 		return name
 
 class IncendiaryAmmunitionUpgrade(AmmunitionUpgrade):
@@ -1203,6 +1267,10 @@ class Living:
 	def save_relative_vitals(self): return None
 	def restore_relative_vitals(self, saved): pass
 
+	def __setstate__(self, state):
+		self.__dict__.update(state)
+		for up in self.upgrades: up.target = self
+
 class Fighter(Living):
 	hp    = property(lambda self: self.cur_hp)
 	mhp   = property(lambda self: max(1, round((self.base_mhp + 1.5 * (self.xl - 1)) * (1 + (self.str - 10) / 10))))
@@ -1288,6 +1356,14 @@ class Fighter(Living):
 		self.cur_hp = clamp(round(self.mhp * saved.hp), 1, self.mhp)
 		self.cur_mp = clamp(round(self.mmp * saved.mp), 1, self.mmp)
 
+	def __getstate__(self):
+		return {k:v for k, v in self.__dict__.items() if k not in ('hexes', 'caused_hexes')}
+
+	def __setstate__(self, state):
+		self.__init__()
+		super().__setstate__(state)
+		self.weapon.owner = self
+
 class Weapon(Living):
 	ap_limit = property(lambda self: 1 + (self.xl - 1))
 	LEVEL_CAP = 5
@@ -1296,6 +1372,13 @@ class Weapon(Living):
 		Living.__init__(self)
 		self.owner = None
 		self.ammos = []
+
+	def __getstate__(self):
+		return {k:v for k, v in self.__dict__.items() if k not in ('owner',)}
+
+	def __setstate__(self, state):
+		super().__setstate__(state)
+		for ammo in self.ammos: ammo.weapon = self
 
 class Arena:
 	pass
@@ -1617,8 +1700,9 @@ class Prompt(MoreMessage):
 
 # Прогресс игрока и информация о сейве.
 class Game:
-	SAVE_BASE = os.path.join(os.path.dirname(__file__), 'save')
-	SAVE_SUFFIX = ".sav"
+	SAVE_BASE, SAVE_SUFFIX = os.path.join(os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__), 'save'), ".sav"
+	LZMA_OPTIONS = {"format": lzma.FORMAT_RAW, "filters": [{"id": lzma.FILTER_LZMA2, "preset": lzma.PRESET_DEFAULT}]}
+	SIGNATURE = b'.*%$)ebcq%*+'
 
 	def __init__(self):
 		# Для отслеживания сохранений с одинаковыми именами персонажей.
@@ -1640,15 +1724,20 @@ class Game:
 		check(self.enough_gold_for(amount), "not enough gold")
 		self.gold -= amount
 
+	class BadSaveError(Exception): pass
 	@staticmethod
 	def corrupted_save_error(what=None):
-		return Exception("Сохранение повреждено{0}.".format(f" ({what})" if what else ""))
+		return Game.BadSaveError("Сохранение повреждено{0}.".format(f" ({what})" if what else ""))
 
-	# Превью для быстрой загрузки. Сохранение состоит из Preview.to_dict() и Game.to_complement()
+	@staticmethod
+	def read_signature(f):
+		if f.read(len(Game.SIGNATURE)) != bytes(b^i for i, b in enumerate(Game.SIGNATURE, 22)):
+			raise Game.corrupted_save_error()
+
+	# Превью для быстрой загрузки. Сохранение состоит из Preview.to_list() и Game.to_complement()
 	class Preview:
 		def __init__(self, game=None, order_key=None, bad=None):
 			self.bad            = bad
-			self.version        = version
 			self.save_file_path  = None # выставляется в load_previews
 			self.character_uid  = game and game.character_uid
 			self.order_key      = order_key or game and game.order_key
@@ -1663,29 +1752,33 @@ class Game:
 			self.timestamp      = game and time.localtime()
 			self.dup_suffix     = None # приписывать -2, -3, etc. для одинаковых имён разных персонажей
 
-		store_fields = {
-			'version': tuple,
-			'character_uid': str, 'order_key': int,
-			'player_name': str, 'player_level': int, 'player_next': (float, type(None)),
-			'weapon_name': str, 'weapon_level': int, 'weapon_next': (float, type(None)),
-			'gold': int, 'next_level': int, 'timestamp': time.struct_time }
+		store_fields = [('character_uid', int), ('order_key', int),
+			('player_name', str), ('player_level', int), ('player_next', (int, type(None))),
+			('weapon_name', str), ('weapon_level', int), ('weapon_next', (int, type(None))),
+			('gold', int), ('next_level', int), ('timestamp', int)]
 
-		def to_dict(self):
-			return { k: getattr(self, k) for k in Game.Preview.store_fields }
+		def to_list(self):
+			return [save_version] + [
+				int(time.mktime(self.timestamp)) if field == 'timestamp' else
+				(round(getattr(self, field) * 10) if getattr(self, field) is not None else None) if field in ('player_next', 'weapon_next') else
+				getattr(self, field)
+				for field, _ in Game.Preview.store_fields]
 
 		@staticmethod
-		def from_dict(d):
+		def from_list(d):
 			pv = Game.Preview()
-			if not isinstance(d, dict) or 'version' not in d or len(d) != len(Game.Preview.store_fields):
+			if not isinstance(d, list) or len(d) < 1:
 				raise Game.corrupted_save_error()
 
-			if d['version'] != version or d.keys() != Game.Preview.store_fields.keys():
-				raise Exception("Несовместимая версия сохранения.")  # хотя можно и совместимость устроить... даже просто не проверять
+			if d[0] != save_version or len(d) != 1 + len(Game.Preview.store_fields):
+				raise Game.BadSaveError("Несовместимая версия сохранения.")  # хотя можно и совместимость устроить... даже просто не проверять
 
-			for field, field_type in Game.Preview.store_fields.items():
-				value = d[field]
+			for index, (field, field_type) in enumerate(Game.Preview.store_fields, 1):
+				value = d[index]
 				if not isinstance(value, field_type): raise Game.corrupted_save_error(field + ": " + str(type(value)))
-				setattr(pv, field, value)
+				elif field == 'timestamp': pv.timestamp = time.localtime(value)
+				elif field in ('player_next', 'weapon_next'): setattr(pv, field, value / 10 if value else None)
+				else: setattr(pv, field, value)
 			return pv
 
 		LOAD_SCREEN_DESC_LINES = 4
@@ -1693,7 +1786,7 @@ class Game:
 			pad = ' ' * pad
 			if self.bad:
 				bad_msg = self.bad is not True and exception_msg(self.bad)
-				if not bad_msg or bad_msg.index("оврежд") < 0:
+				if not bad_msg or not isinstance(self.bad, Game.BadSaveError):
 					bad_msg = "Файл повреждён." + (("\n" + pad + bad_msg) if bad_msg else "")
 				return "{0}\n{pad}[{1}]".format(bad_msg, self.save_file_path, pad = pad)
 			else:
@@ -1717,7 +1810,9 @@ class Game:
 			for fn in filenames:
 				full = os.path.join(dirpath, fn)
 				try:
-					with open(full, 'rb') as f: preview = Game.load_preview(f)
+					with open(full, 'rb') as f:
+						Game.read_signature(f)
+						preview = Game.load_preview(f)
 				except Exception as e:
 					if not include_bad: continue
 					preview = Game.Preview(bad=e)
@@ -1727,27 +1822,22 @@ class Game:
 			# Папки не существовало
 			pass
 
-		# Более новые сохранения (с большим order_key) будут наверху.
-		result = list(reversed(result)) # а это на случай наличия повреждённых — те, что walk вернула позже, тоже будут выше
-		start = 0
-		for i in range(1, len(result) + 1):
-			if i == len(result) or result[i].bad != result[start].bad:
-				if not result[start].bad: result[start:i] = sorted(result[start:i], key=lambda pv: pv.order_key, reverse=True)
-				start = i
+		# Более новые сохранения (с большим order_key) будут наверху; все повреждённые — в конце, т. е. их order_key полагается 0
+		result.sort(key=lambda pv: 0 if pv.bad else pv.order_key, reverse=True)
 		return result
 
 	@staticmethod
 	def load_preview(file):
-		preview = Game.Preview.from_dict(pickle.load(file))
+		preview = Game.Preview.from_list(pickle.load(file))
 		return preview
 
 	@staticmethod
 	def generate_order_key():
-		return max((pv.order_key for pv in Game.load_previews()), default = -1) + 1
+		return max((pv.order_key for pv in Game.load_previews()), default = 0) + 1
 
 	# Придумать основу имени файла. НУЖНО ПОАККУРАТНЕЕ, если игрок назвался чем-то типа ..\
 	def base_filename(self):
-		check(self.character_uid, "character_uid?!", self.player, "player?!")
+		check(self.player, "player?!")
 		def sanitize(name):
 			return "".join(c if
 				'0' <= c <= '9' or
@@ -1787,8 +1877,10 @@ class Game:
 			pass
 
 		# Придумать character_uid, если его ещё нет.
+		# Единственное, для чего он нужен — суффиксы вида «-2» на экране загрузки для разных персонажей с одинаковыми именами.
+		# Т. о. коллизии не критичны, 2**16 достаточно. Ну не выведется суффикс, когда на самом деле должен быть, подумаешь.
 		if not self.character_uid:
-			self.character_uid = format(random.randrange(2**128), 'x')
+			self.character_uid = 1 + random.randrange(2**16 - 1)
 
 		# Придумать order_key, если его ещё нет, или если нужно сохранить в новый файл.
 		if not self.order_key or to_new_file:
@@ -1849,15 +1941,16 @@ class Game:
 			mode = mode.more("Не удалось сохранить игру.\n" + exception_msg(e))
 			if then: mode.then(lambda mode: then(False, mode))
 
-	preview_complement_fields = { 'player': Fighter }
+	preview_complement_fields = [('player', Fighter)]
 	def to_complement(self):
-		return { k: getattr(self, k) for k in Game.preview_complement_fields }
+		return [getattr(self, k) for k, _ in Game.preview_complement_fields]
 
 	@staticmethod
 	def load_complement(file):
 		complement = pickle.load(file)
-		if not isinstance(complement, dict): raise Game.corrupted_save_error('complement')
-		if complement.keys() != Game.preview_complement_fields.keys(): raise Game.corrupted_save_error('complement')
+		if not isinstance(complement, list) or len(complement) != len(Game.preview_complement_fields): raise Game.corrupted_save_error('complement')
+		for index, (field, field_type) in enumerate(Game.preview_complement_fields):
+			if not isinstance(complement[index], field_type): raise Game.corrupted_save_error(field + ": " + str(type(complement[index])))
 		return complement
 
 	@staticmethod
@@ -1867,23 +1960,27 @@ class Game:
 		g.order_key     = preview.order_key
 		g.gold          = preview.gold
 		g.next_level    = preview.next_level
-		for k in Game.preview_complement_fields:
-			setattr(g, k, complement[k])
+		for index, (k, _) in enumerate(Game.preview_complement_fields):
+			setattr(g, k, complement[index])
 
 		g.save_file_path = save_file_path
 		g.save_file_base_name = g.base_filename()
 		return g
 
 	def save_to(self, file, order_key):
-		pickle.dump(Game.Preview(self, order_key=order_key).to_dict(), file)
-		pickle.dump(self.to_complement(), file)
+		file.write(bytes(b^i for i, b in enumerate(Game.SIGNATURE, 22)))
+		file.write(pickletools.optimize(pickle.dumps(Game.Preview(self, order_key=order_key).to_list(), protocol=-1)))
+		with lzma.open(file, 'wb', **Game.LZMA_OPTIONS) as file:
+			file.write(pickletools.optimize(pickle.dumps(self.to_complement(), protocol=-1)))
 
 	@staticmethod
 	def load(file, preview):
+		Game.read_signature(file)
 		# чтобы нельзя было читерить на несоответствии preview и complement, заменяя физический сейв при открытом экране загрузки :P
 		# (как вариант, вообще не использовать preview на этом этапе, дублируя всю нужную информацию в complement)
 		true_preview = Game.load_preview(file)
-		complement = Game.load_complement(file)
+		with lzma.open(file, 'rb', **Game.LZMA_OPTIONS) as file:
+			complement = Game.load_complement(file)
 		return Game.from_preview_and_complement(true_preview, complement, preview.save_file_path)
 
 # Экран между боями.
@@ -1926,6 +2023,7 @@ class Respite(Mode):
 				def modify():
 					player.cur_mp = clamp(player.cur_mp + d, 0, player.mmp)
 					return modify
+				return modify
 			cmds.add('mp+', dmp_func(+1))
 			cmds.add('mp-', dmp_func(-1))
 
@@ -2032,10 +2130,10 @@ class Respite(Mode):
 			elif input == '?':
 				lines = [
 					"{0}[pad] — выйти с сохранением".format("<enter>" if default_yes else "(y)es"),
-					"(q)uit[pad] — выйти без сохранения (т. е. не запоминать изменения с последнего боя)"]
+					"(q)uit[pad] — |выйти без сохранения (т. е. не запоминать изменения с последнего боя)"]
 				if allow_suicide:
 					lines.append(
-						"(s)uicide[pad] — выйти и стереть сохранение [[{0}]".format(
+						"(s)uicide[pad] — |выйти и стереть сохранение [[{0}]".format(
 							multipad_escape(cut_prefix(self.game.save_file_path, self.game.SAVE_BASE + os.sep))))
 				if not default_yes: lines.append("иначе[pad] — продолжить игру")
 				self.more("\n".join(multipad(lines)))
