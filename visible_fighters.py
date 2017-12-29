@@ -1,9 +1,11 @@
-﻿import sys, os, string, pickle, pickletools, textwrap, math, random, traceback, tempfile, time, bisect, lzma
-from collections import namedtuple, OrderedDict
+﻿import sys, os, string, tempfile, pickle, pickletools, lzma, textwrap, math, random, traceback, time, bisect, enum, base64, collections
 version, save_version = (0, 2), 0
 
 class config:
 	min_term_width, min_term_height = 80, 25
+
+# FORMAT_RAW не хранит эти настройки в сжатом потоке, поэтому для распаковки нужно указать те же, которыми упаковывались.
+LZMA_OPTIONS = {"format": lzma.FORMAT_RAW, "filters": [{"id": lzma.FILTER_LZMA2, "preset": lzma.PRESET_DEFAULT}]}
 
 def internalerror(*args):
 	if len(args) == 1: raise AssertionError(f"Внутренняя ошибка: {args[0]}.")
@@ -18,6 +20,7 @@ def internalerror(*args):
 
 # 1. check(what, cond, errmsg)
 # Возвращает what, если всё хорошо (cond), иначе возбуждает internalerror.
+# Короче, assert с возвращаемым значением, чтобы всё в одну строку ебашить))0.
 # Например: hp = check(new_hp, new_hp > 0, "недопустимое значение hp").
 #
 # 2. check(условие 1, internalerror при невыполнении условия 1, ...)
@@ -44,27 +47,287 @@ def plural(n, fmt):
 	# None вместо self вроде работает, не хочу объект создавать
 	return "".join(literal + handle(bracketed) for literal, bracketed, _, _ in string.Formatter.parse(None, fmt))
 
-class Gender:
-	UNKNOWN, MALE, FEMALE, TOTAL = -1, 0, 1, 2
+def cap_first(s):
+	return s[:1].upper() + s[1:]
 
-	# заглушка... можно https://habrahabr.ru/post/120194/ и захардкодить результаты обучения (в bytes-литерал :D), но мне лень искать рефы
+# highlight_variant("y/n", 0) = "Y/n"
+def highlight_variant(s, id):
+	return "/".join(part.upper() if i == id else part for i, part in enumerate(s.split("/")))
+
+# Сжимает строку в кашу, которую можно будет записать в исходнике короче оригинала.
+def pack_str(src):
+	return ''.join(chr(b) for b in base64.b64encode(lzma.compress(src.encode('koi8-r'), **LZMA_OPTIONS)))
+
+# Распаковывает результат pack_str.
+def unpack_str(b):
+	return ''.join(lzma.decompress(base64.b64decode(b), **LZMA_OPTIONS).decode('koi8-r'))
+
+# Красивенько форматирует строку, созданную pack_str, в питонье объявление.
+def pretty_decl(s, width, prefix, pad=""):
+	def pieces_gen():
+		pos = max(0, width-len(prefix))
+		yield '"' + s[:pos] + '"' + ("\\" if pos < len(s) else "") if pos > 0 else '\\' if s else '""'
+		yield from (pad + '"' + s[pos:pos+width] + '"' + ("\\" if pos+width < len(s) else "") for pos in range(pos, len(s), width))
+	return pad + prefix + "\n".join(pieces_gen())
+
+# Наивный байесовский классификатор, украденный из https://habrahabr.ru/post/120194/.
+# guess возвращает (1) наиболее вероятный класс и (2) отрыв от предыдущего, приведённый к [0; 1] (могут быть None).
+# Например, пусть он угадывает пол по первой и двум последним буквам имени:
+#
+# guesser = BayesianGuesser(lambda name: ('F'+name[0], 'S'+name[-2], 'L'+name[-1]))
+# guesser.train({'Петя': Gender.MALE, 'Коля': Gender.MALE, 'Вера': Gender.FEMALE, ...})
+# cls, margin = guesser.guess('Витя')
+#
+# Коллбэк, передаваемый в конструктор, должен извлекать из классифицируемого объекта значащие признаки —
+# то, что нейросеть делала бы автоматически... но не тянуть же её для такой ерунды хд, даже то, что есть, перебор.
+# А вообще всё это из рук вон плохо работает, ну да ладно. В качестве моральной компенсации добавил читерскую проверку на точные совпадения.
+class BayesianGuesser:
+	# Чтобы можно было передавать в samples как словарь, так и список пар.
+	def pairs(self, samples): return samples.items() if isinstance(samples, dict) else samples
+
+	def __init__(self, get_feats, samples=None, cheat=True):
+		self.get_feats      = get_feats
+		self.total_samples  = 0
+		self.total_of_class = collections.defaultdict(lambda: 0)
+		self.total_of_cfeat = collections.defaultdict(lambda: 0)
+		self.cheat          = {} if cheat else None
+		if samples: self.train(samples)
+
+	def train(self, samples):
+		for sample, cls in self.pairs(samples):
+			if self.cheat is not None:
+				check(sample, sample not in self.cheat, "уже было") # хотя так-то есть смысл... можно вообще к сэмплам развесовки давать
+				self.cheat[sample] = cls
+
+			self.total_of_class[cls] += 1
+			for feat in filter(None, self.get_feats(sample)):
+				self.total_of_cfeat[cls, feat] += 1
+			self.total_samples += 1
+
+	# cfeat_prob — это P(wi|c) из статьи http://bazhenov.me/blog/2012/06/11/naive-bayes.html.
+	# По ней же добавил сглаживание Лапласа (в Хабро-варианте вместо него использовалась константа 1e-7).
+	# Внимание, я не уверен, действительно ли в знаменателе в качестве множителя должна быть feats_count, а не что-то ещё.
+	# Формула сглаживания отсюда: https://en.wikipedia.org/wiki/Additive_smoothing.
+	SMOOTH = 1.0
+	def cfeat_prob(self, cls, feat, feats_count):
+		return (self.total_of_cfeat[cls, feat] + self.SMOOTH) / (self.total_of_class[cls] + self.SMOOTH * feats_count)
+
+	def guess(self, sample):
+		if not self.total_samples: raise ValueError("Нет образцов!")
+		if self.cheat:
+			precise = self.cheat.get(sample, None)
+			if precise is not None: return precise, 1.0 # можно брать и этим весь класс заменять...
+
+		feats = self.get_feats(sample)
+		n_feats = sum(1 for feat in feats if feat)
+		best_cls = best_prob = second_best_prob = None
+
+		for cls, count in self.total_of_class.items():
+			# Pc для каждого класса можно посчитать один раз после тренировки (classes[cls] в хабро-варианте), но и так сойдёт
+			Pc = count / self.total_samples
+			prob = math.log(Pc) + sum(math.log(self.cfeat_prob(cls, feat, n_feats)) for feat in feats if feat)
+
+			if not best_prob or prob > best_prob:
+				best_cls, best_prob, second_best_prob = cls, prob, best_prob
+			elif not second_best_prob or prob > second_best_prob:
+				second_best_prob = prob
+
+		return best_cls, 1 - math.exp(second_best_prob - best_prob) if second_best_prob else None
+
+	# оценивает точность классификации — нет большого смысла вызывать на тренировочных образцах, результаты будут слишком оптимистичными
+	def success_rate(self, samples):
+		success = total = 0
+		for sample, ref_cls in self.pairs(samples):
+			if self.guess(sample)[0] == ref_cls: success += 1
+			total += 1
+		return success / max(1, total)
+
+class Gender(enum.IntEnum):
+	UNKNOWN, MALE, FEMALE, NEUTER, TOTAL = -1, 0, 1, 2, 3
+
 	@staticmethod
 	def detect(name):
-		name = name.lower()
-		if name.endswith(('а', 'я')):
-			return Gender.MALE if name[0] in 'рк' or len(name) >= 2 and name[-2] in 'х' else Gender.FEMALE
-		else:
-			return Gender.MALE
+		oracle = BayesianGuesser(lambda w: ('0:'+w[0:1], '01:'+w[:2], '-2-1:'+w[-2:]),
+			samples = {sample[:-1]: Gender.MALE if sample.endswith('8') else Gender.FEMALE
+				for sample in unpack_str(Gender.names_pack()).split()}) # эм, это баг или что... pylint: disable=not-callable
 
-def genderize(g, fmt):
-	def handle(piece): return "" if not piece else piece.split('/', Gender.TOTAL)[g if g != Gender.UNKNOWN else Gender.MALE]
-	return "".join(literal + handle(bracketed) for literal, bracketed, _, _ in string.Formatter.parse(None, fmt))
+		best_guess, best_margin = Gender.UNKNOWN, None
+		for _lit, word in Noun.split_into_words(name):
+			guess, margin = oracle.guess(word.lower())
+			if (best_margin is None or margin > best_margin) and margin > 0.5:
+				best_guess, best_margin = guess, margin
+
+		return best_guess
+
+	def ize(self, fmt):
+		def handle(piece):
+			if not piece: return ""
+			per_gender = piece.split('/', Gender.TOTAL-1)
+			return per_gender[self if self != Gender.UNKNOWN and self < len(per_gender) else Gender.MALE]
+		return "".join(literal + handle(bracketed) for literal, bracketed, _, _ in string.Formatter.parse(None, fmt))
+
+	# Здесь список имён в lowercase, разделённых пробелом, мужские заканчиваются на 8, женские на 3. lambda обходит магию Enum.
+	names_pack = lambda: "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"
+
+class Case:
+	NOMINATIVE, GENITIVE, DATIVE, ACCUSATIVE, INSTRUMENTAL, PREPOSITIONAL, TOTAL = 0, 1, 2, 3, 4, 5, 6
+
+# Noun("маленьк{ий/ого/ому/ий/им/ом} член{/а/у//ом/е}")(Case.GENITIVE) == Noun.guess("маленький член")(Case.GENITIVE) == "маленького члена"
+# Noun("{кусок} угля")(Case.PREPOSITIONAL) == "куском угля"
+class Noun:
+	def __init__(self, src, gender=Gender.UNKNOWN):
+		self.pieces = src if isinstance(src, list) else Noun.parse(src)
+		self.gender = gender
+
+	def __call__(self, case):
+		return "".join(piece for literal, cases in self.pieces for piece in (literal, cases[case] if cases else ""))
+
+	@staticmethod
+	def append_pair(pieces, literal, cases): # ненужная оптимизация, чтобы не бить строку в месте, где guess_one так ничего и не придумала
+		if pieces and not pieces[-1][1]:
+			pieces[-1] = pieces[-1][0] + literal, cases
+		else:
+			pieces.append((literal, cases))
+
+	@staticmethod
+	def parse(src):
+		pieces = []
+		for literal, bracketed, spec, _ in string.Formatter.parse(None, src):
+			if bracketed:
+				cases = bracketed.split('/', Case.TOTAL-1)
+				if len(cases) == 1:
+					animate, gender = False, Gender.UNKNOWN
+					for sym in spec or '':
+						if sym == 'a': animate = True
+						elif sym == 'm': gender = Gender.MALE
+						elif sym == 'f': gender = Gender.FEMALE
+						elif sym == 'n': gender = Gender.NEUTER
+						else: raise ValueError(f"\"{src}\": неожиданное вхождение \"{sym}\" в \"{spec}\".")
+					Noun.append_pair(pieces, literal, None)
+					Noun.guess_multi(pieces, cases[0], animate, gender)
+					continue
+				elif len(cases) != Case.TOTAL:
+					raise ValueError(f"\"{src}\": должно быть 6 падежей {{A/B/.../F}}, \"{bracketed}\".")
+			else:
+				cases = None
+			Noun.append_pair(pieces, literal, cases)
+		return pieces
+
+	@staticmethod
+	def guess(src, animate=False, gender=Gender.UNKNOWN):
+		pieces = []
+		Noun.guess_multi(pieces, src, animate, gender)
+		return Noun(pieces, gender)
+
+	@staticmethod
+	def guess_multi(pieces, src, animate, gender):
+		for literal, word in Noun.split_into_words(src):
+			base, cases = Noun.guess_one(word, animate, gender)
+			Noun.append_pair(pieces, literal + base, cases)
+
+	@staticmethod
+	def guess_one(word, animate, gender):
+		def ngdip(nom, gen, dat, ins, pre): return (nom, gen, dat, gen if animate else nom, ins, pre)
+		def yi(prev): return 'ы' if prev in 'бвдзлмнпрстфц' else 'и'
+		if word.endswith('ый') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
+			return word[:-len('ый')], ngdip('ый', 'ого', 'ому', 'ым', 'ом')
+		elif word.endswith('ий') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
+			return word[:-len('ий')], ngdip('ий', 'ого', 'ому', 'им', 'ом')
+		elif word.endswith('ой') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
+			return word[:-len('ой')], ngdip('ой', 'ого', 'ому', yi(len(word) >= 3 and word[-3])+'м', 'ом')
+		elif word.endswith('ая') and (gender == Gender.UNKNOWN or gender == Gender.FEMALE):
+			return word[:-len('ая')], ('ая', 'ой', 'ой', 'ую', 'ой', 'ой')
+		elif word.endswith('яя') and (gender == Gender.UNKNOWN or gender == Gender.FEMALE):
+			return word[:-len('яя')], ('яя', 'ей', 'ей', 'юю', 'ей', 'ей')
+		elif word.endswith('а'):
+			return word[:-len('а')], ('а', yi(len(word) >= 2 and word[-2]), 'е', 'у', 'ой', 'е')
+		elif word.endswith('я'):
+			return word[:-len('я')], ('я', 'и', 'е', 'ю', 'ей', 'е')
+		elif word.endswith(('б', 'в', 'г', 'д', 'ж', 'з', 'й', 'к', 'л', 'м', 'н', 'п', 'р', 'с', 'т', 'ф', 'х', 'ц', 'ч', 'ш', 'щ')) and \
+			(gender == Gender.UNKNOWN or gender == Gender.MALE):
+			if word.endswith('ок'):
+				return word[:-len('ок')], ngdip('ок', 'ка', 'ку', 'ком', 'ке')
+			else:
+				return word, ngdip('', 'а', 'у', 'ом', 'е')
+		else:
+			return word, None
+
+	@staticmethod
+	def split_into_words(src):
+		def is_word_char(ch): return 'а' <= ch <= 'я' or 'А' <= ch <= 'Я' or ch in 'ёЁ'
+		i = 0
+		while i < len(src):
+			lit_start = i
+			while i < len(src) and not is_word_char(src[i]): i += 1
+			word_start = i
+			while i < len(src) and is_word_char(src[i]): i += 1
+			yield src[lit_start:word_start], src[word_start:i]
+
+	def src(self, sep="/"): return "".join(piece for literal, cases in self.pieces for piece in (literal, "{" + sep.join(cases) + "}" if cases else ""))
+
+class Test:
+	class Failed(Exception): pass
+	def setup(self): pass
+	def teardown(self): pass
+
+	cases = None
+	def one(self, *args): raise NotImplementedError("one(*cases[i])")
+	def describe(self, *desc): return ""
+
+	def expect_equal(self, got, expected, name, *desc):
+		desc = self.describe(*desc)
+		if got != expected: raise Test.Failed("{0}{1}{2} = {3}, ожидается {4}".format(desc, ": " if desc else "", name, got, expected))
+
+class NounTest(Test):
+	cases = \
+		(
+			("Злобн{ый/ого/ому/ого/ым/ом} Буратино", "Злобн{ый|ого|ому|ого|ым|ом} Буратино"),
+			(("Злобный Буратино", {'animate': True}), "Злобн{ый/ого/ому/ого/ым/ом} Буратино"),
+			(("Рика", {'animate': True}), "Рик{а/и/е/у/ой/е}"),
+			(("Слон", {'animate': True}), "Слон{/а/у/а/ом/е}"),
+			(("...{большой кусок} угля"), "...больш{ой/ого/ому/ой/им/ом} кус{ок/ка/ку/ок/ком/ке} угля"),
+		)
+	def one(self, base, expect_src):
+		n = Noun.guess(base[0], **(base[1] if len(base) >= 2 else {})) if isinstance(base, tuple) else Noun(base)
+		self.expect_equal(n.src(sep='|' if isinstance(base, str) and base.find('/') >= 0 else '/'), expect_src, "forms", base)
+	def describe(self, base): return base
 
 def clamp(x, a, b): # эти странные конструкции — (бессмысленная) оптимизация общего случая (a <= x <= b) и паранойя x=NaN.
 	return x if (x >= a) and (x <= b) else b if x > b else a
 
-def cut_prefix(s, prefix):
-	return s[len(prefix):] if s.startswith(prefix) else s
+# XOR с псевдослучайными числами, чтобы некоторые строки не светились в файлах в неизменном виде >:3
+def pcgxor(seq, seed=0, mask=255):
+	def pcg(state, inc):
+		while True:
+			state = (state * 6364136223846793005 + inc) & 0xFFFFFFFFFFFFFFFF
+			xs, rot = (state >> 45) ^ (state >> 27) & 0xFFFFFFFF, state >> 59
+			xs = (xs >> rot) | (xs << (31 & -rot))
+			yield from (xs>>r&mask for r in range(0, 32, 8))
+
+	# эти ^ с нетривиальными числами так-то не нужны, просто seed=0 даёт 0 первым числом
+	return bytes(b^r for b, r in zip(seq, pcg(seed^18446744073709551557, seed^2305843009213693951|1)))
 
 # округляет 8.2 до 8 с шансом 80% или 9 с шансом 20%
 def rand_round(x):
@@ -74,7 +337,7 @@ def rand_round(x):
 
 # Главная причина существования этой функции в том, что textwrap.wrap, похоже, не обрабатывает \n.
 #
-# Если в строку добавлен |, то её хвост начнётся с этой позиции, например:
+# Также, если в строку добавлен |, то её хвост начнётся с этой позиции, например:
 # wrap("Страх — |внутреннее состояние, обусловленное грозящим реальным или предполагаемым бедствием.", ...)
 # ->
 # Страх — внутреннее состояние, обусловленное
@@ -116,20 +379,7 @@ def wrap(text, width):
 	return '\n'.join(lines)
 
 def exception_msg(e):
-	return traceback.format_exc() or str(e) or repr(e)
-
-class Test:
-	class Failed(Exception): pass
-	def setup(self): pass
-	def teardown(self): pass
-
-	cases = None
-	def one(self, *args): raise NotImplementedError("one(*cases[i])")
-	def describe(self, *desc): return ""
-
-	def expect_equal(self, got, expected, name, *desc):
-		desc = self.describe(*desc)
-		if got != expected: raise Test.Failed("{0}{1}{2} = {3}, ожидается {4}".format(desc, ": " if desc else "", name, got, expected))
+	return str(e) or repr(e)
 
 # список команд, позволяющий сокращать их при отсутствии неоднозначностей
 # guess возвращает (1) ассоциированную с командой функцию, (2) список вариантов при неоднозначности, (3) список подсказок при ошибке
@@ -196,7 +446,7 @@ class Commands:
 		for i in range(len(matches)):
 			matches[i] = matches[i].down_to_unambiguous() # однозначные продолжения команды, например, введено hit и есть только hit body
 
-		# Если в какой-то (не промежуточной) команде набралось больше точных совпадений, чем в остальных, выбрать её.
+		# Если в какой-то команде набралось больше точных совпадений, чем в остальных, выбрать её.
 		# Без этого проваливаются тесты на тему sp- и sp.frailness.
 		best_score, best_index = 0, -1
 		for index, match in enumerate(matches):
@@ -230,7 +480,7 @@ class Commands:
 
 	class node:
 		def __init__(self, name, parent):
-			self.childs = OrderedDict()
+			self.childs = collections.OrderedDict()
 			self.func   = None
 			self.name   = name
 			self.parent = parent
@@ -265,8 +515,7 @@ class Commands:
 			return node
 
 		def score(self, path):
-			track = self.backtrack(raw=True)
-			return sum(int(track[-1-i] == path[i]) for i in range(min(len(track), len(path)))) # количество точных совпадений фрагментов команды
+			return sum(int(part == full) for part, full in zip(path, reversed(self.backtrack(raw=True)))) # количество точных совпадений фрагментов команды
 
 class DummyCommands:
 	@staticmethod
@@ -370,18 +619,21 @@ def multipad(lines):
 		marker.next = after.next
 		marker.prev = after
 		after.next  = marker
-		if not marker.next:
+		if marker.next:
+			marker.next.prev = marker
+		else:
 			assert after is last_marker
 			last_marker = marker
 
 	# soup[i] = список фрагментов (Fragment), соответствующих lines[i]
 	soup = []
-
 	for line_index, line in enumerate(lines):
 		i, start, fragments, prev_marker = 0, 0, [], None
 		while i < len(line):
 			if line[i] == '[':
-				if i + 1 < len(line) and line[i + 1] == '[': line = line[:i + 1] + line[i + 2:]; i += 1
+				if i + 1 < len(line) and line[i + 1] == '[':
+					line = line[:i + 1] + line[i + 2:]
+					i += 1
 				else:
 					marker_end = line.find(']', i + 1)
 					if marker_end < 0: raise RuntimeError("неэкранированный [: " + line)
@@ -547,13 +799,15 @@ class Hex:
 
 	def __getstate__(self):
 		check(self.applied, "not applied?!")
-		return {k:v for k,v in self.__dict__.items() if k not in ('applied', 'master', 'victim')}
+		return {k:v for k,v in self.__dict__.items() if k not in (
+			'applied',         # резолвится здесь
+			)}
 
 	def __setstate__(self, state):
 		self.__dict__.update(state)
-		self.applied = True
-		self.master.caused_hexes.add(self)
-		self.victim.hexes.add(self)
+		self.applied = True                # отбрасывается здесь
+		self.master.caused_hexes.add(self) # caused_hexes отбрасывается Fighter
+		self.victim.hexes.add(self)        # hexes отбрасывается Fighter
 
 class RageHex(Hex):
 	#  мин. 1.2x @ pow → 0
@@ -680,8 +934,11 @@ class Upgrade:
 	def do_apply(self, target): pass
 	def do_revert(self, target): pass
 
-	def apply_message(self, target): pass
-	def revert_message(self, target): pass
+	def apply_message(self, target): return self.do_apply_message(target)
+	def revert_message(self, target): return self.do_revert_message(target)
+
+	def do_apply_message(self, target): pass
+	def do_revert_message(self, target): pass
 
 	# Проверяет физическую возможность добавить апгрейд (но не цену в золоте).
 	@classmethod
@@ -746,11 +1003,14 @@ class Upgrade:
 
 	def __getstate__(self):
 		check(self.applied, "not applied?!")
-		return {k:v for k,v in self.__dict__.items() if k not in ('applied', 'target')}
+		return {k:v for k,v in self.__dict__.items() if k not in (
+			'applied', # резолвится здесь
+			'target'   # резолвится Living
+			)}
 
 	def __setstate__(self, state):
 		self.__dict__.update(state)
-		self.applied = True
+		self.applied = True # отбрасывается здесь
 
 class FighterUpgrade(Upgrade):
 	TARGET_CLASS = property(lambda self: Fighter)
@@ -809,8 +1069,8 @@ class StrUpgrade(StatUpgrade):
 	@classmethod
 	def do_gold_cost(cls, target): return 120 + 30 * cls.count(target)
 
-	def apply_message(self, target): return "Ваши мускулы наливаются силой."
-	def revert_message(self, target): return "Ваши мускулы слабеют."
+	def do_apply_message(self, target): return "Ваши мускулы наливаются силой."
+	def do_revert_message(self, target): return "Ваши мускулы слабеют."
 
 	@classmethod
 	def do_sell_accusative(cls, target): return "часть своей силы " + super().do_sell_accusative(target)
@@ -823,8 +1083,8 @@ class IntUpgrade(StatUpgrade):
 	@classmethod
 	def do_gold_cost(cls, target): return 135 + 35 * cls.count(target)
 
-	def apply_message(self, target): return "Ваш ум заостряется."
-	def revert_message(self, target): return "Вы начинаете хуже соображать."
+	def do_apply_message(self, target): return "Ваш ум заостряется."
+	def do_revert_message(self, target): return "Вы начинаете хуже соображать."
 
 	@classmethod
 	def do_sell_accusative(cls, target): return "часть своего интеллекта " + super().do_sell_accusative(target)
@@ -837,8 +1097,8 @@ class DexUpgrade(StatUpgrade):
 	@classmethod
 	def do_gold_cost(cls, target): return 70 + 25 * cls.count(target)
 
-	def apply_message(self, target): return "Ваши рефлексы улучшаются."
-	def revert_message(self, target): return "Вы чувствуете себя {0}.".format(genderize(target.gender, "неповоротлив{ым/ой}"))
+	def do_apply_message(self, target): return "Ваши рефлексы улучшаются."
+	def do_revert_message(self, target): return "Вы чувствуете себя {0}.".format(target.gender.ize("неповоротлив{ым/ой}"))
 
 	@classmethod
 	def do_sell_accusative(cls, target): return "часть своей ловкости " + super().do_sell_accusative(target)
@@ -852,8 +1112,8 @@ class SpeedUpgrade(StatUpgrade):
 	@classmethod
 	def do_gold_cost(cls, target): return 150 + 50 * sum(1 for up in cls.find_all(target))
 
-	def apply_message(self, target): return "Ваша кровь бурлит!"
-	def revert_message(self, target): return "Ваша кровь остывает..."
+	def do_apply_message(self, target): return "Ваша кровь бурлит!"
+	def do_revert_message(self, target): return "Ваша кровь остывает..."
 
 	@classmethod
 	def do_sell_accusative(cls, target): return "часть своей скорости " + super().do_sell_accusative(target)
@@ -870,7 +1130,7 @@ class Firestorm(Spell):
 	def do_cmd(cls): return 'fstorm'
 
 	@classmethod
-	def do_mp_cost(cls): return 5
+	def do_mp_cost(cls): return 6
 
 class Dispell(Spell):
 	LIST_ORDER = 1
@@ -938,8 +1198,8 @@ class FirestormSpellUpgrade(SpellUpgrade):
 	@classmethod
 	def do_cost_preface(cls, target): return "Вы научитесь применять Огненный шторм за"
 
-	def apply_message(self, target): return "Теперь вы можете обрушить на врагов мощный шторм!"
-	def revert_message(self, target): return "Вы больше не можете управлять огненным вихрем."
+	def do_apply_message(self, target): return "Теперь вы умеете обрушать на врагов мощный шторм!"
+	def do_revert_message(self, target): return "Вы больше не можете управлять огненным вихрем."
 
 class DispellSpellUpgrade(SpellUpgrade):
 	SPELL_CLASS = Dispell
@@ -956,8 +1216,8 @@ class DispellSpellUpgrade(SpellUpgrade):
 	@classmethod
 	def do_cost_preface(cls, target): return "Вы научитесь развеивать заклинания за"
 
-	def apply_message(self, target): return "Вы обучаетесь Развеиванию!"
-	def revert_message(self, target): return "Вы больше не можете развеивать заклинания."
+	def do_apply_message(self, target): return "Вы обучаетесь Развеиванию!"
+	def do_revert_message(self, target): return "Вы больше не можете развеивать заклинания."
 
 class FrailnessSpellUpgrade(SpellUpgrade):
 	SPELL_CLASS = Frailness
@@ -974,8 +1234,8 @@ class FrailnessSpellUpgrade(SpellUpgrade):
 	@classmethod
 	def do_cost_preface(cls, target): return "Вы научитесь накладывать хрупкость на врагов за"
 
-	def apply_message(self, target): return "Вы обучаетесь заклинанию Хрупкости!"
-	def revert_message(self, target): return "Вы больше не можете ослаблять врагов."
+	def do_apply_message(self, target): return "Вы обучаетесь заклинанию Хрупкости!"
+	def do_revert_message(self, target): return "Вы больше не можете ослаблять врагов."
 
 class Ammunition:
 	LIST_ORDER = None
@@ -1064,7 +1324,9 @@ class Ammunition:
 	def do_cmd(cls): raise NotImplementedError("do_cmd")
 
 	def __getstate__(self):
-		return {k:v for k, v in self.__dict__.items() if k not in ('weapon',)}
+		return {k:v for k, v in self.__dict__.items() if k not in (
+			'weapon', # резолвится Weapon
+			)}
 
 class IncendiaryAmmunition(Ammunition):
 	LIST_ORDER = 0
@@ -1082,7 +1344,7 @@ class IncendiaryAmmunition(Ammunition):
 		times = (ammo.times() if ammo else 0) + up
 		return times and cls.human_times(times)
 
-	def do_short_name(self): return f"заж.+{self.human_times(self.times)}"
+	def do_short_name(self): return f"заж.{self.human_times(self.times)}"
 
 	@classmethod
 	def do_cmd(cls): return 'incendiary'
@@ -1247,33 +1509,39 @@ class Living:
 		return self.ap_used + ap_cost <= self.ap_limit
 
 	def next_percentage(self):
-		return math.floor(self.xp / self.xp_for_levelup(self.xl) * 1000) / 10 if self.xl < self.LEVEL_CAP else None
+		return math.floor(self.xp / self.xp_for_levelup(self.xl) * 100) if self.xl < self.LEVEL_CAP else None
 
 	def living_desc(self, for_multipad=False):
-		name = self.name + ": "
-		return "{name}{xl}, {ap_mp}умения: {0.ap_used}/{0.ap_limit}".format(
-			self, xl = self.xl_desc(self.xl, self.next_percentage()), name = multipad_escape(name) if for_multipad else name,
+		name = cap_first(self.name) + ": "
+		return ("{name}{xl}" + (", {ap_mp}умения: {0.ap_used}/{0.ap_limit}" if for_multipad or self.xp > 0 or self.xl > 1 or self.ap_used > 0 else "")).format(
+			self, xl = self.xl_desc(self.xl, self.next_percentage()),
+			name = multipad_escape(name) if for_multipad else name,
 			ap_mp = "[ap]" if for_multipad else "")
 
 	@staticmethod
 	def xl_desc(xl, next_percentage, short=None):
 		lv_word = "lv." if short else "уровень "
 		nx_word = "" if short else "след. "
-		return f"{lv_word}{xl}" + (f" ({nx_word}{next_percentage:.0f}%)" if next_percentage is not None else "")
-
-	def living_desc_pad(self):
-		return len(self.name) + 2
+		return f"{lv_word}{xl}" + (f" ({nx_word}{next_percentage}%)" if next_percentage is not None else "")
 
 	def save_relative_vitals(self): return None
 	def restore_relative_vitals(self, saved): pass
 
+	def __getstate__(self):
+		return {
+			k: v.value if k == 'gender' else v
+			for k, v in self.__dict__.items()}
+
 	def __setstate__(self, state):
-		self.__dict__.update(state)
-		for up in self.upgrades: up.target = self
+		self.__init__()
+		self.__dict__.update(
+			(k, Gender(v) if k == 'gender' else v)
+			for k, v in state.items())
+		for up in self.upgrades: up.target = self # отбрасывается Upgrade
 
 class Fighter(Living):
 	hp    = property(lambda self: self.cur_hp)
-	mhp   = property(lambda self: max(1, round((self.base_mhp + 1.5 * (self.xl - 1)) * (1 + (self.str - 10) / 10))))
+	mhp   = property(lambda self: max(1, round((self.base_mhp + 5 * (self.xl - 1)**0.77) * (1 + (self.str - 10) / 10))))
 	dead  = property(lambda self: self.death_cause)
 	alive = property(lambda self: not self.dead)
 	mp    = property(lambda self: self.cur_mp)
@@ -1305,6 +1573,7 @@ class Fighter(Living):
 
 		self.cur_hp = self.mhp
 		self.cur_mp = self.mmp
+		self.ai = None
 
 	def ouch(self, hp_dam, death_cause, killer=None):
 		check(hp_dam >= 0, "hp_dam?!", death_cause, "death_cause?!", not killer or isinstance(killer, Fighter), "killer?!")
@@ -1350,19 +1619,23 @@ class Fighter(Living):
 		self.spells.remove(spell)
 
 	# сохранить соотношения HP/MP к максимумам, если какое-то действие потенциально изменит их лимит.
-	relative_vitals = namedtuple('relative_vitals', 'hp, mp')
+	relative_vitals = collections.namedtuple('relative_vitals', 'hp, mp')
 	def save_relative_vitals(self): return self.relative_vitals(self.hp / self.mhp, self.mp / self.mmp)
 	def restore_relative_vitals(self, saved):
 		self.cur_hp = clamp(round(self.mhp * saved.hp), 1, self.mhp)
 		self.cur_mp = clamp(round(self.mmp * saved.mp), 1, self.mmp)
 
 	def __getstate__(self):
-		return {k:v for k, v in self.__dict__.items() if k not in ('hexes', 'caused_hexes')}
+		check(self.ai, not self.ai, "ai?!")
+		return {k: v for k, v in super().__getstate__().items() if k not in (
+			'hexes', 'caused_hexes', # резолвятся Hex
+			'ai',                    # он как негр, его не должно быть
+			'death_cause'            # либо сохраняемый боец жив, либо эта информация не интересна
+			)}
 
 	def __setstate__(self, state):
-		self.__init__()
 		super().__setstate__(state)
-		self.weapon.owner = self
+		self.weapon.owner = self # отбрасывается Weapon
 
 class Weapon(Living):
 	ap_limit = property(lambda self: 1 + (self.xl - 1))
@@ -1374,13 +1647,21 @@ class Weapon(Living):
 		self.ammos = []
 
 	def __getstate__(self):
-		return {k:v for k, v in self.__dict__.items() if k not in ('owner',)}
+		return {k:v for k, v in super().__getstate__().items() if k not in (
+			'owner', # резолвится Fighter
+			)}
 
 	def __setstate__(self, state):
 		super().__setstate__(state)
-		for ammo in self.ammos: ammo.weapon = self
+		for ammo in self.ammos: ammo.weapon = self # отбрасывается Ammunition
+
+class Damage:
+	pass
 
 class Arena:
+	pass
+
+class AI:
 	pass
 
 class Con:
@@ -1426,10 +1707,13 @@ class Mode:
 		check(self.session.mode == self, "session.mode != self")
 		return self.session.revert(n)
 
-	def more(self, msg, do_cls=False):
-		more = MoreMessage(msg, do_cls)
-		self.switch_to(more)
-		return more
+	def shortcut(self, mode, *a, **ka):
+		mode = mode(*a, **ka)
+		self.switch_to(mode)
+		return mode
+
+	def more(self, *a, **ka): return self.shortcut(MoreMessage, *a, **ka)
+	def prompt(self, *a, **ka): return self.shortcut(Prompt, *a, **ka)
 
 	do_prompt = True
 	do_cls    = True
@@ -1446,7 +1730,7 @@ class MainMenu(Mode):
 		cmds.add((str(ci), 'new'), lambda: self.start_new_game(), '?', lambda: self.more("Начать новую игру."))
 		ci += 1
 
-		if os.path.exists(Game.SAVE_BASE):
+		if os.path.exists(Game.SAVE_FOLDER):
 			msg += "\n({0})      - продолжить игру -    (load)".format(ci)
 			cmds.add((str(ci), 'load'), lambda: self.switch_to(LoadGame()), '?', lambda: self.more("Продолжить сохранённую игру."))
 			ci += 1
@@ -1460,24 +1744,23 @@ class MainMenu(Mode):
 
 	def start_new_game(self):
 		game = Game()
-		game.gold = 300
+		game.gold = 100
 		game.player = Fighter()
 		game.player.set_weapon(Weapon())
 		game.next_level = 1
 		self.switch_to(AskName(game))
 
 	Help = \
-		"Ваш автомат — живой, и при использовании в бою ему будет перенаправлена часть опыта. Пули пробивают броню, но не масштабируются статами персонажа.\n"\
+		"Ваш автомат — живой, и при использовании в бою ему будет перенаправлена часть опыта. Пули пробивают броню, но хуже масштабируются статами персонажа.\n"\
 		"\n"\
 		"Сила      (STR) — |влияет на силу ударов и максимум HP.\n"\
 		"Интеллект (INT) — |на максимум маны, силу заклинаний и сопротивление магии.\n"\
-		"Ловкость  (DEX) — |на точность ударов, шанс уворота и критических ударов.\n"\
+		"Ловкость  (DEX) — |на точность атаки, шанс уворота и критических ударов.\n"\
 		"Скорость  (SPD) — |на инициативу в бою. Например, если ваша скорость 150, а противника 100, "\
 		                   "на три ваших действия будут приходиться два действия противника.\n"\
 		"\n"\
 		"Между боями вы можете тратить золото на апгрейды в пределах полученного опыта. Золото за даунгрейд компенсируется частично.\n"\
-		"Сохранение выполняется автоматически. Скрытая команда backup оставляет прежнее сохранение в покое и переключается на новый файл.\n"\
-		"В игре 10 уровней.\n"\
+		"В игре 10 уровней. Сохранение выполняется автоматически.\n"\
 		"\n"\
 		"Можно сокращать команды до префиксов: heal hp -> h h, b.fire? -> b.f?.\n"\
 		"                                                            ^       ^\n"\
@@ -1598,14 +1881,14 @@ class LoadGame(Mode):
 					with open(pv.save_file_path, 'rb') as f:
 						game = Game.load(f, pv)
 				except Exception as e:
-					mode.more("Не удалось загрузить игру.\n" + (exception_msg(e) or repr(e))).reverts(2)
+					mode.more("Не удалось загрузить игру.\n" + exception_msg(e)).reverts(2)
 					return
 				mode.more("Загрузка...").then(lambda mode: mode.switch_to(Respite(game)))
 			else:
 				mode.revert()
 
 		def handler():
-			self.switch_to(Prompt("\n{0}\n\nЗагрузить эту игру? (Y/n) ".format(self.indexed_save_desc(index, desc_pad)), confirm_load))
+			self.prompt("\n{0}\n\nЗагрузить эту игру? (Y/n) ".format(self.indexed_save_desc(index, desc_pad)), confirm_load)
 		return handler
 
 	def create_remove_request_handler(self, index, desc_pad, extra_reverts=0):
@@ -1618,9 +1901,9 @@ class LoadGame(Mode):
 				mode.revert(1 + extra_reverts)
 
 		def handler():
-			self.switch_to(Prompt("\n{0}\n\nУдалить это сохранение? ({1}/{2}) ".format(
-				self.indexed_save_desc(index, desc_pad),
-				'Y' if pv.bad else 'y', 'n' if pv.bad else 'N'), confirm_remove))
+			self.prompt(
+				"\n{0}\n\nУдалить это сохранение? ({1}) ".format(self.indexed_save_desc(index, desc_pad), highlight_variant("y/n", 0 if pv.bad else 1)),
+				confirm_remove)
 		return handler
 
 	def create_remove_by_number_handler(self, desc_pad):
@@ -1642,7 +1925,7 @@ class LoadGame(Mode):
 			if len(self.previews) == 1:
 				self.create_remove_request_handler(0, desc_pad)()
 			else:
-				self.switch_to(Prompt(f"Какое сохранение удалить? ({1 + self.first} – {1 + self.first + self.num_to_show(self.first) - 1}) ", handle_answer))
+				self.prompt(f"Какое сохранение удалить? ({1 + self.first} – {1 + self.first + self.num_to_show(self.first) - 1}) ", handle_answer)
 		return remove_by_number
 
 	def create_batch_remove_handler(self, predicate, capitalized_saves_desc, default_yes=False):
@@ -1655,7 +1938,7 @@ class LoadGame(Mode):
 					mode.more("{0} сохранения удалены.".format(capitalized_saves_desc)).reverts(2)
 				else:
 					mode.revert()
-			self.switch_to(Prompt("Удалить {0}? (y/N) ".format(plural(count, "{N} сохранени{е/я/й}")), confirm))
+			self.prompt("Удалить {0}? (y/N) ".format(plural(count, "{N} сохранени{е/я/й}")), confirm)
 		return remove
 	prev_mode = True
 
@@ -1700,13 +1983,12 @@ class Prompt(MoreMessage):
 
 # Прогресс игрока и информация о сейве.
 class Game:
-	SAVE_BASE, SAVE_SUFFIX = os.path.join(os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__), 'save'), ".sav"
-	LZMA_OPTIONS = {"format": lzma.FORMAT_RAW, "filters": [{"id": lzma.FILTER_LZMA2, "preset": lzma.PRESET_DEFAULT}]}
-	SIGNATURE = b'.*%$)ebcq%*+'
+	SAVE_FOLDER, SAVE_SUFFIX = os.path.join(os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__), 'save'), ".sav"
+	SAVE_FILE_BASE_NAME_DONT_TOUCH = '\x00/' # save_file_base_name нужна для обнаружения необходимости смены имени, это — маркер «не менять»
+	MAGIC = b'H,/m seX}Y', 2942819, 127
 
 	def __init__(self):
-		# Для отслеживания сохранений с одинаковыми именами персонажей.
-		self.character_uid  = None
+		self.character_uid  = None # Для отслеживания сохранений с одинаковыми именами персонажей.
 		self.order_key      = None
 		self.save_file_path = None
 		self.save_file_base_name = None
@@ -1729,18 +2011,13 @@ class Game:
 	def corrupted_save_error(what=None):
 		return Game.BadSaveError("Сохранение повреждено{0}.".format(f" ({what})" if what else ""))
 
-	@staticmethod
-	def read_signature(f):
-		if f.read(len(Game.SIGNATURE)) != bytes(b^i for i, b in enumerate(Game.SIGNATURE, 22)):
-			raise Game.corrupted_save_error()
-
 	# Превью для быстрой загрузки. Сохранение состоит из Preview.to_list() и Game.to_complement()
 	class Preview:
-		def __init__(self, game=None, order_key=None, bad=None):
+		def __init__(self, game=None, order_key=None, bad=None, compress=True):
 			self.bad            = bad
-			self.save_file_path  = None # выставляется в load_previews
+			self.save_file_path  = None # выставляется load_previews
 			self.character_uid  = game and game.character_uid
-			self.order_key      = order_key or game and game.order_key
+			self.order_key      = order_key if order_key is not None else (game and game.order_key)
 			self.player_name    = game and game.player.name
 			self.player_level   = game and game.player.xl
 			self.player_next    = game and game.player.next_percentage()
@@ -1751,33 +2028,37 @@ class Game:
 			self.next_level     = game and game.next_level
 			self.timestamp      = game and time.localtime()
 			self.dup_suffix     = None # приписывать -2, -3, etc. для одинаковых имён разных персонажей
+			self.compress       = compress
 
 		store_fields = [('character_uid', int), ('order_key', int),
-			('player_name', str), ('player_level', int), ('player_next', (int, type(None))),
-			('weapon_name', str), ('weapon_level', int), ('weapon_next', (int, type(None))),
+			('player_name', bytes), ('player_level', int), ('player_next', (int, type(None))),
+			('weapon_name', bytes), ('weapon_level', int), ('weapon_next', (int, type(None))),
 			('gold', int), ('next_level', int), ('timestamp', int)]
 
 		def to_list(self):
-			return [save_version] + [
+			# save_version начинается с первого бита, а нулевой означает, используется ли сжатие
+			# (возможность его выключить поддерживается, потому что мне иногда интересно посмотреть, ЧО ТАМ)
+			return [save_version<<1 | int(self.compress)] + [
 				int(time.mktime(self.timestamp)) if field == 'timestamp' else
-				(round(getattr(self, field) * 10) if getattr(self, field) is not None else None) if field in ('player_next', 'weapon_next') else
+				pcgxor(getattr(self, field).encode()) if field in ('player_name', 'weapon_name') else
 				getattr(self, field)
 				for field, _ in Game.Preview.store_fields]
 
 		@staticmethod
 		def from_list(d):
 			pv = Game.Preview()
-			if not isinstance(d, list) or len(d) < 1:
+			if not isinstance(d, list) or len(d) < 1 or not isinstance(d[0], int):
 				raise Game.corrupted_save_error()
 
-			if d[0] != save_version or len(d) != 1 + len(Game.Preview.store_fields):
+			if d[0]>>1 != save_version or len(d) != 1 + len(Game.Preview.store_fields):
 				raise Game.BadSaveError("Несовместимая версия сохранения.")  # хотя можно и совместимость устроить... даже просто не проверять
+			pv.compress = bool(d[0] & 1)
 
 			for index, (field, field_type) in enumerate(Game.Preview.store_fields, 1):
 				value = d[index]
 				if not isinstance(value, field_type): raise Game.corrupted_save_error(field + ": " + str(type(value)))
 				elif field == 'timestamp': pv.timestamp = time.localtime(value)
-				elif field in ('player_next', 'weapon_next'): setattr(pv, field, value / 10 if value else None)
+				elif field in ('player_name', 'weapon_name'): setattr(pv, field, pcgxor(value).decode())
 				else: setattr(pv, field, value)
 			return pv
 
@@ -1786,7 +2067,7 @@ class Game:
 			pad = ' ' * pad
 			if self.bad:
 				bad_msg = self.bad is not True and exception_msg(self.bad)
-				if not bad_msg or not isinstance(self.bad, Game.BadSaveError):
+				if not bad_msg or not isinstance(self.bad, Game.BadSaveError) and bad_msg.find('оврежд') < 0 and bad_msg.find('orrupt') < 0:
 					bad_msg = "Файл повреждён." + (("\n" + pad + bad_msg) if bad_msg else "")
 				return "{0}\n{pad}[{1}]".format(bad_msg, self.save_file_path, pad = pad)
 			else:
@@ -1806,53 +2087,57 @@ class Game:
 	def load_previews(include_bad=False):
 		result = []
 		try:
-			dirpath, _dirnames, filenames = next(os.walk(Game.SAVE_BASE))
+			dirpath, _dirnames, filenames = next(os.walk(Game.SAVE_FOLDER))
 			for fn in filenames:
-				full = os.path.join(dirpath, fn)
-				try:
-					with open(full, 'rb') as f:
-						Game.read_signature(f)
-						preview = Game.load_preview(f)
-				except Exception as e:
-					if not include_bad: continue
-					preview = Game.Preview(bad=e)
-				preview.save_file_path = full
-				result.append(preview)
+				if fn.endswith(Game.SAVE_SUFFIX):
+					full = os.path.join(dirpath, fn)
+					try:
+						with open(full, 'rb') as f:
+							preview = Game.load_preview(f)
+					except Exception as e:
+						if not include_bad: continue
+						preview = Game.Preview(bad=e)
+					preview.save_file_path = full
+					result.append(preview)
 		except StopIteration:
 			# Папки не существовало
 			pass
 
-		# Более новые сохранения (с большим order_key) будут наверху; все повреждённые — в конце, т. е. их order_key полагается 0
-		result.sort(key=lambda pv: 0 if pv.bad else pv.order_key, reverse=True)
+		# Более новые сохранения (с большим order_key) будут наверху; все повреждённые — в конце, т. е. их order_key полагается меньше всех остальных.
+		result.sort(key=lambda pv: -1 if pv.bad else pv.order_key, reverse=True)
 		return result
 
 	@staticmethod
 	def load_preview(file):
-		preview = Game.Preview.from_list(pickle.load(file))
-		return preview
+		return Game.Preview.from_list(pickle.load(file))
 
 	@staticmethod
 	def generate_order_key():
-		return max((pv.order_key for pv in Game.load_previews()), default = 0) + 1
+		# Получается, что при каждом сохранении в новый файл ради order_key загружаются и анализируются превью всех существующих сохранений...
+		# Можно было бы единовременно кэшировать максимальный order_key и инкрементировать при вызове этой функции,
+		# засунуть order_key в первые пару байт файла и не грузить всю превьюху ради этого, либо вообще хранить все order_key отдельно...
+		# Впрочем, по сравнению с остальными существующее решение наиболее помехоустойчивое.
+		return max((pv.order_key for pv in Game.load_previews()), default = -1) + 1
 
 	# Придумать основу имени файла. НУЖНО ПОАККУРАТНЕЕ, если игрок назвался чем-то типа ..\
 	def base_filename(self):
 		check(self.player, "player?!")
+		def whitelisted_char(c): return (
+			'0' <= c <= '9' or
+			'a' <= c <= 'z' or 'A' <= c <= 'Z' or
+			'а' <= c <= 'я' or 'А' <= c <= 'Я' or c in 'ёЁ')
+
 		def sanitize(name):
-			return "".join(c if
-				'0' <= c <= '9' or
-				'a' <= c <= 'z' or 'A' <= c <= 'Z' or
-				'а' <= c <= 'я' or 'А' <= c <= 'Я' or c == 'ё' or c == 'Ё'
-				else '_'
-				for c in name)
+			return "".join(c for c in name if whitelisted_char(c))
+
 		return "{0} Lv.{1} ({2} Lv.{3}) D{4}".format(
-			sanitize(self.player.name), self.player.xl, sanitize(self.player.weapon.name), self.player.weapon.xl, self.next_level)
+			sanitize(self.player.name) or "Игрок", self.player.xl, sanitize(self.player.weapon.name) or "автомат", self.player.weapon.xl, self.next_level)
 
 	def open_new_file(self):
 		file, path, base, num = None, None, self.base_filename(), None
 		while True:
 			try:
-				path = os.path.join(self.SAVE_BASE, base + (f" ({num})" if num else "")) + Game.SAVE_SUFFIX
+				path = os.path.join(self.SAVE_FOLDER, base + (f" ({num})" if num else "")) + Game.SAVE_SUFFIX
 				file = open(path, 'x+b')
 				break
 			except FileExistsError:
@@ -1864,82 +2149,84 @@ class Game:
 	def remove_save(path):
 		os.remove(path)
 		try:
-			os.rmdir(Game.SAVE_BASE)
+			os.rmdir(Game.SAVE_FOLDER)
 		except OSError:
 			pass
 
-	# to_new_file=False — автосохранение, выставит self.save_file_*.
-	def save(self, to_new_file=False):
+	def will_autosave_to_new_file(self):
+		return self.save_file_base_name != Game.SAVE_FILE_BASE_NAME_DONT_TOUCH and self.save_file_base_name != self.base_filename()
+
+	def save(self, to_new_file=False, compress=True):
 		# убедиться в существовании папки с сохранениями
 		try:
-			os.mkdir(Game.SAVE_BASE)
+			os.mkdir(Game.SAVE_FOLDER)
 		except FileExistsError:
 			pass
 
 		# Придумать character_uid, если его ещё нет.
 		# Единственное, для чего он нужен — суффиксы вида «-2» на экране загрузки для разных персонажей с одинаковыми именами.
-		# Т. о. коллизии не критичны, 2**16 достаточно. Ну не выведется суффикс, когда на самом деле должен быть, подумаешь.
-		if not self.character_uid:
-			self.character_uid = 1 + random.randrange(2**16 - 1)
+		# Т. о. коллизии не критичны, 2**16=65536 достаточно. Ну не выведется с маленькой вероятностью суффикс, когда нужен, подумаешь.
+		if self.character_uid is None:
+			self.character_uid = random.randrange(2**16)
 
 		# Придумать order_key, если его ещё нет, или если нужно сохранить в новый файл.
-		if not self.order_key or to_new_file:
+		if self.order_key is None or to_new_file:
 			order_key = Game.generate_order_key()
 
 			# Если его нет — он запоминается.
-			if not self.order_key: self.order_key = order_key
+			if self.order_key is None: self.order_key = order_key
 		else:
 			order_key = self.order_key
 
 		# Записать сразу в новый файл, если:
 		# — это явно требуется (to_new_file=True)
 		# -или-
-		# — это автосохранение (to_new_file=False), но базовое имя файла изменилось или не существовало
-		if to_new_file or self.base_filename() != self.save_file_base_name:
+		# — используется семантика автосохранения (to_new_file=False), но старого файла не было или игра хочет его сменить всё равно.
+		#   Логика этого решения вынесена в will_autosave_to_new_file, т. к. интересна кое-кому извне.
+		if to_new_file or self.will_autosave_to_new_file():
 			file, path, base = self.open_new_file()
 			try:
 				try:
-					self.save_to(file, order_key)
+					self.save_to(file, order_key, compress=compress)
 				finally:
 					file.close()
 
 				# если это автосохранение, удалить старый файл.
-				if not to_new_file:
-					if self.save_file_path: Game.remove_save(self.save_file_path)
+				if not to_new_file and self.save_file_path:
+					Game.remove_save(self.save_file_path)
 
-				# save_file_* и order_key на данный момент актуализируются всегда
-				self.save_file_path = path
-				self.save_file_base_name = base
-				self.order_key = order_key
+				# в обоих случаях автосохранение впредь будет выполняться в новый файл.
+				self.save_file_path, self.save_file_base_name, self.order_key = path, base, order_key
 			except:
 				Game.remove_save(path)
 				raise
 		else:
-			# Базовое имя файла не изменилось (и существовало): записать файл во временный, затем атомарно заменить существующий.
-			tmp_fd, tmp_path = tempfile.mkstemp(suffix = ".tmp", prefix = os.path.join(self.SAVE_BASE, self.base_filename()))
+			# Сохранение в тот же файл: записать временный, затем атомарно заменить существующий.
+			# (На самом деле лучше и для случая выше сохранять во временный, чтобы при выдёргивании вилки из розетки не оставлять недописанный .sav).
+			tmp_fd, tmp_path = tempfile.mkstemp(suffix = ".tmp", prefix = self.base_filename(), dir = self.SAVE_FOLDER)
 			# Не знаю, как с ними правильно работать, так что перестрахуюсь.
 			try:
 				with open(tmp_fd, 'wb') as file:
 					tmp_fd = 'CLOSED'
-					self.save_to(file, order_key)
+					self.save_to(file, order_key, compress=compress)
 				os.replace(tmp_path, self.save_file_path)
 			except:
 				if tmp_fd != 'CLOSED': os.close(tmp_fd)
 				Game.remove_save(tmp_path)
 				raise
 
-	def save_nothrow(self, mode, then=None, note_success=False, to_new_file=False):
+	def save_nothrow(self, mode, then=None, note_success=False, to_new_file=False, extra_error_comment=None, compress=True):
 		try:
-			self.save(to_new_file)
+			self.save(to_new_file, compress=compress)
 			if note_success:
 				mode = mode.more("Игра сохранена.")
-				if then: mode.then(lambda mode: then(True, mode))
+				if then: mode.then(lambda mode: then(True, mode.revert()))
 			else:
 				if then: then(True, mode)
 			return True
 		except Exception as e:
-			mode = mode.more("Не удалось сохранить игру.\n" + exception_msg(e))
-			if then: mode.then(lambda mode: then(False, mode))
+			mode = mode.more("Не удалось сохранить игру{0}.\n".format(extra_error_comment or "") + exception_msg(e))
+			if then: mode.then(lambda mode: then(False, mode.revert()))
 
 	preview_complement_fields = [('player', Fighter)]
 	def to_complement(self):
@@ -1956,31 +2243,44 @@ class Game:
 	@staticmethod
 	def from_preview_and_complement(preview, complement, save_file_path):
 		g = Game()
-		g.character_uid = preview.character_uid
-		g.order_key     = preview.order_key
-		g.gold          = preview.gold
-		g.next_level    = preview.next_level
+		for k in ('character_uid', 'order_key', 'gold', 'next_level'):
+			setattr(g, k, getattr(preview, k))
 		for index, (k, _) in enumerate(Game.preview_complement_fields):
 			setattr(g, k, complement[index])
 
 		g.save_file_path = save_file_path
-		g.save_file_base_name = g.base_filename()
+		# если имя файла сформировано по тем же правилам, что сформировало бы само приложение...
+		if os.path.basename(g.save_file_path).startswith(g.base_filename()):
+			g.save_file_base_name = g.base_filename() # ...то считать, что так и есть, и менять его как обычно
+		else:
+			# иначе пользователь переименовал файл (или изменились правила формирования имени, но этот случай опустим)
+			# имя этого файла не будет меняться автоматически
+			g.save_file_base_name = Game.SAVE_FILE_BASE_NAME_DONT_TOUCH
 		return g
 
-	def save_to(self, file, order_key):
-		file.write(bytes(b^i for i, b in enumerate(Game.SIGNATURE, 22)))
-		file.write(pickletools.optimize(pickle.dumps(Game.Preview(self, order_key=order_key).to_list(), protocol=-1)))
-		with lzma.open(file, 'wb', **Game.LZMA_OPTIONS) as file:
-			file.write(pickletools.optimize(pickle.dumps(self.to_complement(), protocol=-1)))
+	def save_to(self, file, order_key, compress=True):
+		file.write(pickletools.optimize(pickle.dumps(Game.Preview(self, order_key=order_key, compress=compress).to_list(), protocol=-1)))
+		file.write(pcgxor(*Game.MAGIC))
+
+		cf = lzma.open(file, 'wb', **LZMA_OPTIONS) if compress else file
+		try:
+			cf.write(pickletools.optimize(pickle.dumps(self.to_complement(), protocol=-1)))
+		finally:
+			if compress: cf.close()
 
 	@staticmethod
 	def load(file, preview):
-		Game.read_signature(file)
 		# чтобы нельзя было читерить на несоответствии preview и complement, заменяя физический сейв при открытом экране загрузки :P
 		# (как вариант, вообще не использовать preview на этом этапе, дублируя всю нужную информацию в complement)
 		true_preview = Game.load_preview(file)
-		with lzma.open(file, 'rb', **Game.LZMA_OPTIONS) as file:
-			complement = Game.load_complement(file)
+		if file.read(len(Game.MAGIC[0])) != pcgxor(*Game.MAGIC):
+			raise Game.corrupted_save_error('magic')
+
+		cf = lzma.open(file, 'rb', **LZMA_OPTIONS) if preview.compress else file
+		try:
+			complement = Game.load_complement(cf)
+		finally:
+			if preview.compress: cf.close()
 		return Game.from_preview_and_complement(true_preview, complement, preview.save_file_path)
 
 # Экран между боями.
@@ -2013,7 +2313,7 @@ class Respite(Mode):
 				def heal_hp():
 					self.game.take_gold(cost)
 					player.cur_hp = player.mhp
-					self.session.cls_once().mode.more("Ваши раны исцелены.")
+					self.session.cls_once().more("Ваши раны исцелены.")
 				cmds.add('heal hp', heal_hp, '?', lambda: self.more("Полностью восстановить очки здоровья."))
 			else:
 				desc += " :("
@@ -2031,14 +2331,14 @@ class Respite(Mode):
 			desc += "\n" +\
 				pad + "MP: " + Con.vital_bar(player.mp, player.mmp) + f" {player.mp}/{player.mmp}"
 			if need_heal_mp:
-				cost = clamp(round((1 - player.mp / player.mmp) * 20 + 0.25 * (player.mmp - player.mp)), 1, 70)
+				cost = clamp(round((1 - player.mp / player.mmp) * 40 + 0.5 * (player.mmp - player.mp)), 1, 70)
 				desc += " восстановить: ${0}".format(cost)
 				if self.game.enough_gold_for(cost):
 					desc += " (heal mp)"
 					def heal_mp():
 						self.game.take_gold(cost)
 						player.cur_mp = player.mmp
-						self.session.cls_once().mode.more("Ваша магическая энергия восстановлена.")
+						self.session.cls_once().more("Ваша магическая энергия восстановлена.")
 					cmds.add('heal mp', heal_mp, '?', lambda: self.more("Полностью восстановить ману."))
 				else:
 					desc += " :("
@@ -2094,7 +2394,7 @@ class Respite(Mode):
 		cmds.add('wxp+', lambda: player.weapon.receive_xp(10))
 		cmds.add('wxp-', lambda: player.weapon.drain_xp(10))
 
-		pad = " " * min(player.living_desc_pad(), player.weapon.living_desc_pad())
+		pad = " " * (min(len(player.name), len(player.weapon.name)) + 2)
 		print(self.describe_player(player, cmds, pad))
 		if player.weapon:
 			print("\n" + self.describe_weapon(player.weapon, cmds, pad))
@@ -2102,46 +2402,38 @@ class Respite(Mode):
 		print("\nследующий уровень (next)"
 			  "\nвыйти             (quit)")
 		cmds.add('next', lambda: self.more("Переход к следующему уровню — TODO"), '?', lambda: self.more("Переход к следующему уровню."))
-		cmds.add('quit', lambda: self.quit(), '?', lambda: self.more("Выход в меню, можно одновременно удалить сохранение."))
+		cmds.add('quit', lambda: self.quit(), '?', lambda: self.more("Выход в меню (с сохранением)."))
 
 	def do_handle_command(self, cmd):
-		if cmd.strip() == 'backup':
-			self.backup()
+		if cmd.strip() == 'split soul':
+			self.split_soul()
 			return True
 
-	def backup(self):
-		self.game.save_nothrow(self, to_new_file=True, note_success=True)
+	def split_soul(self):
+		# Если игра собиралась сохраняться в новый файл, и эта попытка провалилась, второй раз она попробует его же, что бессмысленно.
+		# И наоборот, если игра сохранялась в старый файл, то неважно, удалось ли ей это — запрашивается второе сохранение в новый и переключение на него.
+		do_second_anyway = not self.game.will_autosave_to_new_file()
+		self.game.save_nothrow(self, extra_error_comment=do_second_anyway and " в старый файл",
+			then=lambda success, mode: (success or do_second_anyway) and self.game.save_nothrow(mode, to_new_file=True, note_success=True))
 
 	def quit(self):
 		default_yes = self.last_input == 'quit'
 		allow_suicide = self.game.save_file_path
 		def handle_confirmation(input, mode):
-			if input and 'yes'.startswith(input) or not input and default_yes:
-				self.game.save_nothrow(mode, then=lambda success, mode: mode.switch_to(MainMenu()))
+			if input and 'yes'.startswith(input[:input.find('/')%(len(input)+1)]) or not input and default_yes:
+				self.game.save_nothrow(mode, then=lambda success, mode: mode.switch_to(MainMenu()), compress=input.find('/r') < 0)
 			elif input and 'quit'.startswith(input):
-				self.switch_to(MainMenu())
-			elif allow_suicide and input and 'suicide'.startswith(input):
-				if self.game.save_file_path:
-					try:
-						Game.remove_save(self.game.save_file_path)
-						mode.switch_to(MainMenu())
-					except Exception as e:
-						mode.more("Не удалось удалить сохранение.\n" + exception_msg(e)).then(lambda mode: mode.switch_to(MainMenu()))
-			elif input == '?':
-				lines = [
-					"{0}[pad] — выйти с сохранением".format("<enter>" if default_yes else "(y)es"),
-					"(q)uit[pad] — |выйти без сохранения (т. е. не запоминать изменения с последнего боя)"]
-				if allow_suicide:
-					lines.append(
-						"(s)uicide[pad] — |выйти и стереть сохранение [[{0}]".format(
-							multipad_escape(cut_prefix(self.game.save_file_path, self.game.SAVE_BASE + os.sep))))
-				if not default_yes: lines.append("иначе[pad] — продолжить игру")
-				self.more("\n".join(multipad(lines)))
+				mode.switch_to(MainMenu()) # без сохранения — но это долго объяснять пользователю, пусть просто не знает
+			elif allow_suicide and 'suicide'.startswith(input) and len(input) >= 2:
+				try:
+					Game.remove_save(self.game.save_file_path)
+					mode.switch_to(MainMenu())
+				except Exception as e:
+					mode.more("Не удалось удалить сохранение.\n" + exception_msg(e)).then(lambda mode: mode.switch_to(MainMenu()))
 			else:
 				mode.revert()
 
-		msg = "Выйти из игры? ({y}/{n}/?) ".format(y = 'Y' if default_yes else 'y', n = 'n' if default_yes else 'N')
-		self.switch_to(Prompt(msg, handle_confirmation))
+		self.prompt("Выйти из игры? ({0}) ".format(highlight_variant("y/n", 0 if default_yes else 1)), handle_confirmation)
 
 class Shop(Mode):
 	prev_mode = True
@@ -2172,6 +2464,7 @@ class Shop(Mode):
 					parenthesize_if(str(ap_cost) + "[/ap]", not enough_ap) + \
 					"[/costs] "
 
+			# TODO: вывод описания *И* всех цен по "upgrade_name?", вместо бесполезных upgrade_name+? etc.
 			cmd_list = []
 			if up.allow(target) and game.enough_gold_for(gold_cost):
 				cmd = up.cmd() + '+'
@@ -2188,17 +2481,20 @@ class Shop(Mode):
 			if cmd_list: line += "(" + ", ".join(cmd_list) + ")"
 			lines.append(line)
 
-		def upgrades_section(ups, target):
+		# Ограничения на уровни нужны только чтобы у игрока глаза не разбежались.
+		# Но учитывая, что уровни могут понижаться, был бы шанс попасть в ситуацию, когда имеющийся апгрейд невозможно продать,
+		# поэтому дополнительно проверяется их наличие. (Альтернативно, проверять какой-нибудь max_xl_so_far и никогда не блокировать уже открытые.)
+		def upgrades_section(ups, target, min_xl=None, prohibit=None, lead="\n"):
 			lines = []
 			for up in ups:
-				add_upgrade(lines, up, target)
-			print("\n".join(multipad(lines)))
+				if (not min_xl or target.xl >= min_xl) and (not prohibit or not prohibit(up)) or up.find(target):
+					add_upgrade(lines, up, target)
+			if lines: print(lead + "\n".join(multipad(lines)))
 
-		upgrades_section((StrUpgrade, IntUpgrade, DexUpgrade, SpeedUpgrade), player)
-		print()
-		upgrades_section((IncendiaryAmmunitionUpgrade, SilenceAmmunitionUpgrade, TimestopAmmunitionUpgrade), weapon)
-		print()
-		upgrades_section((FirestormSpellUpgrade, DispellSpellUpgrade, FrailnessSpellUpgrade), player)
+		upgrades_section((StrUpgrade, IntUpgrade, DexUpgrade, SpeedUpgrade), player, lead='')
+		upgrades_section((IncendiaryAmmunitionUpgrade, SilenceAmmunitionUpgrade, TimestopAmmunitionUpgrade), weapon,
+			min_xl=2, prohibit=lambda up: up == TimestopAmmunitionUpgrade and weapon.xl < 3)
+		upgrades_section((FirestormSpellUpgrade, DispellSpellUpgrade, FrailnessSpellUpgrade), player, min_xl=2)
 
 		print("\nВернуться в лагерь (quit)")
 		cmds.add('quit', lambda: self.revert(), '?', lambda: self.more("Вернуться в лагерь."))
@@ -2211,10 +2507,13 @@ class Shop(Mode):
 					self.game.take_gold(gold)
 					up = up_cls()
 					up.apply(target)
-					self.more(up.apply_message(target) or "Апгрейд приобретён за ${0}.".format(gold)).reverts(2)
+
+					msg = up.apply_message(target)
+					# if msg: msg += f" (-${gold})"
+					self.more(msg or f"Апгрейд приобретён за ${gold}.").reverts(2)
 				else:
 					mode.revert()
-			self.switch_to(Prompt("{0} ${1}. Продолжить? (y/N) ".format(up_cls.cost_preface(target), gold), confirm))
+			self.prompt("{0} ${1}. Продолжить? (y/N) ".format(up_cls.cost_preface(target), gold), confirm)
 		return buy
 
 	def sell_upgrade_func(self, target, up):
@@ -2224,10 +2523,12 @@ class Shop(Mode):
 				if input and 'yes'.startswith(input):
 					up.revert(target)
 					self.game.give_gold(gold)
-					self.more(up.revert_message(target) or "Апгрейд продан за ${0}.".format(gold)).reverts(2)
+					msg = up.revert_message(target)
+					# if msg: msg += f" (+${gold})"
+					self.more(msg or f"Апгрейд продан за ${gold}.").reverts(2)
 				else:
 					mode.revert()
-			self.switch_to(Prompt("В обмен на {what} вы получите ${gold}. Продолжить? (y/N) ".format(what=up.sell_accusative(target), gold=gold), confirm))
+			self.prompt("В обмен на {what} вы получите ${gold}. Продолжить? (y/N) ".format(what=up.sell_accusative(target), gold=gold), confirm)
 		return sell
 
 class AskName(Prompt):
@@ -2244,8 +2545,8 @@ class AskName(Prompt):
 		gender = Gender.UNKNOWN
 		if not input or MIN <= len(input) <= MAX:
 			if input:
-				name = input[0].capitalize() + input[1:]
-				if input == name: return self.complete_name(name, gender)
+				name = cap_first(input) if self.who == self.game.player else input
+				if input == name: return self.complete_name(name, gender, mode)
 			else:
 				if self.who == self.game.player:
 					name, gender = "Рика", Gender.FEMALE
@@ -2253,43 +2554,39 @@ class AskName(Prompt):
 					name, gender = "Хуец" if self.game.player.gender == Gender.FEMALE else "GAU-17", Gender.MALE
 				else: internalerror(self.who, "who")
 
-			mode.switch_to(Prompt(
+			mode.prompt(
 				"{0} {1} (Y/n/q) ".format(
 					(f"Очень приятно, {name}." if input else f"Ваше имя — {name}.") if self.who == self.game.player else
 					(f"В ваших руках {name}." if input else f"Имя вашего автомата — {name}.") if self.who == self.game.player.weapon else
 					internalerror(self.who, "who"),
 					"Всё верно?" if input else "Продолжить?"),
-				lambda input, mode: self.handle_name_confirmation(input, mode, name, gender)))
+				lambda input, mode: self.handle_name_confirmation(input, mode, name, gender))
 		else:
 			mode.more("{0}. Длина имени должна быть от {1} до {2}.".format(
 				plural(len(input), "Введ{ён/ено/ено} {N} символ{/а/ов}"), MIN, plural(MAX, "{N} символ{/а/ов}")))
 
 	def handle_name_confirmation(self, input, mode, name, gender):
-		if not input or 'yes'.startswith(input):
-			self.complete_name(name, gender)
-		elif 'quit'.startswith(input):
-			mode.switch_to(MainMenu())
-		else:
-			mode.revert()
+		if not input or 'yes'.startswith(input): self.complete_name(name, gender, mode)
+		elif 'quit'.startswith(input):           mode.switch_to(MainMenu())
+		else:                                    mode.revert()
 
-	def complete_name(self, name, gender):
+	def complete_name(self, name, gender, mode):
 		if gender == Gender.UNKNOWN and self.who == self.game.player:
 			default_gender = Gender.detect(name)
-			self.session.switch_to(Prompt(
-				"Вы мальчик или девочка? ({m}/{f}) ".format(
-					m = 'M' if default_gender == Gender.MALE else 'm', f = 'F' if default_gender == Gender.FEMALE else 'f'),
-				lambda input, mode: self.handle_gender_answer(input, mode, name, default_gender)))
+			mode.prompt("Вы мальчик или девочка? ({0}/q) ".format(highlight_variant("m/f", default_gender)),
+				lambda input, mode: self.handle_gender_answer(input, mode, name, default_gender))
 		else:
 			self.complete(name, gender)
 
 	def handle_gender_answer(self, input, mode, name, default_gender):
 		check(self.who == self.game.player, "not player?!")
-		gender = (Gender.MALE if input and 'male'.startswith(input) else
-			Gender.FEMALE if input and 'female'.startswith(input) else
-			default_gender if not input and default_gender != Gender.UNKNOWN else
-			None)
+		if not input:                    gender = default_gender
+		elif 'male'.startswith(input):   gender = Gender.MALE
+		elif 'female'.startswith(input): gender = Gender.FEMALE
+		elif 'quit'.startswith(input):   mode.switch_to(MainMenu()); return
+		else:                            gender = Gender.UNKNOWN
 
-		if gender is not None:
+		if gender != Gender.UNKNOWN:
 			self.complete(name, gender)
 		else:
 			mode.revert()
@@ -2310,7 +2607,7 @@ class AskName(Prompt):
 class Session:
 	def __init__(self, start=None):
 		self.mode = None
-		self.term_width, self.term_height = None, None
+		self.term_width = self.term_height = None
 		self.quit_posted = False
 		self.cls_once_requested = False
 		self.switch_to(start or MainMenu())
@@ -2329,8 +2626,7 @@ class Session:
 			mode = check(mode.prev_mode, isinstance(mode.prev_mode, Mode), "prev_mode?!")
 			n -= 1
 			self.switch_to(mode, reverting=True)
-		self.cls_once()
-		return mode
+		return self.cls_once()
 
 	def process(self):
 		cmds = Commands()
@@ -2346,12 +2642,12 @@ class Session:
 			self.cls_once_requested = False
 			self.rerender_mode_stack_behind_current_mode()
 
-		self.mode.render(cmds)
+		mode.render(cmds)
 		has_default_commands = cmds.root.childs
 		if has_default_commands: self.add_default_commands(cmds)
 		try:
 			cmd = input()
-			self.mode.last_input = cmd
+			mode.last_input = cmd
 		except (KeyboardInterrupt, EOFError) as e:
 			self.post_quit()
 			if isinstance(e, KeyboardInterrupt): print()
@@ -2359,10 +2655,10 @@ class Session:
 
 		fn, matches, suggestions = cmds.guess(cmd)
 		if fn: fn()
-		elif self.mode.handle_command(cmd): pass
-		elif matches: self.mode.more("Неоднозначная команда: {0}.".format(", ".join(matches)))
-		elif suggestions: self.mode.more("Неизвестная команда. Попробуйте {0}.".format(", ".join(suggestions)))
-		elif cmd and not cmd.isspace(): self.mode.more("Неизвестная команда." + (" Попробуйте \"?\"." if has_default_commands else ""))
+		elif mode.handle_command(cmd): pass
+		elif matches: mode.more("Неоднозначная команда: {0}.".format(", ".join(matches)))
+		elif suggestions: mode.more("Неизвестная команда. Попробуйте {0}.".format(", ".join(suggestions)))
+		elif cmd and not cmd.isspace(): mode.more("Неизвестная команда." + (" Попробуйте \"?\"." if has_default_commands else ""))
 		return not self.quit_posted
 
 	def post_quit(self):
@@ -2385,7 +2681,7 @@ class Session:
 
 	def cls_once(self):
 		self.cls_once_requested = True
-		return self
+		return self.mode
 
 	# Чтобы, например, вложенные more-сообщения корректно убирались, оставляя предыдущие,
 	# экран очищается и всё, что на нём должно было быть — перерисовывается.
@@ -2411,20 +2707,18 @@ def selftest():
 				one(*case)
 			except Exception as e:
 				fails.append("Тест {0} #{1} {2}. {3}".format(name, count, "провален" if isinstance(e, Test.Failed) else "упал",
-					str(e) if isinstance(e, Test.Failed) else traceback.format_exc()))
+					exception_msg(e) if isinstance(e, Test.Failed) else traceback.format_exc()))
 			count += 1
 		if account: tests.append(name + (f" x{count}" if count > 1 else ""))
 
-	if account:
-		ticks = time.clock()
+	if account: ticks = time.clock()
 	for name, value in globals().items():
 		if isinstance(value, type) and issubclass(value, Test) and value is not Test:
 			test = value()
 			test.setup()
 			run(name[:-len("Test")] if name.endswith("Test") and len(name) > len("Test") else name, test.cases, test.one)
 			test.teardown()
-	if account:
-		ticks = time.clock() - ticks
+	if account: ticks = time.clock() - ticks
 
 	if fails:
 		raise Test.Failed("\n".join(fails))
