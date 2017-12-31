@@ -1,8 +1,8 @@
 ﻿import sys, os, string, tempfile, pickle, pickletools, lzma, textwrap, math, time, enum, base64
 from traceback import format_exc
 from collections import namedtuple, OrderedDict, defaultdict, deque
-from bisect import bisect_left, bisect_right, insort_left
-from random import random, randrange, choice
+from bisect import bisect_left, bisect_right, insort_right
+from random import random, randrange, choice, uniform
 version, save_version = (0, 2), 0
 
 class config:
@@ -10,6 +10,8 @@ class config:
 
 # FORMAT_RAW не хранит эти настройки в сжатом потоке, поэтому для распаковки нужно указать те же, которыми упаковывались.
 LZMA_OPTIONS = {"format": lzma.FORMAT_RAW, "filters": [{"id": lzma.FILTER_LZMA2, "preset": lzma.PRESET_DEFAULT}]}
+# для default-параметров, где допустимо None
+sentinel = object()
 
 def internalerror(*args):
 	if len(args) == 1: raise AssertionError(f"Внутренняя ошибка: {args[0]}.")
@@ -73,6 +75,109 @@ def pretty_decl(s, width=155, prefix="", pad="\t"):
 		yield '"' + s[:pos] + '"' + ("\\" if pos < len(s) else "") if pos > 0 else '\\' if s else '""'
 		yield from (pad + '"' + s[pos:pos+width] + '"' + ("\\" if pos+width < len(s) else "") for pos in range(pos, len(s), width))
 	return pad + prefix + "\n".join(pieces_gen())
+
+# Выбирает взвешенно-случайный элемент итерируемой последовательности, т. е. не требует len (в отличие от random.choice).
+# «King of the hill» отсюда: https://eli.thegreenplace.net/2010/01/22/weighted-random-generation-in-python.
+def choose(iterable, get_weight=lambda item, index: 1, default=sentinel):
+	best, best_index, sum = default, -1, 0
+	for index, item in enumerate(iterable):
+		w = get_weight(item, index)
+		if w > 0: # там внизу <= на случай uniform(a, b)==b, поэтому нужно явно отбросить элементы с нулевыми весами
+			sum += w
+			if uniform(0, sum) <= w: best, best_index = item, index
+	if best is not sentinel: return best, best_index
+	raise IndexError("Ничего не выбрано.")
+
+# common_prefix_len("привет", "прийти") = 3
+def common_prefix_len(a, b):
+	n = 0
+	while n < len(a) and n < len(b) and a[n]==b[n]: n += 1
+	return n
+
+# Наибольшая общая подпоследовательность. https://en.wikipedia.org/wiki/Longest_common_subsequence_problem
+# lcs("гвозди", "вонзить") == "вози"
+# eqf — равенство элементов a и b
+#
+# Пусть нужно рассчитать LCS(a[:NA], b[:NB]).
+# Если последние буквы одинаковые, она будет равна LCS(a[:NA-1], b[:NB-1]) + эта буква.
+# Иначе — max(LCS(a[:NA-1], b), LCS(a, b[:NB-1])).
+# Т. о. для LCS[a:NA, b[:NB]] нужно знать решения для всех предыдущих NA и NB.
+# Это можно сделать, заполнив таблицу, где элемент X, Y — LCS(a[:X+1], b[:Y+1]), и равен
+# максимуму соседей сверху и слева (если эта буква не совпадает) или соседу сверху-слева+1 (если буква совпадает и т. о. продолжает последовательность).
+# Пусть A = "вонзить", B = "гвозди".
+#   в о н з и т ь     в о н з и т ь     в о н з и т ь     в о н з и т ь     в о н з и т ь     в о н з и т ь
+# г 0 0 0 0 0 0 0   г 0 0 0 0 0 0 0   г 0 0 0 0 0 0 0   г 0 0 0 0 0 0 0   г 0 0 0 0 0 0 0   г 0 0 0 0 0 0 0
+# в                 в 1 0 0 0 0 0 0   в 1 0 0 0 0 0 0   в 1 0 0 0 0 0 0   в 1 0 0 0 0 0 0   в 1 0 0 0 0 0 0
+# о                 о                 о 1 2 2 2 2 2 2   о 1 2 2 2 2 2 2   о 1 2 2 2 2 2 2   о 1 2 2 2 2 2 2
+# з                 з                                   з 1 2 2 3 3 3 3   з 1 2 2 3 3 3 3   з 1 2 2 3 3 3 3
+# д                 д                                                     д 1 2 2 3 3 3 3   д 1 2 2 3 3 3 3
+# и                 и                                                     и                 и 1 2 2 3 4 4 4
+# В нижней правой ячейке — длина ответа. Для расчёта таблицы достаточно хранить два последних ряда.
+# Чтобы восстановить саму последовательность, нужно помнить, откуда получен ответ в ячейке X, Y, это делается в trace:
+# trace[x, y] = 0 — сдвинуться влево-вверх (взять символ)
+# trace[x, y] = 1 — сдвинуться влево (пропустить символ A)
+# trace[x, y] = 2 — сдвинуться вверх (пропустить символ B).
+# ...только вместо x, y используется ofs = x*len(a) + y, чтобы с точки зрения языка это был одномерный массив.
+# (чтобы найти ВСЕ подпоследовательности, придётся добавлять trace = 3 :^) но это сложнее и я не уверен, что там не экспоненциальная сложность.
+def lcs(aseq, bseq, eqf=lambda a, b: a == b):
+	LP = (1 + len(bseq)) * [0] # предыдущий ряд
+	L  = (1 + len(bseq)) * [0] # рассчитываемый ряд
+	trace = len(aseq) * len(bseq) * [0]
+	ofs = 0
+	for ia in range(1, 1 + len(aseq)): # сдвиг на единицу и L/LP на ячейку больше, чтобы не проверять крайний случай с пустым префиксом
+		for ib in range(1, 1 + len(bseq)):
+			# Если A[ia] = B[ib], LCS(ia, ib) = LCS(ia-1, ib-1). Например, LCS("дождь", "червь") = LCS("дожд", "черв") + "ь"
+			# Иначе LCS(ia, ib) = max(LCS(ia-1, ib), LCS(ia, ib-1).
+			L[ib], trace[ofs] = (LP[ib-1] + 1, 0) if eqf(aseq[ia-1], bseq[ib-1]) else (LP[ib], 1) if LP[ib] >= L[ib-1] else (L[ib-1], 2)
+			ofs += 1
+		LP, L = L, LP
+
+	# ia — индекс символа в строке A, который берётся либо нет (можно вместо него отслеживать ib/B с тем же успехом)
+	# rem — оставшаяся длина подпоследовательности
+	ofs, ia, rem = ofs-1, len(aseq), LP[len(bseq)]
+	result = [None] * rem
+	dispatch = ((1, 1, len(bseq)+1), (1, 0, len(bseq)), (0, 0, 1))  # -ia, -rem, -ofs для каждого возможного значения trace
+	while rem > 0:
+		dis = dispatch[trace[ofs]]
+		ia, rem, ofs = ia - dis[0], rem - dis[1], ofs - dis[2]
+		if dis[1]: result[rem] = aseq[ia]
+	return result if isinstance(result, type(aseq)) else ''.join(result) if issubclass(type(aseq), str) else type(aseq)(result)
+# (в итоге я это не использую, ну и ладно)
+
+# упрощённая версия lcs(), если не нужна сама последовательность, а только длина
+def lcs_len(aseq, bseq, eqf=lambda a, b: a == b):
+	LP = [0] * (1 + len(bseq))
+	L  = [0] * (1 + len(bseq))
+	for ia in range(1, 1 + len(aseq)):
+		for ib in range(1, 1 + len(bseq)):
+			L[ib] = LP[ib-1] + 1 if eqf(aseq[ia-1], bseq[ib-1]) else LP[ib] if LP[ib] >= L[ib-1] else L[ib-1]
+		LP, L = L, LP
+	return LP[len(bseq)]
+
+# is_subseq("вози", "гвозди") == True
+def is_subseq(seq, ref, eqf=lambda a, b: a == b):
+	ref_iter = iter(ref)
+	for item in seq:
+		while True:
+			ref_item = next(ref_iter, sentinel)
+			if ref_item is sentinel: return False
+			if eqf(item, ref_item): break
+	return True
+
+# модификация lcs_len, возвращающая максимальную «оценку» среди общих подпоследовательностей
+# lcs_len — частный случай lcs_score с оценкой 1 при равенстве элементов и 0 при неравенстве
+# например:
+# lcs_score(["раз", "blah", "два", "три"], ["раскол", "дворец", "nah", "триста"], lambda a, _ia, b, _ib: common_prefix_len(a, b)) =
+# = 7 ("ра" + "дв" + "три")
+# если сильно нужно, то по аналогии с lcs() можно восстановить саму последовательность, но мне не нужно :)
+def lcs_score(aseq, bseq, scoref):
+	LP = [0] * (1 + len(bseq))
+	L  = [0] * (1 + len(bseq))
+	for ia in range(1, 1 + len(aseq)):
+		for ib in range(1, 1 + len(bseq)):
+			L[ib] = max(LP[ib-1] + scoref(aseq[ia-1], ia-1, bseq[ib-1], ib-1), LP[ib], L[ib-1])
+		LP, L = L, LP
+	return LP[len(bseq)]
 
 # Наивный байесовский классификатор, украденный из https://habrahabr.ru/post/120194/.
 # guess возвращает (1) наиболее вероятный класс и (2) отрыв от предыдущего, приведённый к [0; 1] (или None, None — пока такого не будет, но завтра...).
@@ -311,7 +416,7 @@ class Noun:
 	# Спасибо, дядя!
 	names = "аватар алкаш анархист ангел аноним Антон атронах бандит батя бес биомусор бодибилдер боец бомж борец брат братишка быдлан великан весельчак ветеран воин волшебник вор ворчун вымогатель глаз глист гном говнарь голем грешник гусь девственник демон дерьмодемон Джон дракон дрищ друг дружище Ероха зверь змей Иван идиот имитатор инвалид инспектор камень карасик Кирилл клинок клоун коллекционер конь крокодил крыс лазутчик лектор лещ маг майор мастер молочник мститель музыкант Нариман наркоман насильник натурал невидимка одиночка отшельник охотник патимейкер паук Петрович петух пидор планктон подлещик пожиратель полковник поп призыватель рай рак рокер сатанист священник скоморох слоник содомит солдат соратник сталкер старатель старик странник студент сыч таран титан товарищ трюкач тян{f} убийца ублюдок угар ужас фаллос фантом философ хикки химик хитрец художник человек червь шайтан шакал шаман шахтёр школьник шторм шутник эксперт эльф" # pylint: disable=line-too-long
 
-	adjs = "адский алкоголический альфа- анальный ангельский астероидный аффективный безголовый безграмотный безногий безрукий бесноватый беспутный бессмертный блаженный боевой бойцовский болотный большой буйный быстрый великий весёлый военный воздушный волшебный вражеский вселенский всемогущий галактический глубоководный голубой горный горячий грустный девственный демонический деревянный дикий доверчивый домашний древний дружеский дырявый ёбаный железный желтый живой жирный законный зеленый зловещий золотой интернациональный искусственный истинный каменный компьютерный королевский космический красный легендарный легкомысленный лесной летающий лимонный лунный маленький мамкин межпространственный молочный молчаливый морозный мстительный мёртвый невидимый незаконный ненужный неповторимый нескучный неудержимый нищий обдристанный обсидиановый обычный огненный одинокий октариновый омега- опасный оранжевый отверженный очковый петушиный пидорский поддельный подзаборный подземный праведный провинциальный пьяный райский раковый речной розовый роковой рыбный свободный святой священный сексуальный семейный серебрянный сильный синий скучный смелый смертельный смертный снежный солнечный степной странный титанический тупой тёмный ублюдочный угольный унылый успешный хитрый честный чёрный шоколадный штормовой шутливый" # pylint: disable=line-too-long
+	adjs = "адский алкоголический альфа- анальный ангельский астероидный аффективный безголовый безграмотный безногий безрукий бесноватый беспутный бессмертный блаженный боевой бойцовский болотный большой буйный быстрый великий весёлый военный воздушный волшебный вражеский вселенский всемогущий галактический глубоководный голубой горный горячий грустный девственный демонический деревянный дикий доверчивый домашний древний дружеский дырявый ёбаный железный жёлтый живой жирный законный зелёный зловещий золотой интернациональный искусственный истинный каменный компьютерный королевский космический красный легендарный легкомысленный лесной летающий лимонный лунный маленький мамкин межпространственный молочный молчаливый морозный мстительный мёртвый невидимый незаконный ненужный неповторимый нескучный неудержимый нищий обдристанный обсидиановый обычный огненный одинокий октариновый омега- опасный оранжевый отверженный очковый петушиный пидорский поддельный подзаборный подземный праведный провинциальный пьяный райский раковый речной розовый роковой рыбный свободный святой священный сексуальный семейный серебрянный сильный синий скучный смелый смертельный смертный снежный солнечный степной странный титанический тупой тёмный ублюдочный угольный унылый успешный хитрый честный чёрный шоколадный штормовой шутливый" # pylint: disable=line-too-long
 
 	@staticmethod
 	def feminize_adj(w):
@@ -358,11 +463,12 @@ def clamp(x, a, b): # эти странные конструкции — (бес
 	return x if (x >= a) and (x <= b) else b if x > b else a
 
 # XOR с псевдослучайными числами, чтобы некоторые строки не светились в файлах в неизменном виде >:3
+# www.pcg-random.org
 def pcgxor(seq, seed=0, mask=255):
 	def pcg(state, inc):
 		while True:
-			state = (state * 6364136223846793005 + inc) & 0xFFFFFFFFFFFFFFFF
-			xs, rot = (state >> 45) ^ (state >> 27) & 0xFFFFFFFF, state >> 59
+			state = (state * 6364136223846793005 + inc) & 0xFFFFFFFFFFFFFFFF # ой, не надо было так делать, ну ладно, мне лень магические строки переделывать
+			xs, rot = (state >> 45) ^ (state >> 27) & 0xFFFFFFFF, state >> 59 # (в оригинале предлагается обновить state ПОСЛЕ, чтобы затруднить поиск в памяти etc.)
 			xs = (xs >> rot) | (xs << (31 & -rot))
 			yield from (xs>>r&mask for r in range(0, 32, 8))
 
@@ -431,7 +537,6 @@ def exception_msg(e):
 # .guess("h") → None, ["hit", "hook"], None
 # .guess("ho") → funcB, None, None
 #
-# Можно использовать составные команды (без них реализация укладывалась в 15 строк, хех мда):
 # .add("hit body", funcC)
 # .guess("h b") → funcC, None, None
 # .guess("h c") → None, None, ["hit body"]
@@ -442,120 +547,169 @@ def exception_msg(e):
 # .add("a b", funcAB)
 # .add("a b c d", funcABCD)
 class Commands:
+	leaf = namedtuple('leaf', 'node, raw, words')
 	def __init__(self):
 		self.root = Commands.node(None, None)
+		self.leafs = []
 
 	def add(self, *args):
-		# можно сделать nodes = [self.root] и убрать node, но это будет создавать мусор,
-		# реально нужный, только когда используется форма .add(("a", "a_synonym"), funcA, ...)
-		node, nodes = self.root, None
+		node, raw, words = self.root, None, None
 
 		iarg = 0
 		while iarg < len(args):
 			cmd, func = args[iarg], args[iarg+1]
+			check(cmd, isinstance(cmd, str), "cmd?!")
+			check(func, func, "func?!")
+
+			new_words = Commands.split(cmd)
+			if not new_words: raise ValueError(f"Пустая команда.")
+			raw = (raw + (" " if Commands.classify_sym(new_words[0][0:1]) == Commands.classify_sym(raw[-1:]) else "") + cmd) if raw else cmd
+			if words: words = words + new_words # нельзя делать extend, эти words лежат в предыдущем leaf
+			else: words = new_words
+
+			node = node.add(cmd, func)
+			self.leafs.append(Commands.leaf(node, raw, words))
 			iarg += 2
 
-			if isinstance(cmd, str):
-				if node: node = node.add(cmd, func)
-				if nodes:
-					for i in range(len(nodes)):
-						nodes[i] = nodes[i].add(cmd, func)
-			else:
-				new_nodes = []
-				for one in cmd:
-					if node: new_nodes.append(node.add(one, func))
-					if nodes: new_nodes.extend(node.add(one, func) for node in nodes)
-				node, nodes = None, new_nodes
-
 	def guess(self, input):
-		def suggestions(matches):
-			# Развернуть детей? Например, развернёт матч "hit body" в гипотетические "hit body strong" и "hit body weak"
-			unfold = len(matches) == 1 and (len(matches[0].childs) > 1 or not matches[0].func)
+		def suggestions_on_error():
+			return None, None, self.suggest_something(input) or None
 
-			# В корне потенциально много команд, так что подсказывать только для частично введённых, т. е. имеющих node.parent.
-			return [node.backtrack() for match in matches for node in (match.childs.values() if match.childs and match.parent and unfold else (match,)) if node.parent]
+		def found(node):
+			node = node.down_to_unambiguous()
+			return (node.func, None, None) if node.func else (None, self.suggest_something(start_node = node) or None, None)
 
-		matches = [self.root] # ведение такого списка позволяет угадать "hit body strong" по "h b s", даже если есть другие команды на "h" или "h b".
-		path = Commands.split(input)
-		for subcommand in path:
-			new_matches = [child for node in matches for cmd, child in node.childs.items() if cmd.startswith(subcommand)]
-			if not new_matches: # введено a b c, когда есть только a b → возврат подсказок по a b
-				return None, None, suggestions(matches) or None
-			matches = new_matches
+		words = Commands.split(input)
+		if not words: return None, None, None # ...а то он много чего придумает
 
-		for i in range(len(matches)):
-			matches[i] = matches[i].down_to_unambiguous() # однозначные продолжения команды, например, введено hit и есть только hit body
+		# Для каких команд input является подпоследовательностью по символам?
+		# Может быть смысл использовать модификацию (omg) lcs_score, которая бы давала бонусы за подряд идущие символы,
+		# чтобы на "il" предпочесть "silence" вместо "dispell"
+		sym_cs = [leaf for leaf in self.leafs if is_subseq(input, leaf.raw)]
+		if len(sym_cs) == 1:
+			# для ровно одной: это однозначный ответ
+			return sym_cs[0].node.func, None, None
+		elif not sym_cs:
+			# ни для одной: подсказать хоть что-нибудь
+			return suggestions_on_error()
+		else:
+			# Возьмём догадки по подпоследовательностям за основу.
+			cs = sym_cs
 
-		# Если в какой-то команде набралось больше точных совпадений, чем в остальных, выбрать её.
-		# Без этого проваливаются тесты на тему sp- и sp.frailness.
-		best_score, best_index = 0, -1
-		for index, match in enumerate(matches):
-			if match.func:
-				score = match.score(path)
-				if score >= best_score:
-					best_score, best_index = score, index if score > best_score else -1 # больше одного максимума — фейл
-		if best_index >= 0: matches = [matches[best_index]]
+			# Но раз по символам слишком много всего, будем анализировать по словам.
+			# Приоритетно рассмотреть подпоследовательности с полными совпадениями слов, если таковые есть.
+			precise_cs = best_score = None
+			for leaf in sym_cs:
+				cur_score = lcs_len(leaf.words, words)
+				if cur_score and (best_score is None or cur_score > best_score):
+					best_score = cur_score
+					precise_cs = [leaf]
+				elif cur_score == best_score:
+					precise_cs.append(leaf)
+			if precise_cs and len(precise_cs) == 1:
+				return found(precise_cs[0].node)
+			elif precise_cs:
+				cs = precise_cs
 
-		# "or None" — чтобы в тестах можно было проверять на равенство, не заботясь о False или [].
-		return len(matches) == 1 and matches[0].func or None, (len(matches) > 1 or not matches[0].func) and suggestions(matches) or None, None
+			# Для каких подпоследовательностей по символам input является подпоследовательностью по словам, и насколько хорошей? Оценивается по длине LCS слов :)
+			# Также пропускаются менее многословные команды, чтобы на 1 и remove 1 ответило 1.
+			# Также бонусно учитывается общий префикс, чтобы на remove 10, remove 11, remove 21 и введённую remove 1 не называло в подсказках remove 21.
+			word_cs = best_score = None
+			for leaf in cs:
+				cur_score = lcs_score(leaf.words, words, lambda a, _ia, b, _ib: common_prefix_len(a, b) + lcs_len(a, b))
+				if best_score is None or cur_score > best_score or cur_score == best_score and len(leaf.words) < len(word_cs[0].words):
+					word_cs = [leaf]
+					best_score = cur_score
+				elif cur_score == best_score and len(leaf.words) == len(word_cs[0].words):
+					word_cs.append(leaf)
 
-	@staticmethod
-	def split(cmd):
-		i, r = 0, []
-		while i < len(cmd):
-			start_cls = Commands.classify_sym(cmd[i])
-			if start_cls >= 0:
-				start = i
-				while i+1 < len(cmd) and Commands.classify_sym(cmd[i+1]) == start_cls: i += 1
-				r.append(cmd[start:i+1])
-			i += 1
-		return r
+			if word_cs and len(word_cs) == 1: # Одна подошла лучше остальных: это однозначный (кхе-кхе) ответ.
+				return found(word_cs[0].node)
+			elif word_cs:
+				cs = word_cs
+			else:
+				# Это НЕВОЗМОЖНО ввиду оценки через lcs_len. Но на случай, если логика оценки изменится, оставлю заглушку...
+				return suggestions_on_error() # Либо cs = word_cs и пойти дальше.
+
+			# После всех пыток команда осталась неоднозначной, так и ответим.
+			# Если слишком много вариантов — выбрать случайные.
+			MAX_ALTERNATIVES = 10
+			if len(cs) > MAX_ALTERNATIVES: cs = [cs[i] for i in sorted(random.sample(range(len(cs)), MAX_ALTERNATIVES))]
+			return None, [leaf.raw for leaf in cs], None
 
 	@staticmethod
 	def classify_sym(sym): return (
 		-1 if sym in string.whitespace else
-		0 if sym in string.ascii_letters or sym in string.digits else
-		1 if sym == '?' else
-		2)
+		0 if sym in string.ascii_letters else
+		1 if sym in string.digits else
+		2 if sym in '?' else
+		3)
+
+	@staticmethod
+	def split(cmd, seps=False):
+		i, r, preved = 0, [], 0
+		while i < len(cmd):
+			start_cls = Commands.classify_sym(cmd[i])
+			if start_cls >= 0:
+				start = i
+				while True:
+					i += 1
+					if i >= len(cmd) or Commands.classify_sym(cmd[i]) != start_cls: break
+				part = cmd[start:i]
+				r.append((cmd[preved:start], part) if seps else part)
+				preved = i
+			else:
+				i += 1
+		return r
+
+	def has_anything(self):
+		return self.root.childs
+
+	def suggest_something(self, input=sentinel, start_node=None):
+		matches = [start_node or self.root]
+		for subcommand in Commands.split(input) if input is not sentinel else []:
+			new_matches = [child for node in matches for cmd, child in node.childs.items() if cmd.startswith(subcommand)]
+			if not new_matches: break
+			matches = new_matches
+
+		# если только один match, и это не корень (либо явно вызвано suggest_something() без input) —  развернуть в детей
+		if len(matches) == 1 and not matches[0].func and matches[0].childs and (matches[0].parent or input is sentinel):
+			matches = [match for match in matches[0].childs.values()]
+
+		return [node.down_to_unambiguous().backtrack() for node in matches if node.parent]
 
 	class node:
-		def __init__(self, name, parent):
+		def __init__(self, name, parent, space=""):
 			self.childs = OrderedDict()
 			self.func   = None
 			self.name   = name
+			self.space  = space
 			self.parent = parent
 
 		def add(self, cmd, func):
 			node = self
-			for subcommand in Commands.split(cmd):
+			for space, subcommand in Commands.split(cmd, seps=True):
 				child = node.childs.get(subcommand, None)
 				if not child:
-					child = Commands.node(subcommand, node)
+					child = Commands.node(subcommand, node, space)
 					node.childs[subcommand] = child
 				node = child
 			if node.func: raise RuntimeError("Команда {0} уже определена.".format(node.backtrack()))
 			node.func = check(func, func, cmd)
 			return node
 
-		def backtrack(self, raw=False):
+		def backtrack(self, as_list=False):
 			node, path = self, []
 			while node.parent:
-				path.append(node.name)
+				path.append(node)
 				node = node.parent
-			if raw: return path
-
-			# в command? пробел не нужен (можно, но не смотрится), в command subcommand — нужен
-			def choose_separator_before(i):
-				return "" if Commands.classify_sym(path[i][0]) != Commands.classify_sym(path[i+1][-1]) else " "
-			return ''.join(path[i//2] if i%2 == 0 else choose_separator_before(i//2) for i in range(2*len(path)-2, -1, -1))
+			if as_list: return [node.name for node in path]
+			return ''.join(node.space + node.name for node in reversed(path))
 
 		def down_to_unambiguous(self):
 			node = self
 			while not node.func and len(node.childs) == 1 and node.parent: node = next(node for node in node.childs.values())
 			return node
-
-		def score(self, path):
-			return sum(int(part == full) for part, full in zip(path, reversed(self.backtrack(raw=True)))) # количество точных совпадений фрагментов команды
 
 class DummyCommands:
 	@staticmethod
@@ -564,16 +718,21 @@ class DummyCommands:
 class CommandsTest(Test):
 	cases = \
 		(
+			(("one two three", "123"), ("one two four", "124"), ("one three six", "136")),
 			(
-				(("one two three", "123"), ("one two four", "124"), ("one three six", "136")),
-				(
-					("o t", (None, ["one two", "one three six"], None)),
-					("o t t", ("123", None, None)),
-					("o t s", ("136", None, None)),
-				)
-			),
-			((("spd-", "A"), ("sp.frailness", "B")), ("sp-", ("A", None, None))),
-			((("sp-", "A"), ("spd-", "B"), ("sp.frailness", "C")), ("sp-", ("A", None, None)))
+				("o t", (None, ["one two three", "one two four", "one three six"], None)),
+				("o t t", ("123", None, None)),
+				("o t s", ("136", None, None)),
+			)
+		), \
+		((("spd-", "A"), ("sp.frailness", "B")), ("sp-", ("A", None, None))), \
+		((("sp-", "A"), ("spd-", "B"), ("sp.frailness", "C")), ("sp-", ("A", None, None))), \
+		(
+			(("1", "L1"), ("remove 1", "A"), ("remove 10", "B"), ("remove 11", "C"), ("remove 21", "D")),
+			(
+				("r1", ("A", None, None)),
+				("r2", ("D", None, None)),
+			)
 		)
 	def one(self, adds, queries):
 		cmds = Commands()
@@ -1515,9 +1674,10 @@ class Living:
 		def will_levelup(): return self.xp >= self.xp_for_levelup(self.xl) and self.xl < self.LEVEL_CAP
 		if will_levelup():
 			rv = self.save_relative_vitals()
-			while will_levelup():
+			while True:
 				self.xp -= self.xp_for_levelup(self.xl)
 				self.level_up()
+				if not will_levelup(): break
 			self.restore_relative_vitals(rv)
 		if self.xl == self.LEVEL_CAP: self.xp = 0
 
@@ -1767,23 +1927,27 @@ class Mode:
 
 class MainMenu(Mode):
 	def do_render(self, cmds):
+		def add_multi(synonims, *args):
+			for cmd in synonims:
+				cmds.add(cmd, *args)
+
 		ci = 1
 		msg = \
 			           "        VISIBLE FIGHTERS v.{0}       \n".format(".".join(str(part) for part in version)) + \
 			         "({0})        - новая игра -        (new)".format(ci)
-		cmds.add((str(ci), 'new'), lambda: self.start_new_game(), '?', lambda: self.more("Начать новую игру."))
+		add_multi((str(ci), 'new'), lambda: self.start_new_game(), '?', lambda: self.more("Начать новую игру."))
 		ci += 1
 
 		if os.path.exists(Game.SAVE_FOLDER):
 			msg += "\n({0})      - продолжить игру -    (load)".format(ci)
-			cmds.add((str(ci), 'load'), lambda: self.switch_to(LoadGame()), '?', lambda: self.more("Продолжить сохранённую игру."))
+			add_multi((str(ci), 'load'), lambda: self.switch_to(LoadGame()), '?', lambda: self.more("Продолжить сохранённую игру."))
 			ci += 1
 
 		msg += \
 			       "\n({0})         - справка -         (help)\n".format(ci) + \
 			           "(0)          - выход -          (quit)"
-		cmds.add((str(ci), 'help'), lambda: self.more(MainMenu.Help, do_cls=True), '?', lambda: self.more("Вывести справку об основных моментах."))
-		cmds.add(('0', 'quit'), lambda: self.session.post_quit(), '?', lambda: self.more("Выйти из приложения."))
+		add_multi((str(ci), 'help'), lambda: self.more(MainMenu.Help, do_cls=True), '?', lambda: self.more("Вывести справку об основных моментах."))
+		add_multi(('0', 'quit', 'exit'), lambda: self.session.post_quit(), '?', lambda: self.more("Выйти из приложения."))
 		print(msg)
 
 	def start_new_game(self):
@@ -1806,61 +1970,107 @@ class MainMenu(Mode):
 		"Между боями вы можете тратить золото на апгрейды в пределах полученного опыта. Золото за даунгрейд компенсируется частично.\n"\
 		"В игре 10 уровней. Сохранение выполняется автоматически.\n"\
 		"\n"\
-		"Можно сокращать команды до префиксов: heal hp -> h h, b.fire? -> b.f?.\n"\
-		"                                                            ^       ^\n"\
-		"                                                    |\"?\" выводит справку по команде или подписанному элементу экрана."
+		"Можно сокращать команды: heal hp -> h h, b.fire? -> b.f?.\n"\
+		"                                               ^       ^\n"\
+		"                                       |\"?\" выводит справку по команде или подписанному элементу экрана."
 
 class LoadGame(Mode):
 	def __init__(self):
 		super().__init__()
-		self.first    = 0
+		self.first = 0
+		self.show = None
 		self.had_previews = None
-		self.step     = None
+		self.first_up = self.show_up = self.first_dn = self.show_dn = None
+		self.something_new = None
 
-	def calculate_step(self):
-		reserve = 11
-		if self.first > 0: reserve += 2 # (up)
-		return max(3, (self.term_height - reserve) // (Session.PreviewsList.Item.LOAD_SCREEN_DESC_LINES + 1) - 1)
+	def estimate_items_count(self, start, down=True):
+		previews = self.session.previews
+		reserve = 9
+		ok_lines = ok_count = longest_desc = 0
+		# ok_lines и ok_count — принятое число строк с описаниями сохранений и число самих сохранений.
+		# Пока возможно, добавляем очередное сохранение.
+		# reserve — всякие вопросики на экране, longest_desc — в диалогах загрузки и удаления какое-то из сохранений напечатается ещё раз.
+		while down and start >= 0 or not down and start < len(previews.items):
+			count = ok_count + 1
+			index = start + count - 1 if down else start - count
+			if down and index >= len(previews.items) or not down and index < 0:
+				break # край списка
+
+			desc_len = previews.items[index].load_screen_desc_lines() + 1 # пустая строка после описания
+			lines = ok_lines + desc_len
+			longest_desc = max(longest_desc, desc_len)
+
+			# lines — строчки одних описаний, для окончательной оценки добавим к ним окружающие и сравним с term_height
+			deco_lines = lines + longest_desc + reserve
+			if (start if down else index) > 0: deco_lines += 2 # (up) + пустая строка
+			if (index if down else start - 1) < len(previews.items) - 1: deco_lines += 2 # (down) + пустая строка
+			if deco_lines <= self.session.term_height:
+				ok_count, ok_lines = count, lines # и пробовать дальше!~
+			else:
+				break
+		return min(max(3, ok_count), len(previews.items) - start if down else start)
 
 	def do_process(self):
-		self.session.previews.update()
-		if self.had_previews is None: self.had_previews = not not self.session.previews.items
-		if not self.session.previews.items:
-			self.revert().more("Нет сохранений.", do_cls=self.had_previews)
+		previews = self.session.previews
+		previews.update()
+		if self.had_previews is None: self.had_previews = bool(previews.items)
+		if not previews.items:
+			return self.revert().more("Нет сохранений.", do_cls=self.had_previews)
+		self.something_new = previews.up_new_miss
 
-		for _pass in range(2):
-			self.step = self.calculate_step()
-			# если экран оказался прокрученным за последнее сохранение (они могли поудаляться за кулисами, etc.): прокрутить так, чтобы были видны нижние
-			if self.first >= len(self.session.previews.items):
-				self.first = max(0, len(self.session.previews.items) - self.step)
-				self.step = self.calculate_step()
+		if self.first >= len(previews.items):
+			# Если обзор уехал за последнее сохранение (мало ли они сами поудалялись), подвинуть на нижние видимые позиции.
+			self.show = self.estimate_items_count(len(previews.items), down=False)
+			self.first = len(previews.items) - self.show
+		else:
+			# Обычный сценарий: просто подогнать под экран.
+			self.show = self.estimate_items_count(self.first, down=True)
+
+		# Доступна ли прокрутка вниз, и какими будут новые first/show?
+		if self.first + self.show < len(previews.items):
+			self.first_dn = self.first + self.show
+			self.show_dn  = self.estimate_items_count(self.first_dn)
+			check(self.show_dn, self.show_dn > 0, "show_dn")
+		else:
+			self.first_dn = None
+
+		# То же для прокрутки вверх
+		if self.first > 0:
+			count = self.estimate_items_count(self.first, down=False)
+			check(count, count > 0, "count")
+			self.first_up = self.first - count
+			self.show_up = count
+		else:
+			self.first_up = None
 
 	def do_render(self, cmds):
-		check(self.step, "step?!")
-		end = self.first + self.num_to_show(self.first)
+		if self.first_up is not None:
+			print(f"({1 + self.first_up}–{self.first_up + self.show_up}) (up)")
+			cmds.add('up', lambda: self.up(), '?', lambda: self.more("Прокрутить список вверх."))
 
-		if self.first > 0:
-			print("({0}) (up)".format(f"{max(1, 1 + self.first - self.step)}–{self.first}"))
-			cmds.add('up', lambda: self.up(self.step), '?', lambda: self.more("Прокрутить список вверх."))
-
-		desc_pad = len(str(end)) + 3 # (, число, ), пробел
-		for item in self.session.previews.items[self.first : end]:
+		desc_pad = len(str(self.first + self.show)) + 3 # (, число, ), пробел
+		for item in self.session.previews.items[self.first : self.first + self.show]:
 			for _tryIndex in range(2): # перестраховка, скорее всего, не нужно, но пусть будет
 				try:
-					print(("\n" if item.index > self.first or self.first > 0 else "") + self.save_desc(item, desc_pad))
+					um = self.session.previews.up_new_miss
+					up_miss = um and any(um) and "  ({0})".format("/".join(s for s in (um[0] and f"+{um[0]}", um[1] and f"-{um[1]}") if s))
+					self.session.previews.up_new_miss = None
+					print(("\n" if item.index > self.first or self.first > 0 else "") + self.save_desc(item, desc_pad, first_line_extra = up_miss))
 					break
 				except Exception as e:
-					self.session.previews.force_bad(item, e)
+					if not item.bad and _tryIndex == 0: self.session.previews.force_bad(item, e)
 			if item.bad:
 				cmds.add(str(1 + item.index), self.create_remove_request_handler(item, desc_pad), '?', lambda: self.more("Удалить это сохранение."))
 			else:
 				cmds.add(str(1 + item.index), self.create_load_request_handler(item, desc_pad), '?', lambda: self.more("Загрузить это сохранение."))
-			item.seen = True # пользователь увидел — в следующий раз не рисовать звёздочку
+			if not item.seen:
+				self.something_new = True # <enter> уберёт звёздочки, а не прокрутит экран
+				item.seen = True # пользователь увидел — в следующий раз не рисовать звёздочку
 
 		remove_inscriptions = ['remove <номер>']
 		cmds.add('remove', self.create_remove_by_number_handler(desc_pad),
 			'?', lambda: self.more("Удалить сохранение{0}.".format(" (спросит номер)" if len(self.session.previews.items) > 1 else "")))
-		for item in self.session.previews.items[self.first : end]:
+		for item in self.session.previews.items[self.first : self.first + self.show]:
 			cmds.add('remove ' + str(1 + item.index), self.create_remove_request_handler(item, desc_pad), '?', lambda: self.more("Удалить это сохранение."))
 
 		if len(self.session.previews.items) > 1:
@@ -1872,35 +2082,34 @@ class LoadGame(Mode):
 			cmds.add('remove bad', self.create_batch_remove_handler(lambda item: item.bad, "Повреждённые", default_yes=True),
 				'?', lambda: self.more("Удалить повреждённые сохранения."))
 
-		if end < len(self.session.previews.items):
-			print("\n({0}) (down)".format(f"{1 + end}–{1 + end + self.num_to_show(end) - 1}"))
-			cmds.add('down', lambda: self.down(self.num_to_show(self.first)), '?', lambda: self.more("Прокрутить список вниз."))
+		if self.first_dn is not None:
+			print(f"\n({1 + self.first_dn}–{self.first_dn + self.show_dn}) (down)")
+			cmds.add('down', lambda: self.down(), '?', lambda: self.more("Прокрутить список вниз."))
 
 		print("\nУдалить сохранение ({0})".format(", ".join(remove_inscriptions)))
 		print("Вернуться в главное меню (quit)")
-		cmds.add('force update', lambda: self.session.previews.post_force_update(), '?', lambda: self.more("Перечитать все сохранения."))
+		cmds.add('force update', lambda: self.force_update(), '?', lambda: self.more("Перечитать все сохранения."))
 		cmds.add('quit', lambda: self.switch_to(MainMenu()), '?', lambda: self.more("Вернуться в главное меню."))
 
 	def do_handle_command(self, cmd):
 		if cmd == "":
-			if self.first + self.num_to_show(self.first) >= len(self.session.previews.items):
-				self.first = 0
-			else:
-				self.down(self.num_to_show(self.first))
+			if self.first_dn is not None: self.down(from_enter=True)
+			else: self.first = 0
 			return True
 
-	def up(self, by):
-		self.first = max(0, self.first - by)
+	def up(self):
+		self.first = check(self.first_up, self.first_up is not None, "first_up?!") # а show всё равно обновится в process
 
-	def down(self, by):
-		self.first = max(0, min(len(self.session.previews.items) - 1, self.first + by))
+	def down(self, from_enter=False):
+		if from_enter:
+			if self.something_new or self.session.previews.up_new_miss: return
+			self.session.previews.update()
+			if self.session.previews.up_new_miss: return
+		self.first = check(self.first_dn, self.first_dn is not None, "first_dn?!")
 
-	def num_to_show(self, first):
-		return min(self.step, len(self.session.previews.items) - first)
-
-	def save_desc(self, item, pad):
+	def save_desc(self, item, pad, first_line_extra=None):
 		cmd = "({0}) ".format(1 + item.index).ljust(pad)
-		return cmd + item.load_screen_desc(npad = pad)
+		return cmd + item.load_screen_desc(npad = pad, first_line_extra=first_line_extra)
 
 	def remove_save(self, item, extra_reverts=0, note_success=False):
 		try:
@@ -1960,7 +2169,7 @@ class LoadGame(Mode):
 							raise ValueError("Неверный ввод.")
 					except ValueError:
 						mode.more("Нет таких.").reverts(2)
-				self.prompt(f"Какое сохранение удалить? ({1 + self.first} – {1 + self.first + self.num_to_show(self.first) - 1}) ", handle_answer)
+				self.prompt(f"Какое сохранение удалить? ({1 + self.first} – {self.first + self.show}) ", handle_answer)
 		return remove_by_number
 
 	def create_batch_remove_handler(self, predicate, capitalized_saves_desc, default_yes=False):
@@ -1982,6 +2191,11 @@ class LoadGame(Mode):
 					mode.revert()
 			self.prompt("Удалить {0}? (y/N) ".format(plural(total, "{N} сохранени{е/я/й}")), confirm)
 		return remove
+
+	def force_update(self):
+		if self.last_input != 'force update': return self.more("force update — ответственная команда, введите полностью.")
+		self.session.previews.post_force_update()
+		self.more("Обновление...")
 	prev_mode = True
 
 class MoreMessage(Mode):
@@ -2120,7 +2334,7 @@ class Game:
 		def validate_char(i, c, s): return (
 			'0' <= c <= '9' or
 			'a' <= c <= 'z' or 'A' <= c <= 'Z' or
-			'а' <= c <= 'я' or 'А' <= c <= 'Я' or c in 'ёЁ' or c == ' ' and i > 0 and i < len(s)-1)
+			'а' <= c <= 'я' or 'А' <= c <= 'Я' or c in 'ёЁ-!()[]' or c in ' .' and i > 0 and i < len(s)-1)
 
 		def sanitize(name):
 			return "".join(c for i, c in enumerate(name) if validate_char(i, c, name))
@@ -2170,6 +2384,15 @@ class Game:
 		if self.character_uid is None:
 			self.character_uid = randrange(2**16)
 
+		# Вообще-то choose_order_key потенциально дёргает previews.update(), а она, в свою очередь, может сломать предположение,
+		# что self.rel_save_path есть в previews. Это всё работает только благодаря удачному сочетанию случайностей
+		# (choose_order_key дёргает update, только когда ему не сообщили имя существующего сохранения,
+		# что возможно только при to_new_file or not self.rel_save_path, но в обоих этих случаях выполнение пойдёт по ветке note_add,
+		# т. е. полагается, что rel_save_path И НЕ БЫЛО в previews).
+		#
+		# Сейчас всё вроде бы стабильно работает без искусственной робастности, но когда-нибудь, возможно,
+		# несуществующие rel_save_path, переданные в previews.note_update (а также существующие, переданные в note_add)
+		# придётся там же тихо игнорировать/фиксить задним числом вместо ассертов.
 		order_key = session.previews.choose_order_key(not to_new_file and self.rel_save_path)
 
 		# Записать сразу в новый файл, если:
@@ -2229,15 +2452,15 @@ class Game:
 			mode = mode.more("Не удалось сохранить игру{0}.\n".format(extra_error_comment or "") + exception_msg(e))
 			if then: mode.then(lambda mode: then(False, mode.revert()))
 
-	preview_complement_fields = [('player', Fighter)]
+	complement_fields = [('player', Fighter)]
 	def to_complement(self):
-		return [getattr(self, k) for k, _ in Game.preview_complement_fields]
+		return [getattr(self, k) for k, _ in Game.complement_fields]
 
 	@staticmethod
 	def load_complement(file):
 		complement = pickle.load(file)
-		if not isinstance(complement, list) or len(complement) != len(Game.preview_complement_fields): raise Game.corrupted_save_error('complement')
-		for index, (field, field_type) in enumerate(Game.preview_complement_fields):
+		if not isinstance(complement, list) or len(complement) != len(Game.complement_fields): raise Game.corrupted_save_error('complement')
+		for index, (field, field_type) in enumerate(Game.complement_fields):
 			if not isinstance(complement[index], field_type): raise Game.corrupted_save_error(field + ": " + str(type(complement[index])))
 		return complement
 
@@ -2246,7 +2469,7 @@ class Game:
 		g = Game()
 		for k in ('character_uid', 'gold', 'next_level'):
 			setattr(g, k, getattr(preview, k))
-		for index, (k, _) in enumerate(Game.preview_complement_fields):
+		for index, (k, _) in enumerate(Game.complement_fields):
 			setattr(g, k, complement[index])
 
 		g.full_save_path, g.rel_save_path = full_save_path, rel_save_path
@@ -2273,7 +2496,7 @@ class Game:
 
 	@staticmethod
 	def load(file, full_save_path, rel_save_path):
-		# чтобы нельзя было читерить на несоответствии preview и complement, заменяя физический сейв при открытом экране загрузки :P
+		# preview загружается с нуля, чтобы нельзя было читерить на несоответствии preview и complement, заменяя физический сейв при открытом экране загрузки :P
 		# (как вариант, вообще не использовать preview на этом этапе, дублируя всю нужную информацию в complement)
 		preview = Game.load_preview(file)
 		if file.read(len(Game.MAGIC[0])) != pcgxor(*Game.MAGIC):
@@ -2557,11 +2780,17 @@ class AskName(Prompt):
 				if input == name: return self.complete_name(mode, name, gender)
 			else:
 				if self.who == self.game.player:
-					if mode.session.globals.recent_fixed_name_proposals < 1:
-						self.fixed = self.query_random_fixed_name()
+					# ну не дёргать же update на каждую has_namesakes_of, лучше уж руками.
+					# previews.has_namesakes_of также проверяется в query_random_fixed_name.
+					mode.session.previews.update()
+					self.fixed = mode.session.globals.recent_fixed_name_proposals < 1 and self.query_random_fixed_name()
+					if self.fixed:
 						name, gender = self.fixed[0], self.fixed[1]
 					else:
-						name, gender = Noun.random_name()
+						MAX_REROLLS = 10
+						for _roll in range(1 + MAX_REROLLS):
+							name, gender = Noun.random_name()
+							if not mode.session.previews.has_namesakes_of(name): break
 				elif self.who == self.game.player.weapon:
 					if self.fixed and len(self.fixed) >= 4:
 						name, gender = self.fixed[2], self.fixed[3]
@@ -2622,22 +2851,12 @@ class AskName(Prompt):
 	fixed_names = (("Рика", Gender.FEMALE), ("Мадока", Gender.FEMALE, "Розочка", Gender.FEMALE), ("Фрисия", Gender.FEMALE, "Хвост", Gender.MALE))
 
 	def query_random_fixed_name(self):
-		# TODO: проверять существование имени среди превью, чтобы не предлагать совпадающие
-		if len(AskName.fixed_names) > len(self.session.globals.last_fixed_names_seen):
-			# индекс в массиве, который получился бы, если из fixed_names убрать last_fixed_names_seen.
-			unbiased = randrange(len(AskName.fixed_names) - len(self.session.globals.last_fixed_names_seen))
-			for i, name in enumerate(AskName.fixed_names):
-				if i in self.session.globals.last_fixed_names_seen: continue
-				unbiased -= 1
-				if unbiased < 0:
-					propose = name
-					self.session.globals.last_fixed_names_seen.append(i)
-					break
-			else: internalerror("impossible")
-		else:
-			propose = choice(AskName.fixed_names)
-		self.session.globals.recent_fixed_name_proposals += 1
-		return propose
+		seen, previews = self.session.globals.last_fixed_names_seen, self.session.previews
+		name, index = choose(AskName.fixed_names, lambda name, index: 0.0 if index in seen or previews.has_namesakes_of(name[0]) else 1.0, None)
+		if index >= 0:
+			seen.append(index)
+			self.session.globals.recent_fixed_name_proposals += 1
+			return name # else None
 
 # Ввод-вывод, стек экранов, глобальности.
 class Session:
@@ -2683,7 +2902,7 @@ class Session:
 			self.rerender_mode_stack_behind_current_mode()
 
 		mode.render(cmds)
-		has_default_commands = cmds.root.childs
+		has_default_commands = cmds.has_anything()
 		if has_default_commands: self.add_default_commands(cmds)
 		try:
 			cmd = input()
@@ -2715,8 +2934,7 @@ class Session:
 
 	@staticmethod
 	def list_available_commands(cmds):
-		list = (node.down_to_unambiguous().backtrack() for node in cmds.root.childs.values())
-		av = ", ".join(cmd for cmd in list if cmd != "?")
+		av = ", ".join(cmd for cmd in cmds.suggest_something() if cmd != "?")
 		return "Доступные команды: " + av + "." if av else "Нет доступных команд."
 
 	def cls_once(self):
@@ -2748,8 +2966,8 @@ class Session:
 		# Можно было бы засунуть поля в Preview и хранить сразу Preview, но там и так много всего.
 		class Item:
 			def __init__(self, full_save_path, rel_save_path):
-				self.preview   = None # элементы PreviewsList.items имеют взаимоисключающе выставленные preview либо bad (экземпляр исключения)
-				self.bad       = None
+				self.preview   = None # элементы PreviewsList.items имеют взаимоисключающе выставленные preview либо bad
+				self.bad       = None # непустой список экземпляров исключений, если с сохранением проблемсы
 				self.index     = None # индекс себя в items
 				self.confirmed = None
 				self.full_save_path = full_save_path
@@ -2757,8 +2975,7 @@ class Session:
 				self.namesake_index = None # приписывать -2, -3, etc. для одинаковых имён разных персонажей
 				self.seen      = False
 
-			LOAD_SCREEN_DESC_LINES = 4
-			def load_screen_desc(self, npad=0):
+			def load_screen_desc(self, npad=0, first_line_extra=None):
 				star = "*NEW* "
 				if not self.seen: npad += len(star)
 				pad = ' ' * npad
@@ -2770,18 +2987,22 @@ class Session:
 				else:
 					pv = self.preview
 					dup_desc = f"-{1+self.namesake_index}" if self.namesake_index >= 1 else ""
-					return ("{star}{ts}\n" +
+					return ("{star}{ts}{fle}\n" +
 						"{pad}{pn}{dd} {pl}\n" +
 						"{pad}{wn} {wl}\n" +
 						"{pad}D:{coming} ${gold}").format(
-						ts = time.asctime(pv.timestamp),
+						ts = time.asctime(pv.timestamp), fle = first_line_extra or "",
 						pn = pv.player_name, dd = dup_desc, pl = Living.xl_desc(pv.player_level, pv.player_next, short=True),
 						wn = cap_first(pv.weapon_name), wl = Living.xl_desc(pv.weapon_level, pv.weapon_next, short=True),
 						coming = pv.next_level, gold = pv.gold,
 						pad = pad, star = '' if self.seen else star)
 
+			def load_screen_desc_lines(self):
+				return 4 if self.preview else sum(len(exception_msg(e).splitlines()) + 2 for e in self.bad)
+
+		__slots__= ('items', 'fn2it', 'max_order_key', 'last_listing', 'first_update', 'up_new_miss')
 		def __init__(self):
-			self.items = self.fn2it = self.max_order_key = self.last_listing = self.first_update = None
+			self.items = self.fn2it = self.max_order_key = self.last_listing = self.first_update = self.up_new_miss = None
 			self.post_force_update()
 
 		def post_force_update(self):
@@ -2791,6 +3012,7 @@ class Session:
 			self.last_listing = [] # содержимое SAVE_FOLDER в последний раз.
 			self.first_update = True # seen будет выставлена всем сохранениям, загруженным по post_force_update
 			                         # (в т. ч. первый раз после создания PreviewsList), чтобы им не рисовались звёздочки
+			self.up_new_miss = None  # (число новых, число удалённых) НЕУЧТЁННЫХ ЧЕРЕЗ NOTE_ с последнего раза (для отладки)
 
 		# Обнаружить изменения в папке сохранений, или загрузить всё в первый раз.
 		def update(self):
@@ -2805,9 +3027,10 @@ class Session:
 			if listing == self.last_listing: # LIKELY
 				return
 
+			assert self.sanitycheck()
 			# Добавить новые превью, удалить старые. Порядок и индексы собьются и будут исправлены позже одним махом
 			# (чтобы на десяти тысячах сохранений не подвеситься на вставках в отсортированный список :))).
-			appeared = []
+			appeared, missing = [], 0
 			for item in self.items:
 				item.confirmed = False # not confirmed будут вычеркнуты как более не существующие в папке
 
@@ -2833,19 +3056,21 @@ class Session:
 					self.items[next_item] = item
 					next_item += 1
 				else:
+					missing += 1
 					del self.fn2it[item.rel_save_path]
 
 			# ...добавить новые...
 			for item in appeared:
 				item.seen = self.first_update
-				self.fn2it[item.rel_save_path] = item
 				if next_item < len(self.items): # новые вставляются в хвост, оставшийся от удалённых, пока возможно
 					self.items[next_item] = item
 				else:
 					self.items.append(item)
+				self.fn2it[item.rel_save_path] = item
 				next_item += 1
 			assert next_item <= len(self.items)
 			del self.items[next_item:] # отрезать пустой хвост; если он был исчерпан, то next_item == len(items) и это no-op
+			self.up_new_miss = (len(appeared), missing) if (appeared or missing) and not self.first_update else None
 			self.first_update = False
 
 			# ...заново отсортировать всё и выставить правильные индексы.
@@ -2861,8 +3086,10 @@ class Session:
 
 			# последний штрих: запомнить состояние SAVE_FOLDER, под которое список подгонялся.
 			self.last_listing = listing
+			assert self.sanitycheck()
 
 		def note_add(self, full_save_path, rel_save_path, preview):
+			assert self.sanitycheck()
 			check(full_save_path, "full_save_path?!", rel_save_path, "rel_save_path?!")
 			check(full_save_path, full_save_path.startswith(Game.SAVE_FOLDER), "абсолютный плес")
 			check(rel_save_path, not rel_save_path.startswith(Game.SAVE_FOLDER) and full_save_path.endswith(rel_save_path), "относительный плес")
@@ -2876,26 +3103,31 @@ class Session:
 			self.items.insert(item.index, item)
 			self.fix_indices(item.index + 1)
 			self.fn2it[rel_save_path] = item
-			insort_left(self.last_listing, rel_save_path)
+			insort_right(self.last_listing, rel_save_path)
 
 			self.max_order_key = max(self.max_order_key, preview.order_key)
 			self.update_namesakes(of=item.preview.player_name)
+			assert self.sanitycheck()
 
 		def note_update(self, rel_save_path, preview, new_full_save_path=None, new_rel_save_path=None):
+			assert self.sanitycheck()
 			item = self.fn2it[rel_save_path]
 			assert item.rel_save_path == rel_save_path
 			if new_rel_save_path is not None:
 				assert new_full_save_path is not None
 				assert new_rel_save_path not in self.fn2it, "сохранение {0} уже существует".format(new_rel_save_path)
-				del self.fn2it[rel_save_path]
-				self.fn2it[new_rel_save_path] = item
 				item.full_save_path, item.rel_save_path = new_full_save_path, new_rel_save_path
 
+				del self.fn2it[rel_save_path]
+				self.fn2it[new_rel_save_path] = item
+
 				del self.last_listing[self.last_listing_index(rel_save_path)]
-				insort_left(self.last_listing, new_rel_save_path)
+				insort_right(self.last_listing, new_rel_save_path)
 			item.preview, item.bad = preview, None
+			assert self.sanitycheck()
 
 		def note_remove(self, item):
+			assert self.sanitycheck()
 			check(item, isinstance(item, (str, Session.PreviewsList.Item)), "item?!")
 			if isinstance(item, str): item = self.fn2it[item]
 			assert item is self.items[item.index], "сбился индекс"
@@ -2908,6 +3140,7 @@ class Session:
 				# пересчитать max_order_key, если он соответствовал удалённой записи
 				if item.preview.order_key == self.max_order_key: self.max_order_key = self.calculate_max_order_key()
 				self.update_namesakes(of=item.preview.player_name)
+			assert self.sanitycheck()
 
 		def calculate_max_order_key(self):
 			return max(self.order_keys(), default=-1)
@@ -2926,15 +3159,11 @@ class Session:
 				if not pv or of is not None and pv.player_name != of: continue
 
 				namesakes = name2namesakes.get(pv.player_name, None)
-				if not namesakes:
-					namesakes = dict()
-					name2namesakes[pv.player_name] = namesakes
+				if not namesakes: namesakes = name2namesakes[pv.player_name] = dict()
 
-				ndups = namesakes.get(pv.character_uid, None)
-				if ndups is None:
-					ndups = len(namesakes)
-					namesakes[pv.character_uid] = ndups
-				item.namesake_index = ndups
+				id = namesakes.get(pv.character_uid, None)
+				if id is None: id = namesakes[pv.character_uid] = len(namesakes)
+				item.namesake_index = id
 
 		def choose_order_key(self, rel_save_path=None):
 			if not rel_save_path: self.update()
@@ -2955,10 +3184,36 @@ class Session:
 				del self.items[item.index]
 				item.index = self.find_position_for(item)
 				self.items.insert(item.index, item)
-				self.fix_indices(item.index + 1 if item.index < old_index else old_index, old_index + 1 if item.index < old_index else item.index)
+				self.fix_indices(*(item.index + 1, old_index + 1) if item.index < old_index else (old_index, item.index))
+				assert self.sanitycheck()
 
 		def find_position_for(self, item):
 			return bisect_left(list(-order_key for order_key in self.order_keys(include_bad=True)), -(item.preview.order_key if item.preview else -1))
+
+		def has_namesakes_of(self, name): # это очень медленно, но пока не горит, чтобы усложнять всё, добавляя dict() тёзок...
+			name = name.lower()
+			return any(item.preview and item.preview.player_name.lower() == name for item in self.items)
+
+		def sanitycheck(self):
+			assert len(self.items) == len(self.fn2it) == len(self.last_listing) and \
+				set(item.rel_save_path for item in self.items) == \
+				set(self.fn2it.keys()) == \
+				set(self.last_listing), self.debug_repr() and \
+				all(item.index == i for i, item in enumerate(self.items))
+			return True
+
+		def debug_repr(self):
+			def item_repr(item):
+				pv = item.preview
+				return "{0.index} {0.rel_save_path} ({1})".format(item, f"order_key = {pv.order_key}" if pv else "BAD" if item.bad else "???")
+
+			return "\n\n".join(part for part in (
+				"items ({0}):\n".format(len(self.items)) +
+				"\n".join(item_repr(item) for item in self.items),
+				"fn2it ({0}):\n".format(len(self.fn2it)) +
+				"\n".join("{0}{1}".format(fn, " -> {0}".format(item.rel_save_path) if item.rel_save_path != fn else " (OK)") for fn, item in self.fn2it.items()),
+				"last_listing ({0}):\n".format(len(self.last_listing)) +
+				"\n".join(self.last_listing)))
 
 	class Globals:
 		def __init__(self):
