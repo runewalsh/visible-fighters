@@ -15,7 +15,7 @@ LZMA_OPTIONS = {"format": lzma.FORMAT_RAW, "filters": [{"id": lzma.FILTER_LZMA2,
 sentinel = object()
 
 def impossible(*args):
-	if len(args) == 1: raise AssertionError(f"Внутренняя ошибка: {args[0]}.")
+	if len(args) <= 1: raise AssertionError("Внутренняя ошибка" + (f": {args[0]}" if len(args) > 0 else "") + ".")
 	elif len(args) == 2:
 		what, desc = args[0], args[1]
 		try:    what = f" ({what})"
@@ -80,7 +80,7 @@ def makefuncs():
 	# Опционально читает из файла, записывает в файл и/или форматирует через pretty_decl.
 	def pack_str(src=None, encoding='koi8-r', *, infile=None, outfile=None, pretty=True, **prettyargs):
 		if infile:
-			with open(infile, 'r') as f: src = f.read()
+			with open(infile, 'r', encoding='utf-8-sig') as f: src = f.read()
 		result = base64.b85encode(lzma.compress(src.encode(encoding), **LZMA_OPTIONS)).decode('ascii')
 		return maybewrite(outfile, pretty_decl(result, **prettyargs) if pretty else result)
 
@@ -453,11 +453,11 @@ class Noun(str):
 
 	def src(self, sep="/"): return "".join(piece for literal, cases in self.pieces for piece in (literal, "{" + sep.join(cases) + "}" if cases else ""))
 
-	names_pack = "-~+1yQC$FFwbQNB8YkMB>EYo0pG@2Gy)(};Q(<{OYfTwU^}XzStFJAUefGJ(sBrku?W_fUiN!?*4-~MSfyau%W+!~fkO}zE+8a8wWZilMI^L>hs?k#759QRL;(xh&fuF^YR;h^)lwqvKTOY"\
+	names_pack = "-~*=uP+b6EwbQNB8YkMB>EYo0pG@2Gy)(};Q(<{OYfTwU^}XzStFJAUefGJ(sBrku?W_fUiN!?*4-~MSfyau%W+!~fkO}zE+8a8wWZilMI^L>hs?k#759QRL;(xh&fuF^YR;h^)lwqvKTOY"\
 	"kNbZ=5;mUq;h??wGkL;sY)OMpXC$$-#LfC;rLRI<e5hYR^+P2OwNvh9**E}#Sbs1|&HyMc?gCIQ8f38Uh~f~XNTkn)~~+pFHLkI~t=o*K`dndQ<fw^G!8tPqWPN1%$U^Od@z3bM1gSV{WM;4vV1kAT3gqg02"\
 	"h&`Iey3FHP-4GhMt4FI9p(I2YqxWk8KEgFUVb@1c^<&3S!-@F5bNxS|f`VK}jl9IL|_@^hxW2V!Q?iNd*!83BcW7=|4ygLvK63<UP^4h!9@4KQ~xcUr=$-S!WG<m#%vYnV;-L4;^D0gIfL}mD^Mw{2Oq268e"\
-	"6HRtF_jtw&)26O!eM|QL1p*uZE6y^Wv8rmFg+(FIsakoUI(ujsz96+xjwx7#cB%)oEr8MvWdUx3tr5`+Y%s<t=|c)%xk&D#3Md9?uVkS`XU5M@Zcr0rGmta_$o1rfdbd#xN0bic=t91j|M|nAOKfAZWLbuhF"\
-	"vA1c{1|=!8X8%z(MFJ7zjq}w>ihyyO<s85Pq<27?#AnSKR8)U<YGwN;E^n#j_WW!Ldm;bEp7HfasqP{r`k#~7LJQZA`i&HX?<q2m1WoCUl7@UrkEv`O*pj(u*ixSf0Yy6z@E3=+<YPE00"
+	"6HRtF_jtw&)26O!eM|QL1p*uZE6y^Wv8rmFg+(FIsakoUI(ujsz96+xjwx7#cB%)oEr8MvWdUx3tr5{C{Y>d6Ey}KxLRB@7-9OJsptI|gf4y5)pWC8AoiEi=!W%hg>C&t<rcjZYp!2ER1$th}q+GhVTCs$@%"\
+	"h=9cSI$DZzJT-%ilhsr^D3DsTZ;zqJZI5b?j4`Ud@uryTCqWMO}!t0<1H79ZZ6Q1SR=j<`oh%4!!M5golaL=#jHK3-&Y6Od)50FT#UkS3&51BI)Ew?X?twuIPr8P4Tlf*p+9c<E{S3Q"
 
 	adjs_pack = "-~}E6kX-;^u@*Ee{cN=|z9K_3hS1v_P@g`XiR+XK=j<U&<9u?9Y7pkD#ssC>3Q~MTp+2z_WOIm~(P4yn_Q3rBkLnNCB_+284gE!0yG%#;vZ}<=T+uQ_Vi-mHc^BO)2v?+T)!O1)Fh$HwjH8a"\
 	"!wM6^qG=G95*_CQma`$`CK#3t6_>2hNWSz9LuRDH<vq(O{%;{*z=%X5>Z2e+stG>I;RqqA1X+tlwB_d>cQer(}2__*jqtP_rA49T0GT4BBkCJ(m>0HDw%#6<j*-%h0%$jr~GoP!+(Ag+_oVbGAv!ZinqRU$~"\
@@ -568,13 +568,6 @@ def rand_round(x):
 #         грозящим реальным или предполагаемым
 #         бедствием.
 def wrap(text, width):
-	# Раньше было устроено чуть сложнее, чтобы попытаться доходить до края терминала, когда возможно, но это не всегда работало:
-	# нет гарантии, что консоль переведёт строку по достижении get_terminal_size.columns.
-
-	def safe_width(width): # менее некрасиво никогда не доходить до края терминала, чем рисковать перевести строку дважды
-		return width - 1
-	width = safe_width(width)
-
 	def wrap_paragraph(line, width):
 		# извлечение управляющего |. До его вхождения, =| эскейпает дословный |.
 		prefix, p = '', 0
@@ -586,9 +579,35 @@ def wrap(text, width):
 				line = line[0:p] + line[p+1:]
 				prefix = ' ' * p
 
-		return textwrap.wrap(line, width, subsequent_indent=prefix, drop_whitespace=False) or ('',)
+		return textwrap.wrap(line, width, subsequent_indent=prefix) or ('',)
 
 	return '\n'.join(wrapped_line for source_line in text.splitlines() for wrapped_line in wrap_paragraph(source_line, width))
+
+# Другая обёртка над textwrap.wrap.
+# Возвращает список записей (piece, start, next), где next — позиция, с которой начинается следующая строка (для последней в text будет next = len(text)),
+# а start — где начинается эта (т. е. без учёта граничных случаев [i].next == [i+1].start).
+# Например: wrap_feedback("привет, как дела?", 7) => [('привет,', start=0, next=8>), ('как', start=8, next=12>), ('дела?', start=12, next=17>)]
+# Не поддерживает возможности предыдущего wrap (\n и |).
+class WrapFeedback:
+	__slots__ = 'piece', 'start', 'next'
+	def __init__(self, piece, start): self.piece, self.start, self.next = piece, start, None
+	def __repr__(self): return f"{self.__class__.__name__}({repr(self.piece)}, start={self.start}, next={self.next}>)"
+
+def wrap_feedback(text, width, maxlines=None):
+	pieces = textwrap.wrap(text, width)
+	result = [None] * min(len(pieces), maxlines if maxlines is not None else len(pieces))
+
+	# Найти конец каждой строки результата в text. Предполагается, что это возможно.
+	text_pos = 0
+	for i in range(len(result) + 1): # + 1 нужно для уточнения последней next
+		if i < len(pieces):
+			start_pos = text.index(pieces[i], text_pos) # если textwrap.wrap() съедает что-то посередине, придётся искать как подпоследовательность, но пока вроде работает
+			text_pos += len(pieces[i])
+			if i < len(result): result[i] = WrapFeedback(pieces[i], start_pos) # next будет уточнён на следующей итерации
+
+		# len(text) — случай самой-самой последней строки, т. е. для которой нет настоящего start_pos следующего piece
+		if i > 0: result[i-1].next = start_pos if i < len(pieces) else len(text)
+	return result
 
 def exception_msg(e):
 	return str(e) or repr(e)
@@ -1070,7 +1089,12 @@ class Hex:
 		turns = self.time_based and ("" if not for_multipad or flip else "[turns]") + str(self.turns) + "t" + ("[/turns]" if for_multipad else "")
 		return left_to_right(desc, cmd, turns, flip=flip)
 
-	def do_name(self): raise NotImplementedError("do_name")
+	@classmethod
+	def generic_name(cls): return cls.do_generic_name()
+	@classmethod
+	def do_generic_name(cls): raise NotImplementedError("do_class_name")
+
+	def do_name(self): return self.generic_name()
 	def do_describe_power(self): return None
 
 	def detail(self): return self.do_detail()
@@ -1107,7 +1131,8 @@ class RageHex(Hex):
 	# макс. 2.2x @ pow = 1100
 	backlash_x = property(lambda self: clamp(1.1 + 0.1 * self.npower, 1.1, 2.2))
 
-	def do_name(self): return "Ярость"
+	@classmethod
+	def do_generic_name(cls): return "Ярость"
 	def do_describe_power(self):
 		m = round(self.physdam_x, 1)
 		return None if m == 1.5 else f"{m}x"
@@ -1134,7 +1159,8 @@ class DeathWordHex(Hex):
 		if self.victim.alive:
 			self.victim.die("в исполнение Смертного приговора", self.master)
 
-	def do_name(self): return "Смертный приговор"
+	@classmethod
+	def do_generic_name(cls): return "Смертный приговор"
 	def do_detail(self): return \
 		"Гарантированная смерть через {turns}.\n"\
 		"Вы можете снять этот хекс с помощью Развеивания либо убив мага, наложившего заклинание.".format(turns = plural(self.turns, "{N} ход{/а/ов}"))
@@ -1148,7 +1174,9 @@ class Bleeding(Hex):
 		self.precise_power = power
 		self.precise_damage = 0
 
-	def do_name(self): return "Кровотечение" + ("!!!" if self.npower > 3 else "!" if self.npower > 2 else "")
+	@classmethod
+	def do_generic_name(cls): return "Кровотечение"
+	def do_name(self): return self.do_generic_name() + ("!!!" if self.npower > 3 else "!" if self.npower > 2 else "")
 	def do_detail(self): return \
 		"Отнимает HP (-{0}%/ход) и уменьшает ловкость (-{1}).".format(round(self.precise_hp_percentile_decay, 1), round(self.precise_dex_debuff))
 
@@ -1992,8 +2020,8 @@ class Arena:
 	# Сообщение может быть сообщено разным sink по-разному: одному — «вы ударили Грязекраба», другому то же самое — «Рика ударила Грязекраба».
 	# Я на самом деле не уверен, что обычно понимают под термином sink :)
 	class MessageSink:
-		def __init__(self, note_callback=None):
-			self.you = None
+		def __init__(self, you, note_callback=None):
+			self.you = you
 			self.note_callback = note_callback
 
 		def note(self, msg): self.do_note(msg)
@@ -2018,7 +2046,7 @@ class Arena:
 	def add(self, fighter, squad_id, ai, *, shortcut_hint=None):
 		fighter.enter_arena(self)
 		battler = Arena.Battler(fighter, squad_id, ai, self.generate_shortcut(fighter, shortcut_hint))
-		if ai: ai.setup(battler, self)
+		if ai: ai.setup(fighter, self)
 		self.battlers.append(battler)
 
 		squad = self.force_squad(squad_id)
@@ -2056,13 +2084,10 @@ class Arena:
 	# arena.note(lambda sink: "Вы обосрались." if who == sink.you else who.name + " обосрался.")
 	def note(self, msg):
 		for sink in self.message_sinks:
-			if isinstance(msg, str):
-				sink.note(msg)
-			else:
-				sink.note(msg(sink))
-
-	def tq_debug(self):
-		return " ".join(battler.shortcut+':'+str(battler.initiative) for battler in self.turn_queue)
+			if not isinstance(msg, str):
+				msg = msg(sink)
+				check(isinstance(msg, str), "должна быть строка")
+			sink.note(msg)
 
 	def turn(self):
 		check(self.started, "не вызвана start", not self.inside_turn, "уже внутри turn")
@@ -2146,6 +2171,13 @@ class Arena:
 	def deny_any_new_squads(self):
 		self.squads_frozen = True
 
+	def add_sink(self, sink):
+		check(sink not in self.message_sinks)
+		self.message_sinks.append(sink)
+
+	def remove_sink(self, sink):
+		self.message_sinks.remove(sink)
+
 class AI:
 	def __init__(self):
 		self.fighter = None
@@ -2158,6 +2190,9 @@ class AI:
 	def teardown(self):
 		check(self.fighter, "double teardown")
 		self.fighter, self.arena = None, None
+
+	def note(self, *args, **kargs):
+		self.arena.note(*args, **kargs)
 
 	def turn(self):
 		self.do_turn()
@@ -2179,7 +2214,39 @@ class PlayerAI(AI):
 		self.decision = None
 
 class DummyAI(AI):
-	def do_turn(self): pass
+	def do_turn(self):
+		chooses = []
+		def make_look_with_hate_at(who):
+			def note(sink):
+				msg = cap_first(self.fighter.name) + " с ненавистью смотрит на "
+				if who == sink.you: msg += "вас"
+				else: msg += who.name(Case.ACCUSATIVE)
+				msg += "."
+				return msg
+			return lambda: self.note(lambda sink: note(sink))
+
+		def make_look_with_love_at(who):
+			def note(sink):
+				msg = cap_first(self.fighter.name) + " смотрит на "
+				if who == sink.you: msg += "вас"
+				else: msg += who.name(Case.ACCUSATIVE)
+				msg += " с любовью."
+				return msg
+			return lambda: self.note(lambda sink: note(sink))
+
+		def make_idle():
+			def note(sink):
+				return cap_first(self.fighter.name) + " облизывается."
+			return lambda: self.note(lambda sink: note(sink))
+
+		for ally in self.arena.allies(self.fighter):
+			chooses.append((1.0, make_look_with_love_at(ally)))
+
+		for enemy in self.arena.enemies(self.fighter):
+			chooses.append((1.0, make_look_with_hate_at(enemy)))
+		chooses.append((1.0, make_idle()))
+
+		choose((act for act in chooses), get_weight=lambda act, index: act[0])[0][1]()
 
 class Con:
 	# На данный момент сделано так, что чуть больше нуля даёт [#....] и чуть меньше максимума — [####.]
@@ -2191,6 +2258,12 @@ class Con:
 	@staticmethod
 	def bullet_bar(cur, max, fillchar='#', emptychar='.'):
 		return fillchar * cur + emptychar * (max - cur)
+
+	# Раньше wrap() был устроен чуть сложнее, чтобы попытаться доходить до края терминала, когда возможно, но это не всегда работало:
+	# нет гарантии, что консоль переведёт строку по достижении get_terminal_size.columns.
+	@staticmethod
+	def safe_width(width):
+		return width - 1
 
 class VitalBarTest(Test):
 	cases = (0, 5, 5, 0), (1, 5, 5, 1), (2, 5, 5, 2), (3, 5, 5, 3), (4, 5, 5, 4), (5, 5, 5, 5), (0.001, 5, 5, 1), (4.999, 5, 5, 4), (1.4, 5, 5, 2)
@@ -2236,6 +2309,7 @@ class Mode:
 	do_cls    = True
 	term_width = property(lambda self: self.session.term_width)
 	term_height = property(lambda self: self.session.term_height)
+	safe_term_width = property(lambda self: Con.safe_width(self.session.term_width))
 	prev_mode = False # запомнит предыдущий режим, т. о. к нему можно будет вернуться
 
 class MainMenu(Mode):
@@ -2526,7 +2600,7 @@ class More(Mode):
 		self.user_continuation = False
 
 	def do_render(self, lines, cmds):
-		lines.append(wrap(self.msg + ("" if self.input_comes else "\n<enter>"), self.term_width))
+		lines.append(wrap(self.msg + ("" if self.input_comes else "\n<enter>"), self.safe_term_width))
 
 	def do_handle_command(self, cmd):
 		self.continuation(self)
@@ -2990,15 +3064,15 @@ class Respite(Mode):
 		arena.add(self.game.player, Game.PLAYER_SQUAD, PlayerAI())
 
 		rat = Fighter()
-		rat.name = Noun.parse("{ручной крыс}")
+		rat.name = Noun.parse("{ручной крыс:a}")
 		arena.add(rat, Game.PLAYER_SQUAD, DummyAI())
 
 		rat = Fighter()
-		rat.name = Noun.parse("{обычный крыс}")
+		rat.name = Noun.parse("{обычный крыс:a}")
 		arena.add(rat, Game.MONSTER_SQUAD, DummyAI())
 
 		rat = Fighter()
-		rat.name = Noun.parse("{волшебный крыс}")
+		rat.name = Noun.parse("{волшебный крыс:a}")
 		with rat.save_relative_vitals():
 			rat.base_mmp = 10
 		rat.learn_spell(Firestorm())
@@ -3108,19 +3182,134 @@ class Shop(Mode):
 		return sell
 
 class ArenaView(Mode):
+	class MessageLog:
+		class Line:
+			__slots__ = ('line', 'turn', 'pieces_count', 'next_sep')
+			def __init__(self, line, turn):
+				self.line = line
+				self.turn = turn
+				self.pieces_count = 1
+				self.next_sep = " "
+		MIN_MESSAGE_LIFE_TURNS = 10
+		MIN_MESSAGES = 30
+
+		def __init__(self):
+			self.lines = []
+			# scroll продолжит выдавать текст, начиная с lines[scroll_line].line[scroll_index] (но может вернуться выше, если упрётся в конец)
+			self.scroll_line = 0
+			self.scroll_index = 0
+			self.line_break_requested = False
+
+		def add(self, msg, turn, *, next_sep=" "):
+			# Критерии, по которым (не) начинается новая строка.
+			# Совсем никогда не начинать нельзя, т. к. из истории не могут быть стёрты отдельные добавленные таким образом фрагменты — только строка целиком.
+			def allow_continuation(prev):
+				# pieces_count — подушка безопасности, ожидается, что такого не будет в естественных сценариях
+				return not self.line_break_requested and prev.pieces_count < 666
+
+			if self.lines and allow_continuation(self.lines[-1]):
+				line = self.lines[-1]
+				line.line += line.next_sep + msg
+				line.turn = turn
+				line.pieces_count += 1
+			else:
+				line = self.Line(msg, turn)
+				self.lines.append(line)
+				self.line_break_requested = False
+			line.next_sep = next_sep
+
+			# стереть старые строки
+			erase = 0
+			while erase < len(self.lines) and (turn - self.lines[erase].turn) > self.MIN_MESSAGE_LIFE_TURNS and len(self.lines) - (erase + 1) >= self.MIN_MESSAGES:
+				erase += 1
+
+			if erase > 0:
+				if self.scroll_line < erase:
+					self.scroll_line, self.scroll_index = 0, 0
+				else:
+					self.scroll_line -= erase
+				del self.lines[:erase]
+
+		# scroll возвращает (1) последние не более чем lines строк, которые пользователь должен увидеть в окне лога, и (2) флаг, есть ли ещё.
+		# Одновременно, если really не вернула False, лог прокручивается вниз на lines-1 либо до упора.
+		# Можно было бы разделить эти шаги, но это будет сложнее и мне не нужно (по сути — отложить присваивание scroll_line/scroll_index).
+		def scroll(self, lines, width, really=lambda pending: True):
+			# Попытаться идти с lines[scroll_line].line[scroll_index] до конца. Если конец не достигнут за lines — вернуть результат как промежуточный.
+			wrapped = []
+			last_line = last_index = None
+			for i, line in enumerate(self.lines[self.scroll_line:], self.scroll_line):
+				start = self.scroll_index if i == self.scroll_line else 0
+				w = wrap_feedback(line.line[start:], width, lines - len(wrapped) + 1) # + 1 — отличить случай «есть ещё строки» от «больше нет строк»
+				overflow = len(wrapped) + len(w) > lines
+				if overflow: del w[lines - len(wrapped):]
+				wrapped.extend(L.piece for L in w)
+
+				if w: last_line, last_index = i, start + (w[-1].start if lines > 1 else w[-1].next)
+				if overflow:
+					# lines строк переполнены — вернуть промежуточный результат, продолжить с последней строки включительно
+					# Бла         1        Бла-бла-бла 3
+					# Бла-бла     2   =>   Бла-бла-бла-бла 4
+					# Бла-бла-бла 3        Бла-бла-бла-бла-бла 5
+					if really(True): self.scroll_line, self.scroll_index = (last_line, last_index) if last_line is not None else impossible()
+					return wrapped, True
+
+			# Конец достигнут? Тогда вернуть последние lines строк (возможно, уже виденных). Алгоритм с точностью до наоборот.
+			wrapped, pos_saved = [], False
+			for i in range(len(self.lines) - 1, -1, -1):
+				w = wrap_feedback(self.lines[i].line, width)
+				if not pos_saved and w:
+					pos_saved = True
+					if really(False): self.scroll_line, self.scroll_index = i, w[-1].start if lines > 1 else w[-1].next
+				overflow = len(wrapped) + len(w) > lines
+				if overflow: del w[:len(w) - (lines - len(wrapped))]
+				wrapped = [L.piece for L in w] + wrapped
+				if overflow: break
+			return wrapped, False
+
+		def post_line_break(self):
+			self.line_break_requested = True
+
 	def __init__(self, game, arena, player, on_leave):
 		super().__init__()
 		self.game  = game
 		self.arena = arena
 		self.player = player
 		self.player_ai = arena.as_battler(player).ai
-		self.on_leave = on_leave
 		check(self.player_ai, isinstance(self.player_ai, PlayerAI), "player.ai")
+		self.on_leave = on_leave
 		self.awaiting_decision = True
 		self.atb_maximum = self.estimate_good_atb_maximum()
 
+		self.log = ArenaView.MessageLog()
+		self.sink = Arena.MessageSink(player, self.receive_note)
+		self.arena.add_sink(self.sink)
+		self.shown_log_lines = None
+		self.next_player_turn = -1
+
 	def do_process(self):
-		if self.arena.whose_turn() != self.game.player or self.player_ai.decision: self.arena.turn()
+		self.awaiting_decision = False
+		self.do_prompt = True
+		log_area_height = 5
+		do_turn = True
+		while do_turn:
+			if self.arena.whose_turn() == self.game.player and not self.player_ai.decision:
+				do_turn = False
+				self.log.post_line_break()
+
+			lines, pending = self.log.scroll(log_area_height, self.safe_term_width, really=lambda pending: pending or not do_turn)
+			if pending:
+				self.shown_log_lines = None
+				self.do_prompt = False
+				self.session.invalidate(self).more("\n" + "\n".join(lines))
+				return
+
+			if do_turn:
+				if self.arena.whose_turn() == self.game.player:
+					self.next_player_turn += 1
+					self.log.add("_", turn=self.next_player_turn, next_sep="")
+				self.arena.turn()
+
+		self.shown_log_lines = lines
 		self.awaiting_decision = self.arena.whose_turn() == self.game.player
 
 	def do_render(self, lines, cmds):
@@ -3131,23 +3320,33 @@ class ArenaView(Mode):
 			left = imA[lineno] if lineno < len(imA) else ""
 			right = imB[lineno] if lineno < len(imB) else ""
 
-			limit = self.term_width - 1
+			limit = self.safe_term_width
 			if len(left) + len(right) > limit:
 				left = left[:limit - len(right)]
 				if len(left) + len(right) > limit: raise RuntimeError(f"Строка не умещается в ширину консоли: {left + '/' + right}.")
 			lines.append(left + " " * (limit - len(left) - len(right)) + right)
 
-		# if self.arena.battlers: lines.append(self.build_atb_scale())
+		if self.shown_log_lines:
+			lines.append("")
+			lines.extend(self.shown_log_lines)
 
 		def hex_func(cls, fighter):
 			def hex():
+				def note(sink):
+					msg = "Вы накладываете"
+					if fighter == sink.you: msg += " на себя"
+					msg += " " + cls.generic_name()
+					if fighter != sink.you: msg += " на " + fighter.name(Case.ACCUSATIVE)
+					msg += "."
+					return msg
+				self.arena.note(lambda sink: note(sink))
 				exist = next((hex for hex in fighter.hexes if isinstance(hex, cls)), None)
 				if exist:
 					if cls == Bleeding:
 						exist.precise_power += 200
 						exist.power = max(1, round(exist.precise_power))
 						exist.turns = exist.turns_from_power(exist.power)
-					elif lcs == RageHex:
+					elif cls == RageHex:
 						exist.power += 100
 						exist.turns += 10
 					else: pass
@@ -3156,16 +3355,20 @@ class ArenaView(Mode):
 					elif cls == RageHex: args = (100, 10)
 					else: args = (100, 10)
 					cls(*args).apply(self.player, fighter)
-			return hex
+			return lambda: self.decide(hex)
 		for b in self.arena.battlers:
-			cmds.add('bleed' + ('' if b.fighter == self.player else ' ' + b.shortcut), bleed_func(b.fighter))
-			cmds.add('rage' + ('' if b.fighter == self.player else ' ' + b.shortcut), rage_func(b.fighter))
-			cmds.add('deathword' + ('' if b.fighter == self.player else ' ' + b.shortcut), deathword_func(b.fighter))
+			cmds.add('bleed' + ('' if b.fighter == self.player else ' ' + b.shortcut), hex_func(Bleeding, b.fighter))
+			cmds.add('rage' + ('' if b.fighter == self.player else ' ' + b.shortcut), hex_func(RageHex, b.fighter))
+			cmds.add('deathword' + ('' if b.fighter == self.player else ' ' + b.shortcut), hex_func(DeathWordHex, b.fighter))
 		cmds.add('quit', lambda: self.quit())
 
 	def do_handle_command(self, cmd):
 		if not cmd:
-			if self.awaiting_decision: self.decide(lambda: None)
+			if self.awaiting_decision:
+				def skip_turn(sink):
+					if sink.you == self.player: return "Вы пропускаете ход."
+					else: return f"{cap_first(self.player.name)} пропускает ход."
+				self.decide(lambda: self.arena.note(lambda sink: skip_turn(sink)))
 			return True
 
 	def decide(self, what):
@@ -3173,6 +3376,7 @@ class ArenaView(Mode):
 		self.player_ai.decide(what)
 
 	def quit(self):
+		self.arena.remove_sink(self.sink)
 		if self.on_leave: self.on_leave()
 		self.game.save_nothrow(self, then=lambda success, mode: mode.switch_to(Respite(self.game)))
 
@@ -3252,13 +3456,14 @@ class ArenaView(Mode):
 		check(victim, isinstance(victim, Arena.Battler), "victim")
 		return "" if victim.fighter == self.player else victim.shortcut + "."
 
+	# Шкала очерёдности хода. В итоге по ней мало что можно понять, так что не используется.
 	def build_atb_scale(self):
 		turn_queue = self.arena.turn_queue
 		# Построить первоначальную шкалу.
 		max_initiative = max(b.initiative for b in turn_queue)
 		if self.atb_maximum is None or self.atb_maximum < max_initiative: self.atb_maximum = max_initiative
 		if 0.6 * self.atb_maximum > max_initiative: self.atb_maximum = max(1.1 * max_initiative, self.estimate_good_atb_maximum())
-		positions = [int(self.term_width * b.initiative / (self.atb_maximum or 1)) for b in turn_queue]
+		positions = [int(self.safe_term_width * b.initiative / (self.atb_maximum or 1)) for b in turn_queue]
 
 		# Сдвинуть наложившихся юнитов так, чтобы они не накладывались, а были на шкале через пробел: R N Ne
 		for i in range(len(positions) - 1):
@@ -3267,7 +3472,7 @@ class ArenaView(Mode):
 
 		# Попытаться сделать то же самое с юнитами, залезшими за правый край экрана.
 		solve = positions[:]
-		max_end = self.term_width - 1
+		max_end = self.safe_term_width
 		for i in range(len(solve) - 1, -1, -1):
 			if solve[i] + len(turn_queue[i].shortcut) > max_end:
 				solve[i] = max_end - len(turn_queue[i].shortcut)
@@ -3275,7 +3480,7 @@ class ArenaView(Mode):
 		# Пропустить результат, только если после этого никто не вылез за левый край (информация о левых ценнее), иначе оставить как было.
 		if solve[0] >= 0: positions = solve
 		# Наконец, отрезать торчащих справа (паранойя).
-		while positions and positions[len(positions)-1] + len(turn_queue[len(positions)-1].shortcut) > self.term_width - 1: del positions[-1]
+		while positions and positions[len(positions)-1] + len(turn_queue[len(positions)-1].shortcut) > self.safe_term_width: del positions[-1]
 
 		# Теперь можно склеить всё в строку.
 		def piece(i):
@@ -3288,8 +3493,10 @@ class ArenaView(Mode):
 	def estimate_good_atb_maximum(self):
 		return 1.2 * self.arena.BASELINE_SPD / max(1, min(b.fighter.spd for b in self.arena.turn_queue))
 
+	def receive_note(self, msg):
+		self.log.add(msg, self.next_player_turn)
+
 class AskName(Prompt):
-	__slots__ = ('game', 'who', 'fixed')
 	def __init__(self, game, who=None, fixed=None):
 		self.game, self.who = game, who or game.player
 		prompt = (
