@@ -1,8 +1,20 @@
-﻿import sys, os, string, tempfile, pickle, pickletools, lzma, textwrap, math, time, enum, base64, heapq
-from traceback import format_exc
+﻿# Просто для информации, т. к. не скомпилируется. Чтобы это обойти и вывести нормальное предупреждение,
+# можно поместить код помимо проверки версии в отдельный модуль, но у меня ИДЕЙНО один файл.
+min_python_version = (3, 6)
+import sys
+if sys.version_info < min_python_version:
+	raise Exception("Нужен Python {0[0]}.{0[1]}+ (у вас {1.major}.{1.minor})".format(min_python_version, sys.version_info))
+
+import os, string, tempfile, pickle, pickletools, lzma, textwrap, enum
 from collections import namedtuple, OrderedDict, defaultdict, deque
 from bisect import bisect_left, bisect_right, insort_right
-from random import random, randrange, uniform
+from time import localtime, mktime, asctime, clock
+from random import random, randrange, uniform, normalvariate
+from base64 import b85encode, b85decode
+from heapq import nlargest, nsmallest
+from math import floor, ceil, exp, log, fabs, fsum
+from contextlib import suppress, AbstractContextManager
+from traceback import format_exc
 version, save_version = (0, 2), 0
 
 class config:
@@ -14,14 +26,15 @@ LZMA_OPTIONS = {"format": lzma.FORMAT_RAW, "filters": [{"id": lzma.FILTER_LZMA2,
 # для default-параметров, где допустимо None
 sentinel = object()
 
+# impossible()
+# impossible("сообщение")
+# impossible(значение, "сообщение")
+# "сообщение" может быть строкой или функцией без аргументов.
 def impossible(*args):
-	if len(args) <= 1: raise AssertionError("Внутренняя ошибка" + (f": {args[0]}" if len(args) > 0 else "") + ".")
-	elif len(args) == 2:
-		what, desc = args[0], args[1]
-		try:    what = f" ({what})"
-		except: what = ""
-		impossible(desc + what)
-	else: raise TypeError(f"impossible: ожидаются 1 (сообщение) или 2 (значение + сообщение) аргумента, получено {len(args)}.")
+	desc = args[0] if len(args) == 1 else args[1] if len(args) == 2 else None
+	value = f" ({args[0]})" if len(args) == 2 else ""
+	if desc and not isinstance(desc, str): desc = desc()
+	raise AssertionError("Внутренняя ошибка" + ((": " if desc.find(":") < 0 else ", ") + desc if desc else "") + value + ".")
 
 # 1. check(what, cond, errmsg)
 # Возвращает what, если всё хорошо (cond), иначе возбуждает impossible.
@@ -40,6 +53,11 @@ def check(*args):
 
 def throw(ecls, *args):
 	raise ecls(*args)
+
+def lazy(calc):
+	value = None
+	def calc_and_save(): nonlocal value; value = (calc(),); return value
+	return lambda: (value or calc_and_save())[0]
 
 # форматирует множественное число по правилам языка
 # plural(3, "{N} слон{/а/ов}") → "3 слона"
@@ -63,12 +81,14 @@ def highlight_variant(s, id):
 	return "/".join(part.upper() if i == id else part for i, part in enumerate(s.split("/")))
 
 # применяется в зеркалящихся элементах интерфейса
-# left_to_right("HP", "######....", "6/10")            = "HP [######....] 6/10"
-# left_to_right("HP", "....######", "6/10", flip=True) = "6/10 [....######] HP"
+# left_to_right("HP", "[######....]", "6/10")            = "HP [######....] 6/10"
+# left_to_right("HP", "[....######]", "6/10", flip=True) = "6/10 [....######] HP"
 def left_to_right(*what, sep=" ", flip=False):
-	def pieces():
-		yield from (piece for piece in (reversed(what) if flip else what) if piece)
-	return sep.join(pieces())
+	return sep.join(piece for piece in (reversed(what) if flip else what) if piece)
+
+def join_with_lastsep(seq, sep, lastsep):
+	if not isinstance(seq, list): seq = list(seq)
+	return (sep.join(seq[:-1]) + lastsep if len(seq) > 1 else "") + (seq[-1] if seq else "")
 
 def makefuncs():
 	def maybewrite(filename, string):
@@ -81,17 +101,17 @@ def makefuncs():
 	def pack_str(src=None, encoding='koi8-r', *, infile=None, outfile=None, pretty=True, **prettyargs):
 		if infile:
 			with open(infile, 'r', encoding='utf-8-sig') as f: src = f.read()
-		result = base64.b85encode(lzma.compress(src.encode(encoding), **LZMA_OPTIONS)).decode('ascii')
+		result = b85encode(lzma.compress(src.encode(encoding), **LZMA_OPTIONS)).decode('ascii')
 		return maybewrite(outfile, pretty_decl(result, **prettyargs) if pretty else result)
 
 	# Распаковывает результат pack_str, опционально в файл.
 	def unpack_str(src, encoding='koi8-r', *, outfile=None):
-		return maybewrite(outfile, ''.join(lzma.decompress(base64.b85decode(src), **LZMA_OPTIONS).decode(encoding)))
+		return maybewrite(outfile, ''.join(lzma.decompress(b85decode(src), **LZMA_OPTIONS).decode(encoding)))
 	return pack_str, unpack_str
 pack_str, unpack_str = makefuncs(); del makefuncs
 
 # Красивенько форматирует строку (предположительно длинную, предположительно результат pack_str) в питонье объявление.
-# длина ограничивается width с учётом prefix, pad и кавычек; символы НЕ эскейпаются, поэтому при '\ в строке результат будет не валиден.
+# длина ограничивается width с учётом prefix, pad и кавычек; символы НЕ эскейпаются, поэтому при "\ в строке результат будет не валиден.
 def pretty_decl(s, width=160, prefix="", pad="\t", cont_pad=None, multiline=False):
 	if width < 1: raise ValueError("width должна быть >= 1")
 	if cont_pad is None: cont_pad = "" if multiline else pad
@@ -117,16 +137,17 @@ def choose(iterable, get_weight=lambda item, index: 1, default=sentinel):
 	best, best_index, sum = default, -1, 0
 	for index, item in enumerate(iterable):
 		w = get_weight(item, index)
-		if w > 0: # там внизу <= на случай uniform(a, b)==b, поэтому нужно явно отбросить элементы с нулевыми весами
+		if w > 0:
 			sum += w
 			if uniform(0, sum) <= w: best, best_index = item, index
+			# uniform(a, b) может оказаться равен b из-за погрешностей, поэтому ни сравнивать uniform < w, ни пропускать сюда нулевые веса нельзя
 	if best is not sentinel: return best, best_index
 	raise IndexError("Ничего не выбрано.")
 
 # common_prefix_len("привет", "прийти") = 3
 def common_prefix_len(a, b):
-	n = 0
-	while n < len(a) and n < len(b) and a[n]==b[n]: n += 1
+	n, lim = 0, min(len(a), len(b))
+	while n < lim and a[n]==b[n]: n += 1
 	return n
 
 # длина наибольшей общей подпоследовательности (https://en.wikipedia.org/wiki/Longest_common_subsequence_problem)
@@ -157,7 +178,11 @@ def lcs_score(aseq, bseq, scoref):
 # subseq_occurences генерирует все вхождения подпоследовательности ss в src
 # Например: subseq_occurences("AB", "AABB") → [0, 2], [0, 3], [1, 2], [1, 3]
 #                                    0123
+#
 # Внимание: для оптимизации возвращаемый список переиспользуется, его нельзя хранить, не скопировав.
+#           т. е. не работает list(subseq_occurences(...)), зато работает list(occ[:] for occ in subseq_occurences(...))
+#
+# Внимание-2: экспоненциальная сложность в «плохих» случаях (ss="A"*5, src="A"*20).
 def subseq_occurences(ss, src):
 	p = [0] * len(ss)
 	def reset(start):
@@ -165,13 +190,14 @@ def subseq_occurences(ss, src):
 			p[i] = src.find(ss[i], (p[i-1]+1) if i > 0 else 0)
 			if p[i] < 0: return False
 		return True
-	digits, digit = range(len(ss)-1, -1, -1), -1
+	digit, lowest = -1, len(ss) - 1
 
-	while reset(digit+1): # после for ниже предполагается, что digit будет тем, на котором брейкнулись — в Python это гарантируется
-		yield p
-		for digit in digits:
+	while True:
+		if reset(digit+1): yield p; digit = lowest
+		while digit >= 0:
 			p[digit] = src.find(ss[digit], p[digit]+1)
 			if p[digit] >= 0: break
+			digit -= 1
 		else: return
 
 # Наивный байесовский классификатор, украденный из https://habrahabr.ru/post/120194/.
@@ -232,7 +258,7 @@ class BayesianGuesser:
 		for cls, count in self.total_of_class.items():
 			# Pc для каждого класса можно посчитать один раз после тренировки (classes[cls] в хабро-варианте), но и так сойдёт
 			Pc = count / self.total_samples
-			prob = math.log(Pc) + sum(math.log(self.cfeat_prob(cls, feat, n_feats)) for feat in feats if feat)
+			prob = log(Pc) + sum(log(self.cfeat_prob(cls, feat, n_feats)) for feat in feats if feat)
 
 			if not best_prob or prob > best_prob:
 				best_cls, best_prob, second_best_prob = cls, prob, best_prob
@@ -240,9 +266,10 @@ class BayesianGuesser:
 				second_best_prob = prob
 
 		check(best_cls, best_cls is not None, "best_cls?!")
-		return best_cls, 1.0 - math.exp(second_best_prob - best_prob) if second_best_prob else 1.0
+		return best_cls, 1.0 - exp(second_best_prob - best_prob) if second_best_prob else 1.0
 
 	# оценивает точность классификации на тестовой выборке
+	# TODO: переделать на http://bazhenov.me/blog/2012/07/21/classification-performance-evaluation.html.
 	def success_rate(self, samples):
 		success = total = 0
 		for sample, ref_cls in self.pairs(samples):
@@ -252,10 +279,10 @@ class BayesianGuesser:
 
 	# статистика по наиболее информативным признакам, как в http://www.nltk.org/_modules/nltk/classify/naivebayes.html
 	# возвращает список 3-тюплов (feat, cls, margin), например, (feat = "LAST_TWO_LETTERS:на", cls = Gender.FEMALE, margin = 12.5)
-	# (margin∈[1; +∞] — разрыв с наименее вероятным по feat. Возможно, больше смысла возвращать, наоборот, отрыв от второго самого вероятного, как в guess.
+	# margin∈[1; +∞] — разрыв с наименее вероятным по feat. Возможно, больше смысла возвращать, наоборот, отрыв от второго самого вероятного, как в guess.
 	#
 	# Была бы полезнее функция most_informative_fnames, которая бы указывала, какие *категории* признаков
-	# были самыми полезными, а какие только мешали (возможно, в связке с success_rate), но я не знаю, как это сделать :(
+	# были самыми информативными, а какие только мешали (возможно, в связке с success_rate), но я не знаю, как это сделать :(
 	# Явного деления на категории нет, но пользователь обычно что-то такое подразумевает, вот как в примере префикс LAST_TWO_LETTERS.
 	def most_informative_feats(self, n=None):
 		informative_feat = namedtuple('informative_feat', 'feat, cls, margin')
@@ -274,7 +301,7 @@ class BayesianGuesser:
 
 		result_gen = (informative_feat(feat, f.max_prob_class, f.max_prob/f.min_prob) for feat, f in feats.items() if f.occurences > 1)
 		key = lambda f: f.margin
-		return sorted(result_gen, key=key, reverse=True) if n is None else heapq.nlargest(n, result_gen, key=key)
+		return sorted(result_gen, key=key, reverse=True) if n is None else nlargest(n, result_gen, key=key)
 
 class Gender(enum.IntEnum):
 	UNKNOWN, MALE, FEMALE, NEUTER, TOTAL = -1, 0, 1, 2, 3
@@ -284,11 +311,11 @@ class Gender(enum.IntEnum):
 		# С L2-L3 бессовестно нарушается предположение о независимости признаков, но результат вроде лучше, кхехех.
 		oracle = BayesianGuesser(lambda w: (('F2', w[0:2]), ('L2', w[-2:]), ('L3', w[-3:])),
 			samples = {sample: gender
-				for samples_pack, gender in ((Gender.male_names_pack(), Gender.MALE), (Gender.female_names_pack(), Gender.FEMALE))
-				for sample in unpack_str(samples_pack).split()})
+				for samples_pack, gender in ((Gender.male_names_pack, Gender.MALE), (Gender.female_names_pack, Gender.FEMALE))
+				for sample in unpack_str(samples_pack()).split()})
 
 		best_guess, best_margin = Gender.UNKNOWN, None
-		for _lit, word in Noun.split_into_words(name):
+		for _lit, word, _isend in Noun.split_into_words(name):
 			guess, margin = oracle.guess(word.casefold())
 			if guess is not None and (best_margin is None or margin > best_margin) and margin > 0.4:
 				best_guess, best_margin = guess, margin
@@ -333,9 +360,15 @@ class Gender(enum.IntEnum):
 
 class Case:
 	NOMINATIVE, GENITIVE, DATIVE, ACCUSATIVE, INSTRUMENTAL, PREPOSITIONAL, TOTAL = 0, 1, 2, 3, 4, 5, 6
+	@staticmethod
+	def from_letter(letter):
+		try:
+			return 'NGDAIP'.index(letter) if letter else Case.NOMINATIVE
+		except ValueError as e:
+			raise ValueError(f"Неизвестный падеж: {letter}.") from e
 
 # Noun.parse("маленьк{ий/ого/ому/ий/им/ом} член{/а/у//ом/е}")(Case.GENITIVE) == Noun.guess("маленький член")(Case.GENITIVE) == "маленького члена"
-# Noun("{кусок} угля")(Case.PREPOSITIONAL) == "куском угля"
+# Noun.parse("{кусок} угля")(Case.PREPOSITIONAL) == "куском угля"
 # Наследование от str нужно *исключительно* для того, чтобы можно было обращаться как с str, если достаточно словарной формы.
 class Noun(str):
 	def __new__(cls, pieces):
@@ -349,9 +382,10 @@ class Noun(str):
 		return "".join(piece for literal, cases in pieces for piece in (literal, cases[case] if cases else ""))
 
 	def __call__(self, case):
-		return "".join(piece for literal, cases in self.pieces for piece in (literal, cases[case] if cases else ""))
+		return Noun.join_pieces(self.pieces, case)
 
 	def __eq__(self, other):
+		check(other, other.__class__ != str, "вряд ли вы хотели сравнить с обычной строкой")
 		return isinstance(other, self.__class__) and self.pieces == other.pieces
 
 	@staticmethod
@@ -359,7 +393,7 @@ class Noun(str):
 		if pieces and not pieces[-1][1]:
 			pieces[-1] = pieces[-1][0] + literal, cases
 		else:
-			pieces.append((literal, cases))
+			pieces.append((literal, tuple(cases) if isinstance(cases, list) else cases))
 
 	@staticmethod
 	def parse(src, *, animate=False, gender=Gender.UNKNOWN, return_gender=False):
@@ -394,33 +428,35 @@ class Noun(str):
 
 	@staticmethod
 	def guess_multi(pieces, src, animate, gender):
-		for literal, word in Noun.split_into_words(src):
-			base, cases = Noun.guess_one(word, animate, gender)
+		for literal, word, isend in Noun.split_into_words(src):
+			base, cases = Noun.guess_one(word, animate, gender, maybe_adjective=not isend)
 			Noun.append_pair(pieces, literal + base, cases)
 
 	# мне очень влом тестировать все ветки, хотя надо бы
 	@staticmethod
-	def guess_one(word, animate, gender):
+	def guess_one(word, animate, gender, maybe_adjective):
 		def ngdip(nom, gen, dat, ins, pre): return (nom, gen, dat, gen if animate else nom, ins, pre)
 		def yi(prev): return 'ы' if prev in 'бвдзлмнпрстфц' else 'и'
 		def oe(prev): return 'е' if prev in 'нр' else 'о'
 		vowels = 'аеёиоуыэюя'
-		if word.endswith('ый') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
-			return word[:-len('ый')], ngdip('ый', 'ого', 'ому', 'ым', 'ом')
-		elif word.endswith('ий') and not word[1].isupper and (gender == Gender.UNKNOWN or gender == Gender.MALE):
-			return word[:-len('ий')], ngdip('ий', oe(word[-3:-2]) + 'го', oe(word[-3:-2]) + 'му', 'им', oe(word[-3:-2]) + 'м')
-		elif word.endswith('ой') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
-			return word[:-len('ой')], ngdip('ой', 'ого', 'ому', yi(word[-3:-2])+'м', 'ом')
-		elif word.endswith('ая') and not word[1].isupper and (gender == Gender.UNKNOWN or gender == Gender.FEMALE):
-			return word[:-len('ая')], ('ая', 'ой', 'ой', 'ую', 'ой', 'ой')
-		elif word.endswith('яя') and (gender == Gender.UNKNOWN or gender == Gender.FEMALE):
-			return word[:-len('яя')], ('яя', 'ей', 'ей', 'юю', 'ей', 'ей')
+		if maybe_adjective:
+			if word.endswith('ый') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
+				return word[:-len('ый')], ngdip('ый', 'ого', 'ому', 'ым', 'ом')
+			elif word.endswith('ий') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
+				return word[:-len('ий')], ngdip('ий', oe(word[-3:-2]) + 'го', oe(word[-3:-2]) + 'му', 'им', oe(word[-3:-2]) + 'м')
+			elif word.endswith('ой') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
+				return word[:-len('ой')], ngdip('ой', 'ого', 'ому', yi(word[-3:-2])+'м', 'ом')
+			elif word.endswith('ая') and (gender == Gender.UNKNOWN or gender == Gender.FEMALE):
+				return word[:-len('ая')], ('ая', 'ой', 'ой', 'ую', 'ой', 'ой')
+			elif word.endswith('яя') and (gender == Gender.UNKNOWN or gender == Gender.FEMALE):
+				return word[:-len('яя')], ('яя', 'ей', 'ей', 'юю', 'ей', 'ей')
+		if word.endswith('ия'):
+			return word[:-len('я')], ('я', 'и', 'и', 'ю', 'ей', 'и')
 		elif word.endswith('а'):
 			return word[:-len('а')], ('а', yi(word[-2:-1]), 'е', 'у', 'ой', 'е')
 		elif word.endswith('я'):
 			return word[:-len('я')], ('я', 'и', 'е', 'ю', 'ей', 'е')
-		elif word.endswith(('б', 'в', 'г', 'д', 'ж', 'з', 'к', 'л', 'м', 'н', 'п', 'р', 'с', 'т', 'ф', 'х', 'ц', 'ч', 'ш', 'щ')) and \
-			(gender == Gender.UNKNOWN or gender == Gender.MALE):
+		elif any(word.endswith(sym) for sym in 'бвгджзклмнпрстфхцчшщ') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
 			if word.endswith('ок') or word.endswith('ёк'):
 				before = ("й" if word[-3:-2] in vowels else "ь") if word[-2:-1] in 'ё' else ""
 				return word[:-len('ок')], ngdip(word[-2:], before + 'ка', before + 'ку', before + 'ком', before + 'ке')
@@ -434,7 +470,7 @@ class Noun(str):
 		elif word.endswith('й') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
 			return word[:-len('й')], ngdip('й', 'я', 'ю', 'ем', 'е')
 		elif word.endswith('ь') and gender == Gender.FEMALE:
-			return word[:-len('ь')], ngdip('ь', 'и', 'и', 'ью', 'и')
+			return word[:-len('ь')], ('ь', 'и', 'и', 'ь', 'ью', 'и')
 		elif word.endswith('ь') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
 			return word[:-len('ь')], ngdip('ь', 'я', 'ю', ('ё' if word.endswith('арь') else 'е') + 'м', 'е')
 		else:
@@ -449,9 +485,10 @@ class Noun(str):
 			while i < len(src) and not is_word_char(src[i]): i += 1
 			word_start = i
 			while i < len(src) and is_word_char(src[i]): i += 1
-			yield src[lit_start:word_start], src[word_start:i]
+			yield src[lit_start:word_start], src[word_start:i], i == len(src)
 
 	def src(self, sep="/"): return "".join(piece for literal, cases in self.pieces for piece in (literal, "{" + sep.join(cases) + "}" if cases else ""))
+	def cap_first(self): return cap_first(self)
 
 	names_pack = "-~*=uP+b6EwbQNB8YkMB>EYo0pG@2Gy)(};Q(<{OYfTwU^}XzStFJAUefGJ(sBrku?W_fUiN!?*4-~MSfyau%W+!~fkO}zE+8a8wWZilMI^L>hs?k#759QRL;(xh&fuF^YR;h^)lwqvKTOY"\
 	"kNbZ=5;mUq;h??wGkL;sY)OMpXC$$-#LfC;rLRI<e5hYR^+P2OwNvh9**E}#Sbs1|&HyMc?gCIQ8f38Uh~f~XNTkn)~~+pFHLkI~t=o*K`dndQ<fw^G!8tPqWPN1%$U^Od@z3bM1gSV{WM;4vV1kAT3gqg02"\
@@ -465,7 +502,7 @@ class Noun(str):
 	"MZV+Bdv9sVH;i8r!-|B<Q$Gs!4xVAU6-}_X+N0b;##3oq@`mnD1w~s>atqHHozGHuw#k0E+=hV--4$tjkbCcCS*S{Yov5Sw#j>5=Y@FSpl2F-E%G{fuTKa2ItQ|~JI*^#59K(BZjJ9sA(u^f8gWfZW*n8!gV"\
 	"39!wsOiub;8&K$`SPsR|SGfWQgb>QOy~hpC&^x`w@*k!WpBO#s5{z4)a6^+eNNXG?F5DS4!J~<pS@K;&h?Sr*RPW_rFfGH}|Kjb_q|_K-O(4!L(o_buIwXs$}<`sMVA292TkVZwUrXA^=p_Uvw~hzcf)0911"\
 	"65fVr|k?FEl|WJv=C?3Y^>=E>#7*CnO#?O1x49<;aR92lTohUt*CqfiKv&nEx?"
-	unpacked_names_and_adjs = None
+	names_and_adjs = lazy(lambda: tuple(unpack_str(pack).split() for pack in (Noun.names_pack, Noun.adjs_pack)))
 
 	@staticmethod
 	def feminize_adj(w):
@@ -474,13 +511,15 @@ class Noun(str):
 		elif w.endswith('н'): return w + 'а'
 		else: return w
 
+	class RandomNamesExhausted(Exception): pass
+	# ban(type, part) — условие реролла на основании неугодных слов.
+	# see(type, part) получает напосмотреть части результата, когда он уже готов.
+	# type — 'adj' или 'noun', part — соответственно, само прилагательное или существительное.
 	@staticmethod
 	def random_name(ban=None, see=None, *, return_gender=False):
-		names, adjs = Noun.unpacked_names_and_adjs or tuple(unpack_str(pack).split() for pack in (Noun.names_pack, Noun.adjs_pack))
-		if not Noun.unpacked_names_and_adjs: Noun.unpacked_names_and_adjs = names, adjs
-
+		names, adjs = Noun.names_and_adjs()
 		while True:
-			if not adjs or not names: return None
+			if not adjs or not names: raise Noun.RandomNamesExhausted("Случайные имена закончились.")
 			iadj, iname = randrange(len(adjs)), randrange(len(names))
 			adj, name, gender = adjs[iadj], names[iname], Gender.MALE
 			if name.endswith('{f}'): name, adj, gender = name[:-len('{f}')], Noun.feminize_adj(adj), Gender.FEMALE
@@ -491,12 +530,14 @@ class Noun(str):
 			adj_l2 = len(adj) - (2 if adj.endswith('й') else 0)
 			px, shortest = common_prefix_len(adj.casefold(), name.casefold()), min(adj_l2, len(name))
 
-			def specialcased_to_live():
+			def false_positive():
 				# «странный странник» — забавно, но OK
 				# «бессмертный бес» etc. — OK; единственная тавтология с «бесом» — «бесноватый»
-				return adj.startswith("странн") or name == "бес" and not adj.startswith("бесн")
+				# «голубой голем», «роковой рокер» — OK
+				return adj.startswith("странн") or name == "бес" and not adj.startswith("бесн") or name in ("голем", "рокер")
 
-			if (shortest + 1) // 2 < px and not specialcased_to_live():
+			if shortest // 2 + (1 if shortest <= 3 else 0) < px and not false_positive():
+				# не изменять оригинальные adjs/names
 				if randrange(2) > 0: adjs = adjs[:iadj] + adjs[iadj+1:]
 				else:                names = names[:iname] + names[iname+1:]
 				continue
@@ -555,9 +596,32 @@ def pcgxor(seq, seed=0, mask=255):
 
 # округляет 8.2 до 8 с шансом 80% или 9 с шансом 20%
 def rand_round(x):
-	f = math.floor(x)
+	f = floor(x)
 	d = x - f
 	return f + int(d > 0 and random() < d)
+
+# График этого распределения — график стандартного нормального распределения с отрезанными «хвостиками» за ±3, сплющенный из (-3, 0, 3) в (min, peak, max).
+#
+#  |                           |          |
+#  |                       ####|###       |
+#  |                   ########|####      |
+#  |                 ##########|#####     |
+#  |              #############|######    |
+#  |          #################|########  |
+#  |###########################|##########|
+# min                        peak        max
+#
+# peak не является средним значением, к сожалению :C я бы сделал, если бы знал, как...
+def bell(min, peak, max):
+	k = fabs(normalvariate(0, 1/3))
+	if k > 1: k = fabs((random() + random() + random()) * (2/3) - 1) # Ц.П.Т.-фоллбэк на случай |normal| > 3, в принципе, можно им одним обойтись :D
+	d = min - peak if random() * (max - min) < peak - min else max - peak
+	return clamp(peak + d * k, min, max)
+
+def trim_leading_spaces(s, start=0):
+	pos = start
+	while pos < len(s) and s[pos] == ' ': pos += 1
+	return pos - start, s[:start] + s[pos:] if pos > start else s
 
 # Главная причина существования этой функции в том, что textwrap.wrap, похоже, не обрабатывает \n.
 #
@@ -579,34 +643,38 @@ def wrap(text, width):
 				line = line[0:p] + line[p+1:]
 				prefix = ' ' * p
 
-		return textwrap.wrap(line, width, subsequent_indent=prefix) or ('',)
+		# drop_whitespace=True режет лишнее, например, пробел после запроса (y/N)
+		pieces = textwrap.wrap(line, width, subsequent_indent=prefix, drop_whitespace=False)
+		for i in range(1, len(pieces)): pieces[i] = trim_leading_spaces(pieces[i], len(prefix))[1]
+		return pieces or ('',)
 
 	return '\n'.join(wrapped_line for source_line in text.splitlines() for wrapped_line in wrap_paragraph(source_line, width))
 
 # Другая обёртка над textwrap.wrap.
-# Возвращает список записей (piece, start, next), где next — позиция, с которой начинается следующая строка (для последней в text будет next = len(text)),
-# а start — где начинается эта (т. е. без учёта граничных случаев [i].next == [i+1].start).
-# Например: wrap_feedback("привет, как дела?", 7) => [('привет,', start=0, next=8>), ('как', start=8, next=12>), ('дела?', start=12, next=17>)]
+# Возвращает список записей (piece, start), где start — позиция этого фрагмента в исходной строке.
+# Например: wrap_feedback("привет, как дела?", 7) => [('привет,', start=0), ('как', start=8), ('дела?', start=12)]
 # Не поддерживает возможности предыдущего wrap (\n и |).
 class WrapFeedback:
-	__slots__ = 'piece', 'start', 'next'
-	def __init__(self, piece, start): self.piece, self.start, self.next = piece, start, None
-	def __repr__(self): return f"{self.__class__.__name__}({repr(self.piece)}, start={self.start}, next={self.next}>)"
+	__slots__ = 'piece', 'start'
+	def __init__(self, piece, start): self.piece, self.start = piece, start
+	def __repr__(self): return f"{self.__class__.__name__}({repr(self.piece)}, start={self.start}>)"
 
 def wrap_feedback(text, width, maxlines=None):
-	pieces = textwrap.wrap(text, width)
+	pieces = textwrap.wrap(text, width, drop_whitespace=False, max_lines=maxlines+1 if maxlines else None) or ("",) # а то отвечает [] на пустую строку
 	result = [None] * min(len(pieces), maxlines if maxlines is not None else len(pieces))
 
-	# Найти конец каждой строки результата в text. Предполагается, что это возможно.
+	# Найти каждую строку результата в text. Предполагается, что это возможно.
 	text_pos = 0
-	for i in range(len(result) + 1): # + 1 нужно для уточнения последней next
-		if i < len(pieces):
-			start_pos = text.index(pieces[i], text_pos) # если textwrap.wrap() съедает что-то посередине, придётся искать как подпоследовательность, но пока вроде работает
-			text_pos += len(pieces[i])
-			if i < len(result): result[i] = WrapFeedback(pieces[i], start_pos) # next будет уточнён на следующей итерации
+	for i in range(len(result)):
+		# если textwrap.wrap() съедает что-то посередине, придётся искать как подпоследовательность, но пока вроде работает
+		start_pos = text.index(pieces[i], text_pos)
+		text_pos += len(pieces[i])
+		# drop_whitespace=True режет лишнее, поэтому РУЧКАМИ.
+		if i > 0:
+			leading_spaces, pieces[i] = trim_leading_spaces(pieces[i])
+			start_pos += leading_spaces
+		result[i] = WrapFeedback(pieces[i], start_pos)
 
-		# len(text) — случай самой-самой последней строки, т. е. для которой нет настоящего start_pos следующего piece
-		if i > 0: result[i-1].next = start_pos if i < len(pieces) else len(text)
 	return result
 
 def exception_msg(e):
@@ -666,9 +734,15 @@ class Commands:
 		# Также отдаётся предпочтение менее многословным командам, чтобы на 1 и remove 1 ответило 1 (сейчас сделано через деление на порядковые номера слов).
 		# Также бонусно учитывается общий префикс, чтобы на remove 10, remove 11, remove 21 и введённую remove 1 не называло в подсказках remove 21.
 		# Также учитывается законченность команды (наличие node.func).
+		def common_prefix_score(a, b):
+			p = common_prefix_len(a, b)
+			score = p * 2
+			if p == len(a): score += 1 # бонус за полное совпадение со словом, см. (**V_vs_Vo), хотя можно было бы вообще убрать word_cs
+			return score               # и ковыряться с этим в subseq_matches, чтобы не делить input на несуществующие слова.
+
 		word_cs = best_score = None
 		for node in cs:
-			cur_score = lcs_score(node.words, words, lambda a, _ia, b, _ib: (common_prefix_len(a, b) + lcs_len(a, b)**2) / (1 + max(_ia, _ib)))
+			cur_score = lcs_score(node.words, words, lambda a, _ia, b, _ib: (common_prefix_score(a, b) + lcs_len(a, b)**2) / (1 + max(_ia, _ib)))
 			if best_score is None or cur_score > best_score or cur_score == best_score and node.func and not any(node.func for node in word_cs):
 				word_cs = [node]
 				best_score = cur_score
@@ -683,6 +757,9 @@ class Commands:
 			# Это НЕВОЗМОЖНО ввиду оценки через lcs_len. Но на случай, если логика оценки изменится, оставлю заглушку...
 			return not_found() # Либо пойти дальше со старыми cs, предлагать АЛЬТЕРНАТИВЫ.
 
+		# для красоты предусматривается редкий случай, когда две разные команды замаплены в одно действие, например, quit, exit и запрос «i».
+		if cs[0].func and all(cs[i].func == cs[0].func for i in range(1, len(cs))): return cs[0].func, None, None
+
 		# После всех пыток команда осталась неоднозначной, так и ответим.
 		# Если слишком много вариантов — выбрать случайные.
 		MAX_ALTERNATIVES = 10
@@ -690,8 +767,8 @@ class Commands:
 		return None, [node.down_to_unambiguous().backtrack() for node in cs], None
 
 	# Основа guess: ищет среди всех команд те, для которых input является подпоследовательностью.
-	# Если просто искать такие среди списка листовых, будет много паразитных при недописанном вводе
-	# (например, когда есть heal hp, heal mp, subseq_matches на "h" вернёт единственный узел heal)
+	# Если просто искать такие среди списка листовых, будет много слишком конкретных при недописанном вводе:
+	# например, когда есть heal hp, heal mp, subseq_matches на "h" должна вернуть единственный узел heal.
 	# Кроме того, совпадения по идущим подряд символам получают бонус, чтобы на "il" предпочесть "silence" вместо "dispell".
 	def subseq_matches(self, input):
 		# сколько последовательных символов inp, начиная со start, составляют подпоследовательность ref?
@@ -717,7 +794,10 @@ class Commands:
 			for occ in subseq_occurences(input, node.full_command):
 				cur = 0
 				for a, b in sequences(occ):
-					cur += (b-a)*(b-a) # нелинейный бонус за идущие подряд символы
+					occ_len = b-a+1
+					word_index = node.sym_index_to_word_index(a)
+					# нелинейный бонус за идущие подряд символы
+					cur += occ_len*occ_len / (1+word_index) # деление для spd+ vs. sp.frailness+, см. (**spd_vs_spfrailness)
 				if best is None or cur > best: best = cur
 			return best
 
@@ -742,23 +822,24 @@ class Commands:
 		return best_nodes
 
 	@staticmethod
-	def classify_sym(sym): return (
+	def classify_sym(sym, start): return (
 		-1 if sym in string.whitespace else
-		0 if sym in string.ascii_letters else
-		1 if sym in string.digits else
-		2 if sym in '?' else
-		3)
+		1 if 'A' <= sym <= 'Z' or 'a' <= sym <= 'z' and start and 'A' <= start <= 'Z' else
+		0 if 'a' <= sym <= 'z' else
+		2 if sym in string.digits else
+		3 if sym in '?' else
+		4)
 
 	@staticmethod
 	def split(cmd, with_spaces=False):
 		i, r, preved = 0, [], 0
 		while i < len(cmd):
-			start_cls = Commands.classify_sym(cmd[i])
+			start_cls = Commands.classify_sym(cmd[i], None)
 			if start_cls >= 0:
 				start = i
 				while True:
 					i += 1
-					if i >= len(cmd) or Commands.classify_sym(cmd[i]) != start_cls: break
+					if i >= len(cmd) or Commands.classify_sym(cmd[i], cmd[start]) != start_cls: break
 				r.append((cmd[preved:i], cmd[start:i]) if with_spaces else cmd[start:i])
 				preved = i
 			else:
@@ -776,7 +857,7 @@ class Commands:
 			matches = new_matches
 
 		# если только один match, и это не корень (либо явно вызвано suggest_something() без input) —  развернуть в детей
-		if len(matches) == 1 and not matches[0].func and matches[0].childs and matches[0].parent or input is sentinel:
+		if len(matches) == 1 and not matches[0].func and matches[0].childs and (matches[0].parent or input is sentinel):
 			matches = [match for match in matches[0].childs.values()]
 
 		return [node.down_to_unambiguous().backtrack() for node in matches if node.parent]
@@ -788,6 +869,7 @@ class Commands:
 			self.spaced_name = spaced_name
 			self.parent = parent
 			self.words  = parent.words + [unspaced_name] if parent else []
+			self.spaced_word_lens = parent.spaced_word_lens + [len(spaced_name)] if parent else []
 			self.full_command = (parent.full_command if parent else "") + spaced_name
 
 		def add(self, cmd, func):
@@ -810,12 +892,20 @@ class Commands:
 			while not node.func and len(node.childs) == 1 and node.parent: node = next(node for node in node.childs.values())
 			return node
 
+		def sym_index_to_word_index(self, start_sym):
+			sym, iw = start_sym, 0
+			while sym >= 0:
+				if iw >= len(self.spaced_word_lens): raise RuntimeError("sym вне слов")
+				sym -= self.spaced_word_lens[iw]
+				if sym < 0: return iw
+				iw += 1
+
 class DummyCommands:
 	@staticmethod
 	def add(*args): pass
 
 class CommandsTest(Test):
-	cases = \
+	cases = (
 		(
 			(("one two three", "123"), ("one two four", "124"), ("one three six", "136")),
 			(
@@ -823,9 +913,9 @@ class CommandsTest(Test):
 				("o t t", ("123", None, None)),
 				("o t s", ("136", None, None)),
 			)
-		), \
-		((("spd-", "A"), ("sp.frailness", "B")), ("sp-", ("A", None, None))), \
-		((("sp-", "A"), ("spd-", "B"), ("sp.frailness", "C")), ("sp-", ("A", None, None))), \
+		),
+		((("spd-", "A"), ("sp.frailness", "B")), ("sp-", ("A", None, None))),
+		((("sp-", "A"), ("spd-", "B"), ("sp.frailness", "C")), ("sp-", ("A", None, None))),
 		(
 			(("1", "L1"), ("remove 10", "B"), ("remove 11", "C"), ("remove 21", "D")),
 			(
@@ -833,9 +923,13 @@ class CommandsTest(Test):
 				("r1", (None, ["remove 10", "remove 11"], None)),
 				("r2", ("D", None, None)),
 			)
-		), \
-		((("shop", "A"), ("shoot timestop", "B")), ("s", ("A", None, None))), \
-		((("sp.dispell+", "A"), ("sp.frailness+", "B"), ("b.timestop-", "C")), (("il", ("B", None, None)), ("es", (None, ["sp.frailness+", "b.timestop-"], None))))
+		),
+		((("shop", "A"), ("shoot timestop", "B")), ("s", ("A", None, None))),
+		((("sp.dispell+", "A"), ("sp.frailness+", "B"), ("b.timestop-", "C")), (("il", ("B", None, None)), ("es", (None, ["sp.frailness+", "b.timestop-"], None)))),
+		((("spd+", "A"), ("sp.frailness+", "B")), ("s+", ("A", None, None))), # чтобы это пройти, используется деление на номер слова (**spd_vs_spfrailness)
+		# чтобы это пройти, [s]subseq_matches поощряет полные вхождения слов[/s] всего лишь различаются большие и маленькие буквы :P (**V_vs_Vo)
+		((("rage V", "A"), ("rage Vo", "B")), ("rV", ("A", None, None))))
+
 	def one(self, adds, queries):
 		cmds = Commands()
 		for add in adds: cmds.add(*add)
@@ -961,7 +1055,7 @@ def multipad(lines):
 					start = i
 			else:
 				i += 1
-		fragments.append(Fragment(line[start:], None, 0, 0, 0)) # см. (**1)
+		fragments.append(Fragment(line[start:], None, 0, 0, 0)) # см. (**fake_last_fragment)
 		soup.append(fragments)
 
 	# Теперь нужно пройтись по списку маркеров и все их выровнять.
@@ -979,7 +1073,7 @@ def multipad(lines):
 			else:
 				fragment.data = ' ' * pad_delta + fragment.data
 
-			# -1 — после последних фрагментов строк, т. е. тех, которые Fragment(line[start:], None, 0, 0, 0) (**1),
+			# -1 — после последних фрагментов строк, т. е. тех, которые Fragment(line[start:], None, 0, 0, 0) (**fake_last_fragment),
 			# маркеров нет, а значит, и смещения корректировать не у чего
 			for i in range(fragment.fragment_index, len(soup[fragment.line_index]) - 1):
 				soup[fragment.line_index][i].marker_pos += pad_delta
@@ -988,12 +1082,13 @@ def multipad(lines):
 
 	return ["".join(frag.data for frag in fragments) for fragments in soup]
 
-def multipad_escape(line):
+def _multipad_escape(line):
 	i = 0
 	while i < len(line):
 		if line[i] == '[': line = line[:i+1] + line[i:]; i += 2
 		else: i += 1
 	return line
+multipad.escape = _multipad_escape; del _multipad_escape
 
 class MultipadTest(Test):
 	cases = \
@@ -1032,21 +1127,22 @@ def cls():
 class Hex:
 	ran_out = property(lambda self: self.turns <= 0)
 
-	def __init__(self, power, turns):
+	def __init__(self, power, *, turns=None):
 		self.applied = False
 		self.master = self.victim = None
 		self.power = check(power, power > 0, "power?!")
 		if self.time_based:
-			self.turns = check(turns, turns > 0, "turns?!")
+			self.turns = self.turns_from_power(power) if turns is None else check(turns, turns > 0, "turns?!")
 		else:
 			self.turns = 1
 
-	def apply(self, master, victim):
-		check(not self.applied, "already applied", master.alive, "мастер мёртв", victim.alive, "жертва мертва")
+	def apply(self, master, victim=None):
+		check(not self.applied, "already applied", master.alive, "мастер мёртв", not victim or victim.alive, "жертва мертва")
 		self.master = check(master, isinstance(master, Fighter), "master?!")
-		self.victim = check(victim, isinstance(victim, Fighter), "victim?!")
+		self.victim = check(victim, isinstance(victim, Fighter), "victim?!") if victim else master
 		master.caused_hexes.add(self)
-		victim.hexes.append(self)
+		self.victim.hexes.append(self)
+		self.do_start()
 		self.applied = True
 
 	def unapply(self):
@@ -1075,7 +1171,7 @@ class Hex:
 	def do_finish(self): pass
 	def do_cancel(self): pass
 
-	def short(self, cmd_prefix="", for_multipad=False, flip=False):
+	def short_desc(self, cmd_prefix="", for_multipad=False, flip=False):
 		# desc [cmd]cmd [turns]turns[/turns]
 		# или
 		# turns[/turns] cmd[/cmd] desc[/desc]
@@ -1103,6 +1199,9 @@ class Hex:
 	def cmd(self): return self.do_cmd()
 	def do_cmd(self): raise NotImplementedError("do_cmd")
 
+	def turns_from_power(self, power): return self.do_turns_from_power(power)
+	def do_turns_from_power(self, power): return 10
+
 	npower = property(lambda self: self.power / self.BASELINE_POWER)
 	BASELINE_POWER = 100
 	dispellable = False
@@ -1112,13 +1211,12 @@ class Hex:
 		check(self.applied, "not applied?!")
 		return {k:v for k,v in self.__dict__.items() if k not in (
 			'applied',         # резолвится здесь
+			'victim'           # резолвится Fighter
 			)}
 
 	def __setstate__(self, state):
 		self.__dict__.update(state)
-		self.applied = True                # отбрасывается здесь
-		self.master.caused_hexes.add(self) # caused_hexes отбрасывается Fighter
-		self.victim.hexes.append(self)     # hexes отбрасывается Fighter
+		self.applied = True    # отбрасывается здесь
 
 class RageHex(Hex):
 	#  мин. 1.2x @ pow → 0
@@ -1131,6 +1229,12 @@ class RageHex(Hex):
 	# макс. 2.2x @ pow = 1100
 	backlash_x = property(lambda self: clamp(1.1 + 0.1 * self.npower, 1.1, 2.2))
 
+	def do_start(self):
+		self.victim.note(lambda sink: sink.youify("{Вы/F} приходит{е/} в ярость!", self.victim))
+
+	def do_finish(self):
+		self.victim.note(lambda sink: sink.youify("{Вы/F} успокаивает{есь/ся}.", self.victim))
+
 	@classmethod
 	def do_generic_name(cls): return "Ярость"
 	def do_describe_power(self):
@@ -1141,6 +1245,7 @@ class RageHex(Hex):
 		"Увеличивает физическую атаку (x{0}) и любой получаемый урон (x{1}).".format(round(self.physdam_x, 1), round(self.backlash_x, 1))
 
 	def do_cmd(self): return 'rage'
+	def do_turns_from_power(self, power): return clamp(ceil(4*power**0.2), 3, 20)
 
 class RageHexTest(Test):
 	def __init__(self): self.dummy = None
@@ -1170,7 +1275,7 @@ class DeathWordHex(Hex):
 
 class Bleeding(Hex):
 	def __init__(self, power):
-		super().__init__(power, Bleeding.turns_from_power(power))
+		super().__init__(power)
 		self.precise_power = power
 		self.precise_damage = 0
 
@@ -1182,7 +1287,7 @@ class Bleeding(Hex):
 
 	def do_tick(self):
 		self.precise_damage += self.precise_hp_percentile_decay/100 * self.victim.mhp
-		dmg = math.floor(self.precise_damage)
+		dmg = floor(self.precise_damage)
 		if dmg > 0:
 			self.victim.ouch(dmg, "от потери крови", self.master)
 			self.precise_damage -= dmg
@@ -1194,8 +1299,7 @@ class Bleeding(Hex):
 	@staticmethod
 	def decay_power(power): return power * Bleeding.POWER_DECAY
 
-	@staticmethod
-	def turns_from_power(power): return clamp(math.ceil(math.log(0.5 * Hex.BASELINE_POWER / power, Bleeding.POWER_DECAY)), 3, 20)
+	def do_turns_from_power(self, power): return clamp(ceil(log(0.5 * self.BASELINE_POWER / power, self.POWER_DECAY)), 3, 20)
 
 	precise_hp_percentile_decay = property(lambda self: clamp(2.5 * (self.npower**0.5 if self.npower > 1 else self.npower), 1, 5))
 	precise_dex_debuff = property(lambda self: 3 * self.npower**0.5)
@@ -1205,9 +1309,9 @@ class Bleeding(Hex):
 class Spell:
 	LIST_ORDER = None
 	@classmethod
-	def name(cls): return cls.do_name()
+	def name(cls, *, long=False): return cls.do_name(long)
 	@classmethod
-	def do_name(cls): raise NotImplementedError("do_name")
+	def do_name(cls, long): raise NotImplementedError("do_name")
 
 	@classmethod
 	def cmd(cls): return cls.do_cmd()
@@ -1235,6 +1339,7 @@ class Upgrade:
 		self.applied = True
 		target.ap_used += ap
 		target.upgrades.append(self)
+		target.note(lambda sink: sink.you == target and self.apply_message(target))
 
 	def revert(self, target):
 		check(self.applied, "not applied", self.target == target, "target?!")
@@ -1242,6 +1347,7 @@ class Upgrade:
 		target.ap_used -= self.ap_taken
 		self.applied = False
 		self.do_revert(target)
+		target.note(lambda sink: sink.you == target and self.revert_message(target))
 
 	def do_apply(self, target): pass
 	def do_revert(self, target): pass
@@ -1249,8 +1355,8 @@ class Upgrade:
 	def apply_message(self, target): return self.do_apply_message(target)
 	def revert_message(self, target): return self.do_revert_message(target)
 
-	def do_apply_message(self, target): pass
-	def do_revert_message(self, target): pass
+	def do_apply_message(self, target): return f"Апгрейд приобретён за ${self.gold_taken}."
+	def do_revert_message(self, target): return f"Апгрейд продан за ${self.refund()}."
 
 	# Проверяет физическую возможность добавить апгрейд (но не цену в золоте).
 	@classmethod
@@ -1275,14 +1381,12 @@ class Upgrade:
 	@classmethod
 	def count(cls, target): return sum(1 for up in cls.find_all(target))
 
-	# Стоимость в AP.
 	@classmethod
 	def ap_cost(cls, target): return cls.do_ap_cost(target)
 
 	@classmethod
 	def do_ap_cost(cls, target): raise NotImplementedError("do_ap_cost")
 
-	# Стоимость в золоте.
 	@classmethod
 	def gold_cost(cls, target): return cls.do_gold_cost(target)
 
@@ -1405,7 +1509,7 @@ class DexUpgrade(StatUpgrade):
 	STAT, AMOUNT, LIMIT = 'dex', 5, 20
 
 	@classmethod
-	def do_gold_cost(cls, target): return 70 + 25 * cls.count(target)
+	def do_gold_cost(cls, target): return 90 + 25 * cls.count(target)
 
 	def do_apply_message(self, target): return "Ваши рефлексы улучшаются."
 	def do_revert_message(self, target): return "Вы чувствуете себя {0}.".format(target.gender.ize("неповоротлив{ым/ой}"))
@@ -1434,7 +1538,7 @@ class SpeedUpgrade(StatUpgrade):
 class Firestorm(Spell):
 	LIST_ORDER = 0
 	@classmethod
-	def do_name(cls): return "Огн. шторм"
+	def do_name(cls, long): return "Огненный шторм" if long else "Огн. шторм"
 
 	@classmethod
 	def do_cmd(cls): return 'fstorm'
@@ -1444,7 +1548,7 @@ class Firestorm(Spell):
 class Dispell(Spell):
 	LIST_ORDER = 1
 	@classmethod
-	def do_name(cls): return "Развеять"
+	def do_name(cls, long): return "Развеять"
 
 	@classmethod
 	def do_cmd(cls): return 'dispell'
@@ -1454,7 +1558,7 @@ class Dispell(Spell):
 class Frailness(Spell):
 	LIST_ORDER = 2
 	@classmethod
-	def do_name(cls): return "Хрупкость"
+	def do_name(cls, long): return "Хрупкость"
 
 	@classmethod
 	def do_cmd(cls): return 'frailness'
@@ -1722,7 +1826,7 @@ class AmmunitionUpgrade(WeaponUpgrade):
 
 	@classmethod
 	def shop_label(cls, target):
-		name = multipad_escape(target.name) + ": " + cls.AMMUNITION_CLASS.name(target)
+		name = multipad.escape(target.name) + ": " + cls.AMMUNITION_CLASS.name(target)
 		if cls.allow(target, ignore_ap_cost=True):
 			targ = cls.AMMUNITION_CLASS.name_up(target, up=+1)
 			if targ: name += (" -> " if cls.AMMUNITION_CLASS.name_up(target, up=0) else "") + targ
@@ -1765,6 +1869,166 @@ class TimestopAmmunitionUpgrade(AmmunitionUpgrade):
 
 	@classmethod
 	def genitive_ammunition_module_name(cls): return "патронов остановки времени"
+
+class FighterAttribute:
+	def __init__(self):
+		self.fighter = None
+
+	def set_fighter(self, fighter):
+		check(not self.fighter, "двойной set_fighter")
+		self.fighter = fighter
+
+	def reset_fighter(self, fighter):
+		check(self.fighter == fighter, lambda: "fighter не соответствует прежнему" if self.fighter else "fighter не задан")
+		self.fighter = None
+
+	def __getstate__(self):
+		return {k: v for k, v in self.__dict__.items() if k not in (
+			'fighter', # резолвится Fighter
+			)}
+
+class Special(FighterAttribute):
+	LIST_ORDER = None
+	def __init__(self):
+		super().__init__()
+
+	def name(self): return self.do_name()
+	def do_name(self): raise NotImplementedError("do_name")
+
+	def do_ouch(self): pass
+
+class RageOnLowHP(Special):
+	LIST_ORDER = 1
+	def __init__(self, *, red_zone=0.4):
+		super().__init__()
+		self.proceed = False
+		self.red_zone = red_zone
+
+	def do_name(self): return "Ярость"
+
+	def do_ouch(self):
+		if not self.proceed and self.fighter.hp <= round(self.fighter.mhp * self.red_zone):
+			RageHex(32 * (self.fighter.str * self.fighter.xl)**0.5).apply(self.fighter)
+			self.proceed = True
+
+class UnarmedAttack(FighterAttribute):
+	def attack(self, target, arena): raise NotImplementedError("attack")
+	def to_hit(self, target, arena): return 10 + self.fighter.dex
+	def ev(self, target, arena): return target.ev
+	def cumulative(self, target, arena): return None
+	def dodge(self, target, arena): return arena.dodge(self.to_hit(target, arena), self.ev(target, arena), cumulative=self.cumulative(target, arena))
+
+class BareHands(UnarmedAttack):
+	def __init__(self):
+		super().__init__()
+
+	def attack(self, target, arena):
+		dodged, hit_chance, hit_roll = self.dodge(target, arena)
+		if dodged:
+			def get_note(sink):
+				how = "едва " if hit_roll - 0.05 < hit_chance else "легко " if hit_roll - 0.2 > hit_chance else ""
+				return sink.youify("{Вы/F} " + how + "уклоняет{есь/ся}", target) + " от " + sink.youify("{вашего /}удара{/ F:G}", self.fighter) + "."
+			arena.note(get_note)
+		else:
+			damage = rand_round(bell(0, 0.15, 0.2) * self.fighter.str)
+			def get_note(sink):
+				if damage > 0:
+					msg = sink.youify("{Вы/F} наносит{е/} удар по ", self.fighter) + ("себе" if self.fighter == target else sink.youify("{вам/F:D}", target))
+				else:
+					msg = sink.youify("{Вы/F} касает{есь/ся} ", self.fighter) + ("себя" if self.fighter == target else sink.youify("{вас/F:G}", target))
+				bh_noticed = sink.extra_prop('bh_noticed', lambda: {})
+				if self not in bh_noticed:
+					msg += " голыми руками"
+					bh_noticed[self] = True
+				return msg + f" ({damage})."
+			arena.note(get_note)
+			target.ouch(damage, "от полученных ран", self.fighter)
+
+class Teeth(UnarmedAttack):
+	def attack(self, target, arena):
+		dodged, hit_chance, hit_roll = self.dodge(target, arena)
+		if dodged:
+			def get_note(sink):
+				how = "едва " if hit_roll - 0.05 < hit_chance else "легко " if hit_roll - 0.2 > hit_chance else ""
+				return sink.youify("{Вы/F} " + how + "уклоняет{есь/ся}", target) + " от " + sink.youify("{вас /}{/F:G}", self.fighter) + "."
+			arena.note(get_note)
+		else:
+			damage = rand_round(bell(0, 0.15, 0.2) * self.fighter.str)
+			def get_note(sink):
+				if damage > 0:
+					msg = sink.youify("{Вы/F} кусает{е/} ", self.fighter) + ("себя" if self.fighter == target else sink.youify("{вас/F:A}", target))
+				else:
+					msg = sink.youify("{Вы/F} скользнул{и//а} зубами по ", self.fighter) + ("себе" if self.fighter == target else sink.youify("{вам/F:G}", target))
+				return msg + f" ({damage})."
+			arena.note(get_note)
+			target.ouch(damage, "от полученных ран", self.fighter)
+
+# Механизм подписки на сообщения о боевых и не очень событиях.
+# Сообщение может быть сообщено разным sink по-разному: одной — «вы ударили Грязекраба», другой то же самое — «Рика ударила Грязекраба»
+# (с этим разбирается автор сообщения и передаёт в note либо строку, либо функцию от sink, возвращающую строку).
+# Через on_note разные режимы по-разному реагируют на эти сообщения: на арене (ArenaView) они добавляются в лог, в магазине — отображаются как more().
+# Я на самом деле не уверен, что обычно понимают под термином sink :)
+class MessageSink:
+	def __init__(self, you, on_note, *, FICTIVE=False):
+		if not FICTIVE:
+			self.you = you
+			self.on_note = on_note
+			self.extra_props = {}
+
+	def receive_note(self, msg):
+		if not isinstance(msg, str):
+			msg = msg(self)
+			check(not msg or isinstance(msg, str), "должна быть строка")
+		if msg: self.on_note(cap_first(msg))
+
+	# {вы/не вы}, {вы/F:падеж}, {вы/не вы мужского рода/не вы женского рода...}
+	# Например,
+	# sink.youify("{Вас/F:G} нет в списке.", fighter)
+	# вернёт "Вас нет в списке", когда fighter == sink.you, и f"{fighter.name(Case.GENITIVE)} нет в списке" — в противном случае.
+	def youify(self, src, fighter):
+		def handle(piece, spec):
+			if not piece: return ""
+			pieces = piece.split('/')
+			if fighter == self.you: p = pieces[0]
+			else: p = pieces[min(len(pieces) - 1, 1 + min(fighter.gender if fighter.gender != Gender.UNKNOWN else Gender.MALE, len(pieces) - 2))]
+			i = 0
+			while i < len(p):
+				if p[i] == 'F':
+					name = fighter.name(Case.from_letter(spec))
+					p = p[:i] + name + p[i+1:]
+					i += len(name)
+				else:
+					i += 1
+			return p
+		return "".join(literal + handle(bracketed, spec) for literal, bracketed, spec, _ in string.Formatter.parse(None, src))
+
+	def extra_prop(self, name, default_ctr):
+		value = self.extra_props.get(name, None)
+		if value is None:
+			value = default_ctr()
+			self.extra_props[name] = value
+		return value
+
+# arena.note("сообщение")
+# -или-
+# who = ...
+# arena.note(lambda sink: "Вы обосрались." if who == sink.you else who.name + " обосрался.")
+class MessageBroadcaster:
+	def __init__(self):
+		self.sinks = []
+
+	def add_sink(self, sink):
+		check(sink not in self.sinks, "add_sink 2x")
+		self.sinks.append(sink)
+		if len(self.sinks) > 1:
+			impossible("Нет, в принципе это возможно (иначе зачем было вообще городить sinks[]), но сейчас, когда игрок ровно один — означает баг.")
+
+	def remove_sink(self, sink):
+		self.sinks.remove(sink)
+
+	def note(self, msg):
+		for sink in self.sinks:
+			sink.receive_note(msg)
 
 class Living:
 	ap_limit = property(lambda self: 1 + 2*(self.xl - 1))
@@ -1817,15 +2081,15 @@ class Living:
 		return self.ap_used + ap_cost <= self.ap_limit
 
 	def next_percentage(self):
-		return math.floor(self.xp / self.xp_for_levelup(self.xl) * 100) if self.xl < self.LEVEL_CAP else None
+		return floor(self.xp / self.xp_for_levelup(self.xl) * 100) if self.xl < self.LEVEL_CAP else None
 
 	# под for_multipad подразумевается for_shop
 	def living_desc(self, for_multipad=False):
-		name = cap_first(self.name)
+		name = self.name.cap_first()
 		show_ap = for_multipad or self.xp > 0 or self.xl > 1 or self.ap_used > 0
 		return ("{name}: {xlmp}{xl}" + (", {ap_mp}умения: {0.ap_used}/{0.ap_limit}" if show_ap else "")).format(
 			self, xl = self.xl_desc(self.xl, self.next_percentage(), short=for_multipad, show_nx=not for_multipad),
-			name = multipad_escape(name) if for_multipad else name,
+			name = multipad.escape(name) if for_multipad else name,
 			xlmp = "[lv]" if for_multipad else "",
 			ap_mp = "[ap]" if for_multipad else "")
 
@@ -1835,32 +2099,37 @@ class Living:
 		nx_word = "" if short else "след. "
 		return f"{lv_word}{xl}" + (f" ({nx_word}{next_percentage}%)" if show_nx and next_percentage is not None else "")
 
-	class RelativeVitals():
+	class RelativeVitals(AbstractContextManager):
 		def __init__(self, char): self.char = char
-		def __enter__(self): return self
-		def __exit__(self, et, e, tb): pass
+		def __exit__(self, *poxui): pass
 
 	def save_relative_vitals(self): return self.RelativeVitals(self)
 
 	def __getstate__(self):
 		return {k:
 			v.value if k == 'gender' else
-			('g' + str(v) if v == Noun.guess(v) else 'p' + v.src()) if k == 'name' else
+			('g' + str(v) if v == Noun.guess(v, gender=self.gender, animate=isinstance(self, Fighter)) else 'p' + v.src()) if k == 'name' else
 			v
 			for k, v in self.__dict__.items()}
 
 	def __setstate__(self, state):
+		def unpack_name(n):
+			return (
+				Noun.parse(n[1:]) if n.startswith('p') else
+				Noun.guess(n[1:], gender=Gender(state['gender']), animate=isinstance(self, Fighter)) if n.startswith('g') else
+				throw(pickle.UnpicklingError, "name"))
+
 		self.__init__()
 		self.__dict__.update((k,
 			Gender(v) if k == 'gender' else
-			(Noun.parse(v[1:]) if v.startswith('p') else Noun.guess(v[1:]) if v.startswith('g') else throw(pickle.UnpicklingError, "name")) if k == 'name' else
+			unpack_name(v) if k == 'name' else
 			v)
 			for k, v in state.items())
 		for up in self.upgrades: up.target = self # отбрасывается Upgrade
 
-class Fighter(Living):
+class Fighter(Living, MessageBroadcaster):
 	hp    = property(lambda self: self.cur_hp)
-	mhp   = property(lambda self: max(1, round((self.base_mhp + 5 * (self.xl - 1)**0.77) * (1 + (self.str - 10) / 10))))
+	mhp   = property(lambda self: max(1, round((self.base_mhp + 5 * (self.xl - 1)**0.77) * (1 + (self.base_str - 10) / 10))))
 	dead  = property(lambda self: self.death_cause)
 	alive = property(lambda self: not self.dead)
 	mp    = property(lambda self: self.cur_mp)
@@ -1870,11 +2139,12 @@ class Fighter(Living):
 	dex   = property(lambda self: self.base_dex)
 	spd   = property(lambda self: self.base_spd)
 	ac    = property(lambda self: self.base_ac)
-	ev    = property(lambda self: max(0, self.base_ev + (self.dex - 10)))
+	ev    = property(lambda self: max(0, self.base_ev + (self.dex - 10)//2))
 	LEVEL_CAP = 7
 
 	def __init__(self):
 		Living.__init__(self)
+		MessageBroadcaster.__init__(self)
 		self.base_mhp = 10
 		self.base_mmp = 10
 		self.base_str = 10
@@ -1884,12 +2154,13 @@ class Fighter(Living):
 		self.base_ac = 0
 		self.base_ev = 10
 		self.death_cause = None
-		self.arena = None
 
 		self.hexes = []
 		self.caused_hexes = set()
+		self.unarmed = None
 		self.weapon = None
 		self.spells = []
+		self.specials = []
 
 		self.cur_hp = self.mhp
 		self.cur_mp = self.mmp
@@ -1899,19 +2170,31 @@ class Fighter(Living):
 
 		if not self.dead:
 			self.cur_hp -= hp_dam
-			if self.cur_hp <= 0: self.die(death_cause, killer)
+			if self.cur_hp <= 0:
+				self.die(death_cause, killer)
+			else:
+				for sp in self.specials:
+					sp.do_ouch()
 
 	def die(self, cause, killer=None):
 		check(not self.dead, "not dead", cause, "cause?!", not killer or isinstance(killer, Fighter), "killer?!")
+		self.death_cause = cause
+		def get_note(sink):
+			return sink.youify("{Вы/F} умирает{е/} ", self) + cause + "."
+		self.note(get_note)
+
 		for hex in self.hexes:
 			hex.cancel()
 
 		for hex in self.caused_hexes:
-			if isinstance(hex, DeathWordHex):
-				hex.cancel()
+			if not hex.ran_out:
+				if isinstance(hex, DeathWordHex):
+					def death_word_cancellation_note(sink):
+						return sink.youify("{Вы/F} больше не чувствует{е/} дыхание смерти.", hex.victim)
+					hex.victim.note(death_word_cancellation_note)
+					hex.cancel()
 
-		if killer: cause = f"{cause} ({killer.name})"
-		self.death_cause = cause
+		if killer: self.death_cause = f"{self.death_cause} ({killer.name})"
 
 	def end_turn(self):
 		ran_out = []
@@ -1930,18 +2213,46 @@ class Fighter(Living):
 
 	def learn_spell(self, spell):
 		check(spell not in self.spells, "already in spells",
-			all(not isinstance(spell, type(sp)) for sp in self.spells), "duplicate spell",
-			all(not isinstance(sp, type(spell)) for sp in self.spells), "duplicate spell 2")
+			all(not isinstance(spell, type(sp)) and not isinstance(sp, type(spell)) for sp in self.spells), "duplicate spell")
 		self.spells.insert(bisect_right([spell.LIST_ORDER for spell in self.spells], spell.LIST_ORDER), spell)
 
 	def forget_spell(self, spell):
 		self.spells.remove(spell)
+
+	def add_special(self, special):
+		check(special not in self.specials, "already in specials",
+			all(not isinstance(special, type(sp)) and not isinstance(sp, type(special)) for sp in self.specials), "duplicate special")
+		special.set_fighter(self)
+		self.specials.insert(bisect_right([special.LIST_ORDER for special in self.specials], special.LIST_ORDER), special)
+
+	def remove_special(self, special):
+		self.specials.remove(special)
+		special.reset_fighter(self)
+
+	def set_unarmed(self, unarmed):
+		if self.unarmed: self.unarmed.reset_fighter(self)
+		self.unarmed = unarmed
+		if unarmed: unarmed.set_fighter(self)
 
 	def has_magic(self):
 		return self.spells and self.mmp
 
 	def actual_hexes(self):
 		return (hex for hex in self.hexes if not hex.ran_out)
+
+	def generic_bar(self, name, cur, max, flip):
+		return left_to_right(name + ("" if flip else ":"), Con.vital_bar(cur, max, flip=flip), f"{cur}/{max}", flip=flip)
+	def hp_bar(self, flip=False): return self.generic_bar("HP", self.hp, self.mhp, flip)
+	def mp_bar(self, flip=False): return self.generic_bar("MP", self.mp, self.mmp, flip)
+
+	def act_skip_turn(self):
+		def get_note(sink):
+			return sink.youify("{Вы/F} пропускает{е/} ход.", self)
+		self.note(get_note)
+
+	def act_attack_unarmed(self, target, arena):
+		check(self.unarmed, "не задан флавор атаки голыми руками", self.alive, "dead")
+		self.unarmed.attack(target, arena)
 
 	# сохранить соотношения HP/MP к максимумам, если какое-то действие потенциально изменит их лимит.
 	class RelativeVitals(Living.RelativeVitals):
@@ -1955,25 +2266,22 @@ class Fighter(Living):
 			self.char.cur_mp = clamp(round(self.char.mmp * self.relative_mp), min(1, self.char.mmp), self.char.mmp)
 			super().__exit__(et, e, tb)
 
-	def enter_arena(self, arena):
-		check(not self.arena, "already on arena")
-		self.arena = arena
-
-	def leave_arena(self, arena):
-		if self.arena != arena: impossible(f"arena: {self.arena}, new: {arena}")
-		self.arena = None
-
 	def __getstate__(self):
-		check(not self.arena, "arena?!")
 		return {k: v for k, v in super().__getstate__().items() if k not in (
-			'hexes', 'caused_hexes', # резолвятся Hex
-			'death_cause',           # либо сохраняемый боец жив, либо эта информация не интересна
-			'arena'                  # сохраняются только в лагере~
-			)}
+			'caused_hexes', # резолвятся здесь
+			'death_cause',  # либо сохраняемый боец жив, либо эта информация не интересна
+			'sinks'         # из MessageBroadcaster; подписчики по своей природе — динамическая штука, их не то что «можно не», а категорически нельзя сохранять
+			) and not (k in ('hexes', 'spells', 'specials', 'unarmed', 'weapon') and not v)}
 
 	def __setstate__(self, state):
 		super().__setstate__(state)
 		self.weapon.owner = self # отбрасывается Weapon
+		for hex in self.hexes:
+			hex.victim = self                # отбрасывается Hex
+			hex.master.caused_hexes.add(hex) # отбрасываются здесь
+		for special in self.specials:
+			special.fighter = self  # отбрасывается FighterAttribute
+		if self.unarmed: self.unarmed.fighter = self # отбрасывается FighterAttribute
 
 class Weapon(Living):
 	ap_limit = property(lambda self: 1 + (self.xl - 1))
@@ -1987,7 +2295,8 @@ class Weapon(Living):
 	def __getstate__(self):
 		return {k:v for k, v in super().__getstate__().items() if k not in (
 			'owner', # резолвится Fighter
-			)}
+			)
+			and not (k == 'ammos' and not self.ammos)}
 
 	def __setstate__(self, state):
 		super().__setstate__(state)
@@ -1999,16 +2308,17 @@ class Element:
 class Damage:
 	pass
 
-class Arena:
+class Arena(MessageBroadcaster, MessageSink):
 	BASELINE_SPD = 100
 
 	class Battler: # Gladiator слишком длинно
-		def __init__(self, fighter, squad_id, ai, shortcut):
+		def __init__(self, fighter, squad_id, ai, shortcut, game):
 			self.fighter    = fighter
 			self.squad_id   = squad_id
 			self.ai         = ai
 			self.initiative = 0        # время до хода этого участника; после хода увеличивается на значение, зависящее от SPD
 			self.shortcut   = shortcut # сокращение, используемое в командах и на шкале инициативы
+			self.game       = None
 
 	class Squad:
 		def __init__(self, id):
@@ -2016,36 +2326,30 @@ class Arena:
 			self.members     = []
 			self.max_members = None
 
-	# Механизм подписки на сообщения о боевых событиях (note).
-	# Сообщение может быть сообщено разным sink по-разному: одному — «вы ударили Грязекраба», другому то же самое — «Рика ударила Грязекраба».
-	# Я на самом деле не уверен, что обычно понимают под термином sink :)
-	class MessageSink:
-		def __init__(self, you, note_callback=None):
-			self.you = you
-			self.note_callback = note_callback
-
-		def note(self, msg): self.do_note(msg)
-
-		def do_note(self, msg):
-			if self.note_callback: self.note_callback(msg)
-			else: raise NotImplementedError("do_note")
-
 	def __init__(self):
+		MessageBroadcaster.__init__(self)
+		MessageSink.__init__(self, None, None, FICTIVE=True)
 		self.battlers   = []
 		self.squads     = {}
 		self.turn_queue = [] # battlers, отсортированные по initiative
-		self.message_sinks = []
 		self.started = False
 		self.inside_turn = False
-		self.action_cost = None
+		self.last_action_cost = None
 		self.squads_frozen = False
+
+	# Арена подписывается на сообщения от бойцов, чтобы переслать их своим подписчикам.
+	# Т. е. MessageSink.receive_note перенаправляется в MessageBroadcaster.note.
+	# Вместе с тем, MessageBroadcaster.note может быть вызвана и напрямую, когда сообщение сгенерировано не бойцом, а, например, самой ареной («тик!»).
+	def receive_note(self, msg):
+		self.note(msg)
 
 	# shortcut_hint — список предпочтительных сокращений участника, либо строка-альтернативное имя для автогенерируемых сокращений.
 	# например: add(fighter, squad_id, ai, "Ghost") -> автоматически сгенерируются G, Gh, Go... G2, G3...
-	#           add(fighter, squad_id, ai, ("Fi", "Alt")) -> предпочтёт Fi или Alt, прежде чем пойти по автогенерируемым
-	def add(self, fighter, squad_id, ai, *, shortcut_hint=None):
-		fighter.enter_arena(self)
-		battler = Arena.Battler(fighter, squad_id, ai, self.generate_shortcut(fighter, shortcut_hint))
+	#           add(fighter, squad_id, ai, ("Fi", "Alt")) -> предпочтёт Fi или Alt, прежде чем пойти по автогенерируемым из fighter.name
+	def add(self, fighter, squad_id, ai, *, shortcut_hint=None, force_delay=None, game=None):
+		if any(battler.fighter == fighter for battler in self.battlers): impossible(f"{fighter.name} уже на арене")
+		if self.started: fighter.add_sink(self)
+		battler = Arena.Battler(fighter, squad_id, ai, self.generate_shortcut(fighter, shortcut_hint), game)
 		if ai: ai.setup(fighter, self)
 		self.battlers.append(battler)
 
@@ -2054,86 +2358,79 @@ class Arena:
 		squad.members.append(battler)
 
 		self.turn_queue.insert(0, battler)
-		self.delay_by(fighter, random())
+		self.delay_by(battler, random() if force_delay is None else force_delay)
 
-	def remove(self, fighter):
-		battler = self.as_battler(fighter)
+	def remove(self, battler):
+		if check(battler, isinstance(battler, Arena.Battler), "battler").ai: battler.ai.teardown()
 		self.battlers.remove(battler)
 		self.squads[battler.squad_id].members.remove(battler)
 		self.turn_queue.remove(battler)
-		if battler.ai: battler.ai.teardown()
-		fighter.leave_arena(self)
+		battler.fighter.remove_sink(self)
 
 	def dismiss(self):
-		while self.battlers: self.remove(self.battlers[0].fighter)
+		while self.battlers: self.remove(self.battlers[0])
 
 	def allies(self, fighter):
 		battler = self.as_battler(fighter)
-		return (member.fighter for member in self.squads[battler.squad_id].members if member.fighter != fighter)
+		return (member.fighter for member in self.squads[battler.squad_id].members if member.fighter != fighter and member.fighter.alive)
 
 	def enemies(self, fighter):
 		battler = self.as_battler(fighter)
-		return (member.fighter for squad_id, squad in self.squads.items() if squad_id != battler.squad_id for member in squad.members)
+		return (member.fighter for squad_id, squad in self.squads.items() if squad_id != battler.squad_id for member in squad.members if member.fighter.alive)
 
 	def as_battler(self, fighter):
 		return next(b for b in self.battlers if b.fighter == fighter)
 
-	# arena.note("сообщение")
-	# -или-
-	# who = ...
-	# arena.note(lambda sink: "Вы обосрались." if who == sink.you else who.name + " обосрался.")
-	def note(self, msg):
-		for sink in self.message_sinks:
-			if not isinstance(msg, str):
-				msg = msg(sink)
-				check(isinstance(msg, str), "должна быть строка")
-			sink.note(msg)
-
 	def turn(self):
 		check(self.started, "не вызвана start", not self.inside_turn, "уже внутри turn")
 		self.inside_turn = True
-		self.action_cost = 1.0
+		self.last_action_cost = 1.0
 		self.turn_queue[0].ai.turn()
 		self.turn_queue[0].fighter.end_turn()
-		self.delay_by(self.turn_queue[0].fighter, self.action_cost * uniform(0.8, 1/0.8))
+		self.delay_by(self.turn_queue[0], self.last_action_cost * uniform(0.8, 1.2))
 		self.shift_delays()
 		self.inside_turn = False
+
+		corpses = [b for b in self.battlers if b.fighter.dead]
+		for corpse in corpses: self.remove(corpse)
 
 	def whose_turn(self):
 		return self.turn_queue[0].fighter
 
-	def delay_by(self, fighter, multiplier):
-		battler = self.as_battler(fighter)
-		index = self.turn_queue.index(battler)
-		battler.initiative += multiplier * Arena.BASELINE_SPD / max(fighter.spd, 1)
+	def delay_by(self, battler, multiplier):
+		index = self.turn_queue.index(check(battler, isinstance(battler, Arena.Battler), "battler"))
+		battler.initiative += multiplier * Arena.BASELINE_SPD / max(battler.fighter.spd, 1)
 		while index + 1 < len(self.turn_queue) and battler.initiative >= self.turn_queue[index + 1].initiative:
 			self.turn_queue[index], index = self.turn_queue[index + 1], index + 1
 		self.turn_queue[index] = battler
 
 	def start(self):
 		check(not self.started, "уже")
+		for battler in self.battlers:
+			battler.fighter.add_sink(self)
 		self.shift_delays()
 		self.started = True
+
+		def note_group(sink, group, preface):
+			dudes = list(group(sink.you))
+			if dudes:
+				return "{0} вста{1}т {2}.".format(preface, "ё" if len(dudes) == 1 else "ю", join_with_lastsep((dude.name for dude in dudes), ", ", " и "))
+		self.note(lambda sink: note_group(sink, lambda you: self.enemies(you), "против вас"))
+		self.note(lambda sink: note_group(sink, lambda you: self.allies(you), "с вашей стороны"))
 
 	def shift_delays(self):
 		shift = self.turn_queue[0].initiative
 		for battler in self.turn_queue:
 			battler.initiative -= shift
 
-	def try_shortcut(self, shortcut):
-		return all(b.shortcut != shortcut for b in self.battlers)
-
 	def suggest_shortcuts(self, name_or_list):
+		# это не совсем транслитерация, неподходящие символы ~выбрасываются~.
 		def transliterate(src):
-			table = {'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo', 'ж': 'j', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l',
-				'м': 'm', 'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'h', 'ц': 'c', 'ч': 'ch', 'ш': 'sh',
-				'щ': 'sch', 'ъ': '\'', 'ы': 'y', 'ь': '\'', 'э': 'e', 'ю': 'yu', 'я': 'ya'}
-			result = []
-			for sym in check(src, src == src.casefold(), "src"):
-				if 'a' <= sym <= 'z' or '0' <= sym <= '9': tr = sym
-				else: tr = table.get(sym, None)
-				if tr: result.append(tr)
-			return ''.join(result)
+			def split(s): return (sym.strip() for sym in s.split('|'))
+			table = dict(zip(split("а|б|в|г|д|е|ж|з|и|й|к|л|м|н|о|п|р|с|т|у|ф|х|ц|ч |ш |щ  |ъ|ы|ь|э|ю |я |ё"),
+			                 split("a|b|v|g|d|e|j|z|i|y|k|l|m|n|o|p|r|s|t|u|f|h|c|ch|sh|sch|'|y|'|e|yu|ya|yo")))
+			pieces = (sym if 'a' <= sym <= 'z' or '0' <= sym <= '9' else table.get(sym, None) for sym in check(src, src == src.casefold(), "src"))
+			return ''.join(piece for piece in pieces if piece)
 
 		if isinstance(name_or_list, str):
 			tr = transliterate(name_or_list.casefold())
@@ -2151,7 +2448,7 @@ class Arena:
 
 	def generate_shortcut(self, fighter, hint):
 		packs = (hint and self.suggest_shortcuts(hint), self.suggest_shortcuts(fighter.name))
-		return next(shortcut for shortcut_pack in packs if shortcut_pack for shortcut in shortcut_pack if self.try_shortcut(shortcut))
+		return next(shortcut for shortcut_pack in packs if shortcut_pack for shortcut in shortcut_pack if all(b.shortcut != shortcut for b in self.battlers))
 
 	def force_squad(self, squad_id):
 		squad = self.squads.get(squad_id, None)
@@ -2163,20 +2460,24 @@ class Arena:
 
 	def set_action_cost(self, fighter, cost):
 		check(self.inside_turn, "not inside turn()", self.turn_queue[0].fighter == fighter, "not your turn")
-		self.action_cost = cost
+		self.last_action_cost = cost
 
 	def limit_squad_members(self, squad_id, limit):
-		self.force_squad(squad_id).max_members = limit
+		squad = self.force_squad(squad_id)
+		check(len(squad.members) <= limit, "уже больше")
+		squad.max_members = min(limit, squad.max_members if squad.max_members is not None else limit)
 
 	def deny_any_new_squads(self):
 		self.squads_frozen = True
 
-	def add_sink(self, sink):
-		check(sink not in self.message_sinks)
-		self.message_sinks.append(sink)
+	def dodge(self, to_hit, ev, *, cumulative=None):
+		hit_chance = self.hit_chance(to_hit, ev, cumulative=cumulative)
+		hit_roll = random()
+		dodged = hit_roll >= hit_chance
+		return dodged, hit_chance, hit_roll
 
-	def remove_sink(self, sink):
-		self.message_sinks.remove(sink)
+	def hit_chance(self, to_hit, ev, *, cumulative=None):
+		return to_hit / (to_hit + ev)
 
 class AI:
 	def __init__(self):
@@ -2192,7 +2493,7 @@ class AI:
 		self.fighter, self.arena = None, None
 
 	def note(self, *args, **kargs):
-		self.arena.note(*args, **kargs)
+		self.fighter.note(*args, **kargs)
 
 	def turn(self):
 		self.do_turn()
@@ -2210,34 +2511,26 @@ class PlayerAI(AI):
 
 	def do_turn(self):
 		check(self.decision, "decision?!")
-		self.decision()
+		self.decision(self)
 		self.decision = None
 
 class DummyAI(AI):
 	def do_turn(self):
 		chooses = []
 		def make_look_with_hate_at(who):
-			def note(sink):
-				msg = cap_first(self.fighter.name) + " с ненавистью смотрит на "
-				if who == sink.you: msg += "вас"
-				else: msg += who.name(Case.ACCUSATIVE)
-				msg += "."
-				return msg
-			return lambda: self.note(lambda sink: note(sink))
+			def note_msg(sink):
+				return self.fighter.name + sink.youify(" с ненавистью смотрит на {вас/F:A}", who) + "."
+			return lambda: self.note(note_msg)
 
 		def make_look_with_love_at(who):
-			def note(sink):
-				msg = cap_first(self.fighter.name) + " смотрит на "
-				if who == sink.you: msg += "вас"
-				else: msg += who.name(Case.ACCUSATIVE)
-				msg += " с любовью."
-				return msg
-			return lambda: self.note(lambda sink: note(sink))
+			def note_msg(sink):
+				return self.fighter.name + sink.youify(" смотрит на {вас/F:A} с любовью.", who)
+			return lambda: self.note(note_msg)
 
 		def make_idle():
-			def note(sink):
-				return cap_first(self.fighter.name) + " облизывается."
-			return lambda: self.note(lambda sink: note(sink))
+			def note_msg(sink):
+				return self.fighter.name + " облизывается."
+			return lambda: self.note(note_msg)
 
 		for ally in self.arena.allies(self.fighter):
 			chooses.append((1.0, make_look_with_love_at(ally)))
@@ -2248,12 +2541,35 @@ class DummyAI(AI):
 
 		choose((act for act in chooses), get_weight=lambda act, index: act[0])[0][1]()
 
+class MeleeAI(AI):
+	def __init__(self):
+		super().__init__()
+		self.lock_on = self.lock_interest = None
+
+	def do_turn(self):
+		if not self.lock_on or not self.lock_on.alive or self.lock_interest <= 0:
+			target, index = choose(self.arena.enemies(self.fighter), default=None)
+			if target:
+				self.lock_on = target
+				self.lock_interest = randrange(3, 6)
+			else:
+				self.lock_on = None
+
+		if self.lock_on:
+			if self.fighter.unarmed:
+				self.fighter.act_attack_unarmed(self.lock_on, self.arena)
+				self.lock_interest -= 1
+			else:
+				self.note(self.fighter.name + " не может найти свои руки (БАГ).")
+		else:
+			self.note(lambda sink: sink.youify("{Вы/F} облизывает{есь/ся}.", self.fighter))
+
 class Con:
 	# На данный момент сделано так, что чуть больше нуля даёт [#....] и чуть меньше максимума — [####.]
 	@staticmethod
-	def vital_bar(cur, max, divs=10, fillchar='#', emptychar='.', reverse=False):
+	def vital_bar(cur, max, divs=10, fillchar='#', emptychar='.', flip=False):
 		fill = int(clamp(int(cur > 0) + (divs - 1) * (cur / (max or 1)), 0, divs))
-		return ("[{1}{0}]" if reverse else "[{0}{1}]").format(fillchar * fill, emptychar * (divs - fill))
+		return f"[{{{int(flip)}}}{{{int(not flip)}}}]".format(fillchar * fill, emptychar * (divs - fill))
 
 	@staticmethod
 	def bullet_bar(cur, max, fillchar='#', emptychar='.'):
@@ -2275,6 +2591,7 @@ class Mode:
 	def __init__(self):
 		self.session = None
 		self.last_screen = self.last_input = ""
+		self.invalidated = False
 
 	def process(self):
 		self.do_process()
@@ -2285,7 +2602,11 @@ class Mode:
 
 	def do_process(self): pass
 	def do_render(self, lines, cmds): raise NotImplementedError("do_render")
+
+	def activate(self): self.do_activate()
+	def deactivate(self): self.do_deactivate()
 	def do_activate(self): pass
+	def do_deactivate(self): pass
 
 	def handle_command(self, cmds): return self.do_handle_command(cmds)
 	def do_handle_command(self, cmd): return False
@@ -2296,6 +2617,12 @@ class Mode:
 	def revert(self, n=1):
 		check(self.session.mode == self, "session.mode != self")
 		return self.session.revert(n)
+
+	# Обычно родительские режимы не перерендериваются, а используется запомненная с последнего render картинка.
+	# invalidate форсирует перерисовку. Пример: после команды heal hp полоска немедленно перерисовывается, несмотря на то, что активно more-сообщение.
+	def invalidate(self):
+		self.invalidated = True
+		return self.session.cls_once()
 
 	def shortcut(self, mode, *a, **ka):
 		mode = mode(*a, **ka)
@@ -2340,6 +2667,7 @@ class MainMenu(Mode):
 		game = Game()
 		game.gold = 100
 		game.player = Fighter()
+		game.player.set_unarmed(BareHands())
 		game.player.set_weapon(Weapon())
 		game.next_level = 1
 		self.switch_to(AskName(game))
@@ -2394,7 +2722,7 @@ class LoadGame(Mode):
 				ok_count, ok_lines = count, lines # и пробовать дальше!~
 			else:
 				break
-		return min(max(3, ok_count), len(previews.items) - start if down else start)
+		return min(max(2, ok_count), len(previews.items) - start if down else start)
 
 	def do_process(self):
 		previews = self.session.previews
@@ -2431,7 +2759,7 @@ class LoadGame(Mode):
 
 	def do_render(self, lines, cmds):
 		if self.first_up is not None:
-			lines.append(f"({1 + self.first_up}–{self.first_up + self.show_up}) (up)")
+			lines.append(f"({1 + self.first_up}–{1 + self.first_up + self.show_up - 1}) (up)")
 			cmds.add('up', lambda: self.up(), '?', lambda: self.more("Прокрутить список вверх."))
 
 		def describe_up_new_miss_onetime():
@@ -2472,7 +2800,7 @@ class LoadGame(Mode):
 				'?', lambda: self.more("Удалить повреждённые сохранения."))
 
 		if self.first_dn is not None:
-			lines.append(f"\n({1 + self.first_dn}–{self.first_dn + self.show_dn}) (down)")
+			lines.append(f"\n({1 + self.first_dn}–{1 + self.first_dn + self.show_dn - 1}) (down)")
 			cmds.add('down', lambda: self.down(), '?', lambda: self.more("Прокрутить список вниз."))
 
 		lines.append("\nУдалить сохранение ({0})".format(", ".join(remove_inscriptions)))
@@ -2511,14 +2839,7 @@ class LoadGame(Mode):
 		check(item.preview, "preview?!")
 		def confirm_load(input, mode):
 			if not input or 'yes'.startswith(input):
-				try:
-					with open(item.full_save_path, 'rb') as f:
-						game = Game.load(f, item.full_save_path, item.rel_save_path)
-				except Exception as e:
-					mode.more("Не удалось загрузить игру.\n" + exception_msg(e)).reverts(2)
-					self.session.previews.force_bad(item, e)
-				else:
-					mode.more("Загрузка...").then(lambda mode: mode.switch_to(Respite(game)))
+				Game.load_nothrow(item, self, on_fail=lambda mode: mode.reverts(2))
 			else:
 				mode.revert()
 
@@ -2616,8 +2937,8 @@ class More(Mode):
 	input_comes = False
 
 class Prompt(More):
-	def __init__(self, msg, callback, casefold_input=True):
-		super().__init__(msg)
+	def __init__(self, msg, callback, casefold_input=True, *, do_cls=False):
+		super().__init__(msg, do_cls)
 		self.callback, self.casefold_input = callback, casefold_input
 
 	def do_handle_command(self, cmd):
@@ -2679,7 +3000,7 @@ class Game:
 			self.weapon_next    = game and game.player.weapon.next_percentage()
 			self.gold           = game and game.gold
 			self.next_level     = game and game.next_level
-			self.timestamp      = game and time.localtime()
+			self.timestamp      = game and localtime()
 			self.compress       = compress
 
 		store_fields = [('character_uid', int), ('order_key', int),
@@ -2692,8 +3013,8 @@ class Game:
 			# save_version начинается с первого бита, а нулевой означает, используется ли сжатие
 			# (возможность его выключить поддерживается, потому что мне иногда интересно посмотреть, ЧО ТАМ)
 			return [save_version<<1 | int(self.compress)] + [
-				int(time.mktime(self.timestamp)) if field == 'timestamp' else
-				pcgxor(getattr(self, field).encode()) if field in ('player_name', 'weapon_name') else
+				int(mktime(self.timestamp)) if field == 'timestamp' else # секундной точности достаточно
+				pcgxor(getattr(self, field).encode()) if field in ('player_name', 'weapon_name') else # не светить непосредственно
 				getattr(self, field)
 				for field, _ in Game.Preview.store_fields]
 
@@ -2710,7 +3031,7 @@ class Game:
 			for index, (field, field_type) in enumerate(Game.Preview.store_fields, 1):
 				value = d[index]
 				if not isinstance(value, field_type): raise Game.corrupted_save_error(field + ": " + str(type(value)))
-				elif field == 'timestamp': pv.timestamp = time.localtime(value)
+				elif field == 'timestamp': pv.timestamp = localtime(value)
 				elif field in ('player_name', 'weapon_name'): setattr(pv, field, pcgxor(value).decode())
 				else: setattr(pv, field, value)
 			return pv
@@ -2749,10 +3070,8 @@ class Game:
 	@staticmethod
 	def remove_from_save_folder(path):
 		os.remove(path)
-		try:
+		with suppress(OSError):
 			os.rmdir(Game.SAVE_FOLDER)
-		except OSError:
-			pass
 
 	@staticmethod
 	def remove_known_save(session, full_path, rel_path_or_item):
@@ -2764,10 +3083,8 @@ class Game:
 
 	def save(self, session, to_new_file=False, compress=True):
 		# убедиться в существовании папки с сохранениями
-		try:
+		with suppress(FileExistsError):
 			os.mkdir(Game.SAVE_FOLDER)
-		except FileExistsError:
-			pass
 
 		# Придумать character_uid, если его ещё нет.
 		# Единственное, для чего он нужен — суффиксы вида «-2» на экране загрузки для разных персонажей с одинаковыми именами.
@@ -2776,10 +3093,10 @@ class Game:
 			self.character_uid = randrange(2**16)
 
 		# Вообще-то choose_order_key потенциально дёргает previews.update(), а она, в свою очередь, может сломать предположение,
-		# что self.rel_save_path есть в previews. Это всё работает только благодаря удачному сочетанию случайностей
-		# (choose_order_key дёргает update, только когда ему не сообщили имя существующего сохранения,
-		# что возможно только при to_new_file or not self.rel_save_path, но в обоих этих случаях выполнение пойдёт по ветке note_add,
-		# т. е. полагается, что rel_save_path И НЕ БЫЛО в previews).
+		# что self.rel_save_path есть в previews. Это всё работает только благодаря удачному сочетанию случайностей:
+		# больше никто не дёргает previews.update при активной Game, а сама choose_order_key дёргает,
+		# только когда ей не сообщили имя существующего сохранения, что возможно только при to_new_file or not self.rel_save_path,
+		# но в обоих этих случаях выполнение пойдёт по ветке note_add, т. е. полагается, что rel_save_path И НЕ БЫЛО в previews.
 		#
 		# Сейчас всё вроде бы стабильно работает без искусственной робастности, но когда-нибудь, возможно,
 		# несуществующие rel_save_path, переданные в previews.note_update (а также существующие, переданные в note_add)
@@ -2833,15 +3150,14 @@ class Game:
 	def save_nothrow(self, mode, then=None, note_success=False, to_new_file=False, extra_error_comment=None, compress=True):
 		try:
 			self.save(mode.session, to_new_file, compress=compress)
-			if note_success:
-				mode = mode.more("Игра сохранена.")
-				if then: mode.then(lambda mode: then(True, mode.revert()))
-			else:
-				if then: then(True, mode)
-			return True
 		except Exception as e:
 			mode = mode.more("Не удалось сохранить игру{0}.\n".format(extra_error_comment or "") + exception_msg(e))
 			if then: mode.then(lambda mode: then(False, mode.revert()))
+		else:
+			if note_success:
+				mode = mode.more("Игра сохранена.")
+				if then: mode.then(lambda mode: then(True, mode.revert()))
+			elif then: then(True, mode)
 
 	complement_fields = [('player', Fighter)]
 	def to_complement(self):
@@ -2900,11 +3216,45 @@ class Game:
 			if preview.compress: cf.close()
 		return Game.from_preview_and_complement(preview, complement, full_save_path, rel_save_path)
 
-# Экран между боями.
-class Respite(Mode):
+	@staticmethod
+	def load_nothrow(pv, mode, on_fail=lambda mode: None, more_on_success=True):
+		try:
+			with open(pv.full_save_path, 'rb') as f:
+				game = Game.load(f, pv.full_save_path, pv.rel_save_path)
+		except Exception as e:
+			on_fail(mode.more("Не удалось загрузить игру.\n" + exception_msg(e)))
+			mode.session.previews.force_bad(pv, e)
+		else:
+			then = lambda mode: mode.switch_to(Respite(game))
+			if more_on_success: mode.more("Загрузка...").then(then)
+			else: then(mode)
+
+class NonCombatMode(Mode, MessageSink):
 	def __init__(self, game):
-		super().__init__()
+		Mode.__init__(self)
+		MessageSink.__init__(self, game.player, lambda msg: self.handle_note(msg))
 		self.game = game
+		self.pending_notes = []
+
+	def do_activate(self):
+		self.game.player.add_sink(self)
+
+	def do_deactivate(self):
+		self.game.player.remove_sink(self)
+
+	def handle_note(self, msg):
+		self.pending_notes.append(msg)
+
+	def check_for_pending_notes(self, *, reverts=1, invalidate=True):
+		check(self.pending_notes, "ожидались сообщения")
+		if invalidate: self.invalidate()
+		self.more(" ".join(self.pending_notes)).reverts(reverts)
+		self.pending_notes = []
+
+# Экран между боями.
+class Respite(NonCombatMode):
+	def __init__(self, game):
+		super().__init__(game)
 
 	def describe_player(self, player, cmds, pad):
 		desc = player.living_desc()
@@ -2920,8 +3270,8 @@ class Respite(Mode):
 		cmds.add('hp+', dhp_func(+1))
 		cmds.add('hp-', dhp_func(-1))
 
-		desc += "\n" +\
-			pad + "HP: " + Con.vital_bar(player.hp, player.mhp) + f" {player.hp}/{player.mhp}"
+		desc += "\n" + \
+			pad + player.hp_bar()
 		if need_heal_hp:
 			cost = clamp(round((1 - player.hp / player.mhp) * 30 + 0.25 * (player.mhp - player.hp)), 1, 50)
 			desc += " восстановить: ${0}".format(cost)
@@ -2930,7 +3280,8 @@ class Respite(Mode):
 				def heal_hp():
 					self.game.take_gold(cost)
 					player.cur_hp = player.mhp
-					self.session.invalidate(self).more("Ваши раны исцелены.")
+					player.note("Ваши раны исцелены.")
+					self.check_for_pending_notes(invalidate=True)
 				cmds.add('heal hp', heal_hp, '?', lambda: self.more("Полностью восстановить очки здоровья."))
 			else:
 				desc += " :("
@@ -2955,7 +3306,8 @@ class Respite(Mode):
 					def heal_mp():
 						self.game.take_gold(cost)
 						player.cur_mp = player.mmp
-						self.session.invalidate(self).more("Ваша магическая энергия восстановлена.")
+						player.note("Ваша магическая энергия восстановлена.")
+						self.check_for_pending_notes(invalidate=True)
 					cmds.add('heal mp', heal_mp, '?', lambda: self.more("Полностью восстановить ману."))
 				else:
 					desc += " :("
@@ -3022,7 +3374,7 @@ class Respite(Mode):
 		cmds.add('quit', lambda: self.quit(), '?', lambda: self.more("Выход в меню (с сохранением)."))
 
 	def do_handle_command(self, cmd):
-		if cmd.strip() == 'split soul':
+		if cmd in ('split soul', '_br'):
 			self.split_soul()
 			return True
 
@@ -3037,57 +3389,45 @@ class Respite(Mode):
 		default_yes = self.last_input == 'quit'
 		allow_suicide = self.game.full_save_path
 		def handle_confirmation(input, mode):
+			# это странное выражение означает find('/', default=len(input))
 			if input and 'yes'.startswith(input[:input.find('/')%(len(input)+1)]) or not input and default_yes:
 				self.game.save_nothrow(mode, then=lambda success, mode: mode.switch_to(MainMenu()), compress=input.find('/r') < 0)
 			elif input and 'quit'.startswith(input):
-				mode.switch_to(MainMenu()) # без сохранения — но это долго объяснять пользователю, пусть просто не знает
-			elif allow_suicide and 'suicide'.startswith(input) and len(input) >= 2:
-				try:
-					Game.remove_known_save(self.session, self.game.full_save_path, self.game.rel_save_path)
-				except Exception as e:
-					mode.more("Не удалось удалить сохранение.\n" + exception_msg(e)).then(lambda mode: mode.switch_to(MainMenu()))
-				else:
-					mode.switch_to(MainMenu())
+				mode.switch_to(MainMenu()) # без сохранения — но это долго объяснять пользователю, пусть с тем же успехом дропает игру без сохранения по Ctrl-C
+			elif allow_suicide and 'suicide'.startswith(input) and len(input) >= len('sui'):
+				def confirm(input, mode):
+					if not input or 'yes'.startswith(input):
+						try:
+							Game.remove_known_save(self.session, self.game.full_save_path, self.game.rel_save_path)
+						except Exception as e:
+							mode.more("Не удалось удалить сохранение.\n" + exception_msg(e)).then(lambda mode: mode.switch_to(MainMenu()))
+						else:
+							mode.more("Сохранение удалено.").then(lambda mode: mode.switch_to(MainMenu()))
+					else:
+						mode.revert()
+				mode.prompt("Это сотрёт сохранение. Вы уверены? (Y/n) ", confirm)
 			else:
 				mode.revert()
 
 		self.prompt("Выйти из игры? ({0}) ".format(highlight_variant("y/n", 0 if default_yes else 1)), handle_confirmation)
 
 	def do_activate(self):
+		super().do_activate()
 		self.session.globals.recent_fixed_name_proposals = 0
 
 	def to_next_level(self):
-		arena = Arena()
-		arena.limit_squad_members(Game.PLAYER_SQUAD, 3)
-		arena.limit_squad_members(Game.MONSTER_SQUAD, 3)
-		arena.deny_any_new_squads()
-		arena.add(self.game.player, Game.PLAYER_SQUAD, PlayerAI())
+		self.game.save_nothrow(self, then=lambda success, mode: self.to_arena_entrance())
 
-		rat = Fighter()
-		rat.name = Noun.parse("{ручной крыс:a}")
-		arena.add(rat, Game.PLAYER_SQUAD, DummyAI())
+	def to_arena_entrance(self):
+		def before(arena):
+			# За игроком всегда первый ход.
+			arena.add(self.game.player, Game.PLAYER_SQUAD, PlayerAI(), game=self.game, force_delay=0)
+		arena = FixedLevels.list[self.game.next_level-1].create_arena(before)
+		self.switch_to(ArenaEntrance(self.game, arena, self.game.next_level))
 
-		rat = Fighter()
-		rat.name = Noun.parse("{обычный крыс:a}")
-		arena.add(rat, Game.MONSTER_SQUAD, DummyAI())
-
-		rat = Fighter()
-		rat.name = Noun.parse("{волшебный крыс:a}")
-		with rat.save_relative_vitals():
-			rat.base_mmp = 10
-		rat.learn_spell(Firestorm())
-		arena.add(rat, Game.MONSTER_SQUAD, DummyAI())
-		arena.start()
-
-		def on_leave():
-			arena.dismiss()
-		self.switch_to(ArenaView(self.game, arena, self.game.player, on_leave))
-
-class Shop(Mode):
-	prev_mode = True
+class Shop(NonCombatMode):
 	def __init__(self, game):
-		super().__init__()
-		self.game = game
+		super().__init__(game)
 
 	def do_render(self, lines, cmds):
 		game, player, weapon = self.game, self.game.player, self.game.player.weapon
@@ -3147,7 +3487,7 @@ class Shop(Mode):
 		upgrades_section((FirestormSpellUpgrade, DispellSpellUpgrade, FrailnessSpellUpgrade), player, min_xl=2)
 
 		lines.append("\nВернуться в лагерь (quit)")
-		cmds.add('quit', lambda: self.revert(), '?', lambda: self.more("Вернуться в лагерь."))
+		cmds.add('quit', lambda: self.switch_to(Respite(self.game)), '?', lambda: self.more("Вернуться в лагерь."))
 
 	def buy_upgrade_func(self, target, up_cls):
 		def buy():
@@ -3157,10 +3497,7 @@ class Shop(Mode):
 					self.game.take_gold(gold)
 					up = up_cls()
 					up.apply(target)
-
-					msg = up.apply_message(target)
-					# if msg: msg += f" (-${gold})"
-					self.more(msg or f"Апгрейд приобретён за ${gold}.").reverts(2)
+					self.check_for_pending_notes(reverts=2)
 				else:
 					mode.revert()
 			self.prompt("{0} ${1}. Продолжить? (y/N) ".format(up_cls.cost_preface(target), gold), confirm)
@@ -3173,13 +3510,124 @@ class Shop(Mode):
 				if input and 'yes'.startswith(input):
 					up.revert(target)
 					self.game.give_gold(gold)
-					msg = up.revert_message(target)
-					# if msg: msg += f" (+${gold})"
-					self.more(msg or f"Апгрейд продан за ${gold}.").reverts(2)
+					self.check_for_pending_notes(reverts=2)
 				else:
 					mode.revert()
 			self.prompt("В обмен на {what} вы получите ${gold}. Продолжить? (y/N) ".format(what=up.sell_accusative(target), gold=gold), confirm)
 		return sell
+
+class ArenaEntrance(Mode):
+	prev_mode = True
+	def __init__(self, game, arena, floor_number):
+		super().__init__()
+		self.game  = game
+		self.arena = arena
+		self.floor_number = floor_number
+
+	# Здесь выполняется эдакий вертикальный multipad, части выравниваются по высоте:
+	#
+	#   Обычный крыс Lv.1              Волшебный крыс Lv.1      <-- имя (desc[0])
+	# HP: [##########] 10/10          HP: [##########] 10/10    <-- полоски HP/MP (desc[1])
+	#                                 MP: [##########] 10/10
+	#
+	# Зубы        (unarmed)           Огн. шторм (V1)           <-- способности и т. п. (desc[2])
+	# Ярость      (O1)
+	#
+	# AC/EV       0/10                AC/EV       0/10          <-- статы (desc[3])
+	# STR/INT/DEX 5/10/10             STR/INT/DEX 5/15/10
+	# SPD         100                 SPD 90
+	def do_render(self, lines, cmds):
+		max_width = 0
+		descs     = []
+		max_part_height = []
+		for b in self.arena.battlers:
+			if b.squad_id != Game.PLAYER_SQUAD:
+				desc, width = self.describe_fighter(b.fighter, b)
+				if not max_part_height:
+					max_part_height = [len(part) for part in desc]
+				else:
+					check(len(desc) == len(max_part_height), lambda: f"describe_fighter: {len(desc)} vs. {len(max_part_height)}")
+					for i in range(len(desc)): max_part_height[i] = max(max_part_height[i], len(desc[i]))
+				max_width = max(max_width, width)
+				descs.append(desc)
+
+		if max_width * len(descs) > self.safe_term_width:
+			impossible(f"информация о противниках не умещается на экран (max_width = {max_width} x{len(descs)}, safe_term_width = {self.safe_term_width})")
+
+		first = len(lines)
+		BORDER = 2
+		next_command_reserve = 2
+		flr = f"{self.floor_number}-й этаж"
+		lines.append(flr)
+		empty_lines_before = (self.term_height - 1 - next_command_reserve - sum(max_part_height) - (len(lines) - first)) // 6
+		lines.extend("" for i in range(empty_lines_before))
+		centered_width = self.safe_term_width // len(descs)
+		if centered_width > max_width + 10:
+			centered_width = max_width + 10
+			field = " " * ((self.safe_term_width - len(descs) * centered_width) // 2)
+		else:
+			field = ""
+		lines.extend(field + "".join((desc[part_index][line] if line < len(desc[part_index]) else "").ljust(max_width).center(centered_width) for desc in descs)
+			for part_index, part_height in enumerate(max_part_height)
+				for line in range(part_height))
+
+		reserve = 5
+		lines.extend("" for i in range(empty_lines_before))
+
+		back = BORDER * " " + "Вернуться (quit)"
+		nx = "Продолжить (next)"
+		nxleft = self.safe_term_width - BORDER - len(nx)
+		lines.append(back + " " * (nxleft - len(back)) + nx)
+		cmds.add('quit', lambda: self.back_to_camp())
+		cmds.add('next', lambda: self.to_arena())
+
+	def do_handle_command(self, cmd):
+		if cmd == "":
+			def handle_answer(input, mode):
+				if not input or 'yes'.startswith(input):
+					mode.revert().to_arena()
+				else:
+					mode.revert()
+			self.prompt("Сразиться? (Y/n) ", handle_answer)
+			return True
+
+	def describe_fighter(self, fighter, battler):
+		name_part = [fighter.name.cap_first() + f" Lv.{fighter.xl} ({battler.shortcut})"]
+		vitals_part = [fighter.hp_bar()]
+		if fighter.has_magic(): vitals_part.append(fighter.mp_bar())
+		vitals_part.append("")
+
+		numeric_cmd = 1
+		abil_part = []
+		for sp in fighter.specials:
+			abil_part.append("{0} [cmd]({1})".format(sp.name(), numeric_cmd))
+			numeric_cmd += 1
+		for spl in fighter.spells:
+			abil_part.append("{0} [cmd]({1})".format(spl.name(long=True), numeric_cmd))
+			numeric_cmd += 1
+		if abil_part:
+			abil_part.append("")
+			abil_part = multipad(abil_part)
+
+		def gen_nv(): return filter(lambda nv: nv[1], (("AC", fighter.ac), ("EV", fighter.ev)))
+		ae = " [val]".join(filter(None, ("/".join(name for name, value in gen_nv()), "/".join(str(value) for name, value in gen_nv()))))
+		def gen_nv(): return filter(lambda nv: nv[1] != 10, (("STR", fighter.base_str), ("INT", fighter.base_int), ("DEX", fighter.base_dex)))
+		sid = " [val]".join(filter(None, ("/".join(name for name, value in gen_nv()), "/".join(str(value) for name, value in gen_nv()))))
+		stats_part = multipad([part for part in (ae, sid, f"SPD [val]{fighter.spd}") if part])
+
+		parts = [name_part, vitals_part, abil_part, stats_part]
+		width = max(len(line) for lines in parts for line in lines)
+		name_part[0] = " " * ((width - len(name_part[0])) // 2) + name_part[0]
+		return parts, width
+
+	def back_to_camp(self):
+		self.revert()
+
+	def to_arena(self):
+		def on_leave():
+			self.arena.dismiss()
+		self.switch_to(ArenaView(self.game, self.arena, self.game.player, on_leave))
+		self.arena.start()
 
 class ArenaView(Mode):
 	class MessageLog:
@@ -3198,16 +3646,22 @@ class ArenaView(Mode):
 			# scroll продолжит выдавать текст, начиная с lines[scroll_line].line[scroll_index] (но может вернуться выше, если упрётся в конец)
 			self.scroll_line = 0
 			self.scroll_index = 0
-			self.line_break_requested = False
+			self.last_message, self.last_message_reps = None, 0
 
-		def add(self, msg, turn, *, next_sep=" "):
+		def add(self, msg, turn, *, next_sep=" ", start_new_line=None):
+			if msg == self.last_message:
+				self.last_message_reps += 1
+				return
+			self.flush()
+			self.last_message = msg
+
 			# Критерии, по которым (не) начинается новая строка.
 			# Совсем никогда не начинать нельзя, т. к. из истории не могут быть стёрты отдельные добавленные таким образом фрагменты — только строка целиком.
 			def allow_continuation(prev):
 				# pieces_count — подушка безопасности, ожидается, что такого не будет в естественных сценариях
-				return not self.line_break_requested and prev.pieces_count < 666
+				return prev.pieces_count < 666
 
-			if self.lines and allow_continuation(self.lines[-1]):
+			if not start_new_line and self.lines and allow_continuation(self.lines[-1]):
 				line = self.lines[-1]
 				line.line += line.next_sep + msg
 				line.turn = turn
@@ -3215,7 +3669,6 @@ class ArenaView(Mode):
 			else:
 				line = self.Line(msg, turn)
 				self.lines.append(line)
-				self.line_break_requested = False
 			line.next_sep = next_sep
 
 			# стереть старые строки
@@ -3234,150 +3687,239 @@ class ArenaView(Mode):
 		# Одновременно, если really не вернула False, лог прокручивается вниз на lines-1 либо до упора.
 		# Можно было бы разделить эти шаги, но это будет сложнее и мне не нужно (по сути — отложить присваивание scroll_line/scroll_index).
 		def scroll(self, lines, width, really=lambda pending: True):
+			self.flush()
 			# Попытаться идти с lines[scroll_line].line[scroll_index] до конца. Если конец не достигнут за lines — вернуть результат как промежуточный.
 			wrapped = []
-			last_line = last_index = None
 			for i, line in enumerate(self.lines[self.scroll_line:], self.scroll_line):
-				start = self.scroll_index if i == self.scroll_line else 0
-				w = wrap_feedback(line.line[start:], width, lines - len(wrapped) + 1) # + 1 — отличить случай «есть ещё строки» от «больше нет строк»
-				overflow = len(wrapped) + len(w) > lines
-				if overflow: del w[lines - len(wrapped):]
-				wrapped.extend(L.piece for L in w)
+				offset = self.scroll_index if i == self.scroll_line else 0
+				# Ограничение на 1 строку больше реального.
+				w = wrap_feedback(line.line[offset:], width, lines - len(wrapped) + 1)
+				take = min(len(w), lines - len(wrapped))
+				wrapped.extend(L.piece for L in w[:take])
 
-				if w: last_line, last_index = i, start + (w[-1].start if lines > 1 else w[-1].next)
-				if overflow:
-					# lines строк переполнены — вернуть промежуточный результат, продолжить с последней строки включительно
-					# Бла         1        Бла-бла-бла 3
-					# Бла-бла     2   =>   Бла-бла-бла-бла 4
-					# Бла-бла-бла 3        Бла-бла-бла-бла-бла 5
-					if really(True): self.scroll_line, self.scroll_index = (last_line, last_index) if last_line is not None else impossible()
+				# Если результат вылез за реальное lines - len(wrapped), значит, lines строк переполнены — вернуть промежуточный результат.
+				if take < len(w):
+					# Прокрутить лог. Если прокрутка на более чем одну строку, продолжить с последней включительно
+					# 1 Бла                3 Бла-бла-бла
+					# 2 Бла-бла       =>   4 Бла-бла-бла-бла
+					# 3 Бла-бла-бла        5 Бла-бла-бла-бла-бла
+					# иначе прокрутить на начало следующей.
+					if really(True): self.scroll_line, self.scroll_index = i, offset + (w[take-1].start if lines > 1 else w[take].start)
 					return wrapped, True
 
 			# Конец достигнут? Тогда вернуть последние lines строк (возможно, уже виденных). Алгоритм с точностью до наоборот.
-			wrapped, pos_saved = [], False
-			for i in range(len(self.lines) - 1, -1, -1):
-				w = wrap_feedback(self.lines[i].line, width)
-				if not pos_saved and w:
-					pos_saved = True
-					if really(False): self.scroll_line, self.scroll_index = i, w[-1].start if lines > 1 else w[-1].next
-				overflow = len(wrapped) + len(w) > lines
-				if overflow: del w[:len(w) - (lines - len(wrapped))]
-				wrapped = [L.piece for L in w] + wrapped
-				if overflow: break
+			wrapped = []
+			for i, line in zip(reversed(range(len(self.lines))), reversed(self.lines)):
+				w = wrap_feedback(line.line, width)
+				if i == len(self.lines) - 1 and really(False): self.scroll_line, self.scroll_index = i, w[-1].start if w else 0
+				take = min(len(w), lines - len(wrapped))
+				if take: wrapped = [L.piece for L in w[-take:]] + wrapped
+				if take < len(w): break
 			return wrapped, False
 
-		def post_line_break(self):
-			self.line_break_requested = True
+		def flush(self):
+			if self.last_message_reps:
+				self.lines[-1].line += self.lines[-1].next_sep + f"(x{1 + self.last_message_reps})"
+				self.lines[-1].next_sep = " "
+				self.last_message, self.last_message_reps = None, 0
 
 	def __init__(self, game, arena, player, on_leave):
 		super().__init__()
-		self.game  = game
-		self.arena = arena
-		self.player = player
-		self.player_ai = arena.as_battler(player).ai
-		check(self.player_ai, isinstance(self.player_ai, PlayerAI), "player.ai")
+		self.game, self.arena, self.player = game, arena, player
 		self.on_leave = on_leave
-		self.awaiting_decision = True
-		self.atb_maximum = self.estimate_good_atb_maximum()
+		self.awaiting_decision = None
+		self.player_ai = None
+		self.atb_maximum = None
 
-		self.log = ArenaView.MessageLog()
-		self.sink = Arena.MessageSink(player, self.receive_note)
-		self.arena.add_sink(self.sink)
-		self.shown_log_lines = None
+		def receive_note(msg):
+			if self.player.alive:
+				self.log.add(msg, self.next_player_turn)
+			elif not self.death_message:
+				# Довольно хрупкое предположение, что первая заметка после смерти будет её описанием. Пока работает, но в будущем, возможно,
+				# понадобится цеплять к note'ам дополнительную информацию для таких случаев.
+				self.death_message = msg
+
+		self.log = self.MessageLog()
+		self.sink = MessageSink(player, receive_note)
+		self.log_lines = None
+		self.render_log = True
+		self.log_area_height = None
 		self.next_player_turn = -1
+		self.your_turn_announced = False
+		self.start_log_at = None
+		self.extra_lines = None
+		self.do_prompt = True
+		self.death_message = None
+		self.okay_to_skip_turns = False
+
+	def do_activate(self):
+		self.player_ai = self.arena.as_battler(self.player).ai
+		check(self.player_ai, isinstance(self.player_ai, PlayerAI), "player.ai")
+		self.atb_maximum = self.estimate_good_atb_maximum()
+		self.arena.add_sink(self.sink)
+
+	def do_deactivate(self):
+		if self.on_leave: self.on_leave()
+		self.arena.remove_sink(self.sink)
 
 	def do_process(self):
+		min_log_lines = self.min_log_lines()
+		min_lines_total = (
+			  self.min_lines_for_squads()
+			+ self.min_action_lines()
+			+ min_log_lines
+			+ self.reserve_lines())
+		if min_lines_total >= self.term_height: impossible(f"min_lines_total = {min_lines_total}, term_height = {self.term_height}")
+		extra_lines = self.term_height - min_lines_total
+		extra_log_lines = round(extra_lines/3/max(1, self.term_width/50))
+		self.extra_lines = extra_lines - extra_log_lines
+
 		self.awaiting_decision = False
 		self.do_prompt = True
-		log_area_height = 5
+		self.log_area_height = min_log_lines + extra_log_lines
+		self.render_log = True
 		do_turn = True
 		while do_turn:
-			if self.arena.whose_turn() == self.game.player and not self.player_ai.decision:
-				do_turn = False
-				self.log.post_line_break()
+			if not self.player.alive: do_turn = False
+			elif self.arena.whose_turn() == self.player:
+				if not self.player_ai.decision:
+					self.awaiting_decision = True
+					do_turn = False
+				if not self.your_turn_announced:
+					self.next_player_turn += 1
+					put_extra_line = False and self.log.lines and len(self.log.lines[-1].line) > self.safe_term_width and self.log_area_height >= 7
+					if put_extra_line:
+						self.log.add("", turn=self.next_player_turn, start_new_line=True)
+					self.log.add("_", turn=self.next_player_turn, next_sep="", start_new_line=True)
+					self.your_turn_announced = True
 
-			lines, pending = self.log.scroll(log_area_height, self.safe_term_width, really=lambda pending: pending or not do_turn)
+			# условие в really означает «прокрутить, если сейчас будет сообщение с \n(...) или render()».
+			# В противном случае пользователь какое-то время не увидит результат, поэтому скроллить его рано.
+			self.log_lines, pending = self.log.scroll(self.log_area_height, self.safe_term_width, really=lambda pending: pending or not do_turn)
 			if pending:
-				self.shown_log_lines = None
-				self.do_prompt = False
-				self.session.invalidate(self).more("\n" + "\n".join(lines))
+				self.do_prompt, self.last_input = False, ""
+				self.render_log = False
+				self.invalidate().prompt("\n".join(self.log_lines) + "\n(...)", lambda _input, mode: mode.revert())
 				return
 
 			if do_turn:
-				if self.arena.whose_turn() == self.game.player:
-					self.next_player_turn += 1
-					self.log.add("_", turn=self.next_player_turn, next_sep="")
+				if self.arena.whose_turn() == self.player: self.your_turn_announced = False
 				self.arena.turn()
 
-		self.shown_log_lines = lines
-		self.awaiting_decision = self.arena.whose_turn() == self.game.player
+		if not self.player.alive:
+			self.do_prompt, self.last_input = False, ""
+			if self.game.rel_save_path:
+				def handle_answer(input, mode):
+					if not input or 'yes'.startswith(input):
+						pv = self.session.previews.fn2it[self.game.rel_save_path]
+						Game.load_nothrow(pv, self, more_on_success=False, on_fail=lambda mode: mode.then(lambda mode: mode.switch_to(MainMenu())))
+					else:
+						mode.switch_to(MainMenu())
+				after_prompt = lambda input, mode: mode.prompt("Загрузить последнее сохранение? (Y/n) ", handle_answer)
+			else:
+				after_prompt = lambda input, mode: mode.switch_to(MainMenu())
+			self.invalidate().prompt("\n..." + check(self.death_message, "нет сообщения о смерти"), after_prompt)
 
 	def do_render(self, lines, cmds):
-		squadA, squadB = tuple(heapq.nsmallest(2, self.arena.squads.keys()))
-		imA = self.build_squad_image(squadA, None, None, False)
-		imB = self.build_squad_image(squadB, None, None, True)
-		for lineno in range(max(len(imA), len(imB))):
-			left = imA[lineno] if lineno < len(imA) else ""
+		start_lines = len(lines)
+		reserve = 5
+		squadA, squadB = tuple(nsmallest(2, self.arena.squads.keys()))
+		imA = self.build_squad_image(squadA, None, self.term_height - reserve - self.log_area_height - 1, False)
+		imB = self.build_squad_image(squadB, None, self.term_height - reserve - self.log_area_height - 1, True)
+		cmds_desc = self.build_commands_desc(cmds) if self.awaiting_decision else []
+		cmds_desc_shift = len(imA) + (1 if cmds_desc else 0)
+
+		for lineno in range(max(cmds_desc_shift + len(cmds_desc), len(imB))):
+			left = imA[lineno] if lineno < len(imA) else cmds_desc[lineno - cmds_desc_shift] if 0 <= lineno - cmds_desc_shift < len(cmds_desc) else ""
 			right = imB[lineno] if lineno < len(imB) else ""
 
 			limit = self.safe_term_width
 			if len(left) + len(right) > limit:
 				left = left[:limit - len(right)]
-				if len(left) + len(right) > limit: raise RuntimeError(f"Строка не умещается в ширину консоли: {left + '/' + right}.")
+				if len(left) + len(right) > limit: impossible(f"Строка не умещается в ширину консоли: {left}/{right}.")
 			lines.append(left + " " * (limit - len(left) - len(right)) + right)
 
-		if self.shown_log_lines:
-			lines.append("")
-			lines.extend(self.shown_log_lines)
+		lines_taken = len(lines) - start_lines
+		self.start_log_at = min(
+			lines_taken + 3 if self.start_log_at is None else self.start_log_at if self.start_log_at > lines_taken else lines_taken + 3,
+			self.term_height - reserve - max(len(self.log_lines), self.log_area_height))
 
-		def hex_func(cls, fighter):
-			def hex():
-				def note(sink):
-					msg = "Вы накладываете"
-					if fighter == sink.you: msg += " на себя"
-					msg += " " + cls.generic_name()
-					if fighter != sink.you: msg += " на " + fighter.name(Case.ACCUSATIVE)
-					msg += "."
-					return msg
-				self.arena.note(lambda sink: note(sink))
-				exist = next((hex for hex in fighter.hexes if isinstance(hex, cls)), None)
-				if exist:
-					if cls == Bleeding:
-						exist.precise_power += 200
-						exist.power = max(1, round(exist.precise_power))
-						exist.turns = exist.turns_from_power(exist.power)
-					elif cls == RageHex:
-						exist.power += 100
-						exist.turns += 10
-					else: pass
-				else:
-					if cls == Bleeding: args = (200,)
-					elif cls == RageHex: args = (100, 10)
-					else: args = (100, 10)
-					cls(*args).apply(self.player, fighter)
-			return lambda: self.decide(hex)
-		for b in self.arena.battlers:
-			cmds.add('bleed' + ('' if b.fighter == self.player else ' ' + b.shortcut), hex_func(Bleeding, b.fighter))
-			cmds.add('rage' + ('' if b.fighter == self.player else ' ' + b.shortcut), hex_func(RageHex, b.fighter))
-			cmds.add('deathword' + ('' if b.fighter == self.player else ' ' + b.shortcut), hex_func(DeathWordHex, b.fighter))
+		lines.extend("" for _i in range(self.start_log_at - lines_taken))
+		# ^ сработает и перед тем more с (...) при переполненном логе
+		if self.render_log:
+			lines.extend(self.log_lines)
+			lines.extend("" for _i in range(self.log_area_height - len(self.log_lines)))
+
+		if self.awaiting_decision:
+			def hex_func(cls, fighter):
+				def hex(ai):
+					exist = next((hex for hex in fighter.hexes if isinstance(hex, cls)), None)
+					if exist:
+						if cls == Bleeding:
+							exist.precise_power += 200
+							exist.power = max(1, round(exist.precise_power))
+							exist.turns = exist.turns_from_power(exist.power)
+						elif cls == RageHex:
+							exist.power += 100
+							exist.turns += 10
+						else: pass
+					else:
+						if cls == Bleeding: args = (200,)
+						elif cls == RageHex: args = (100,)
+						else: args = (100,)
+						cls(*args).apply(self.player, fighter)
+
+					def get_note(sink):
+						return "Вы накладываете" + sink.youify("{ на себя/}", fighter) + " " + cls.generic_name() + sink.youify("{/ на F:A}", fighter) + "."
+					ai.note(get_note)
+				return lambda: self.decide(hex)
+			for b in self.arena.battlers:
+				cmds.add('bleed' + ('' if b.fighter == self.player else ' ' + b.shortcut), hex_func(Bleeding, b.fighter))
+				cmds.add('rage' + ('' if b.fighter == self.player else ' ' + b.shortcut), hex_func(RageHex, b.fighter))
+				cmds.add('deathword' + ('' if b.fighter == self.player else ' ' + b.shortcut), hex_func(DeathWordHex, b.fighter))
 		cmds.add('quit', lambda: self.quit())
+
+	def min_lines_for_squads(self):
+		def get_max_members(squad):
+			if squad.max_members is None: impossible(f"У стороны {squad.id} не ограничено число участников.")
+			return squad.max_members
+		max_members = max(get_max_members(squad) for squad in self.arena.squads.values())
+		return max_members * (
+			1 + # имя
+			2 + # полоски HP/MP
+			1)  # новая строка
+
+	def min_action_lines(self):
+		return 4
+
+	def min_log_lines(self):
+		return 3
+
+	def reserve_lines(self):
+		return 5
 
 	def do_handle_command(self, cmd):
 		if not cmd:
 			if self.awaiting_decision:
-				def skip_turn(sink):
-					if sink.you == self.player: return "Вы пропускаете ход."
-					else: return f"{cap_first(self.player.name)} пропускает ход."
-				self.decide(lambda: self.arena.note(lambda sink: skip_turn(sink)))
-			return True
+				if self.okay_to_skip_turns:
+					self.decide_to_skip_turn()
+				else:
+					def confirm_skip_turn(input, mode):
+						if input and 'yes'.startswith(input):
+							self.okay_to_skip_turns = True
+							self.decide_to_skip_turn()
+						mode.revert()
+					self.prompt("Пропустить ход? (y/N) ", confirm_skip_turn)
+				return True
 
 	def decide(self, what):
 		check(self.awaiting_decision, "не вовремя")
 		self.player_ai.decide(what)
 
+	def decide_to_skip_turn(self):
+		self.decide(lambda ai: ai.fighter.act_skip_turn())
+
 	def quit(self):
-		self.arena.remove_sink(self.sink)
-		if self.on_leave: self.on_leave()
 		self.game.save_nothrow(self, then=lambda success, mode: mode.switch_to(Respite(self.game)))
 
 	def build_squad_image(self, squad, cmds, lines_limit, flip):
@@ -3397,20 +3939,18 @@ class ArenaView(Mode):
 			im = PerBattler(fighter, b)
 			# (N) Некромант AC:6 EV:10
 			im.lines.append(left_to_right(f"({b.shortcut})",
-				cap_first(fighter.name), fighter.ac > 0 and f"AC:{fighter.ac}", fighter.ev > 0 and f"EV:{fighter.ev}", flip=flip))
+				fighter.name.cap_first(), fighter.ac > 0 and f"AC:{fighter.ac}", fighter.ev > 0 and f"EV:{fighter.ev}", flip=flip))
 			total_lines += 1
 
 			if fighter.dead:
 				im.lines.append("RIP")
 				total_lines += 1
 			else:
-				def bar(name, cur, max):
-					return left_to_right(name + ("" if flip else ":"), Con.vital_bar(cur, max), f"{cur}/{max}", flip=flip)
-				im.lines.append(bar("HP", fighter.hp, fighter.mhp))
+				im.lines.append(fighter.hp_bar(flip))
 				total_lines += 1
 
 				if fighter.has_magic():
-					im.lines.append(bar("MP", fighter.mp, fighter.mmp))
+					im.lines.append(fighter.mp_bar(flip))
 					total_lines += 1
 			per_battler.append(im)
 
@@ -3436,13 +3976,18 @@ class ArenaView(Mode):
 				fighter = im.fighter
 				hex = next(im.hexes_gen, None)
 				if hex:
-					im.hex_descs.append(hex.short(cmd_prefix=self.hex_cmd_prefix(hex, per_battler[i].battler), for_multipad=True, flip=flip))
+					im.hex_descs.append(hex.short_desc(cmd_prefix=self.hex_cmd_prefix(hex, per_battler[i].battler), for_multipad=True, flip=flip))
 					total_lines += 1
 					something_changed = True
 					if lines_limit is not None and total_lines >= lines_limit: break
 			if not something_changed: break
 		for im in per_battler:
 			im.hex_descs = multipad(im.hex_descs)
+			if next(im.hexes_gen, None):
+				extra = 1 + sum(1 for hex in im.hexes_gen)
+				hint = "  (+{extra}, {cmd}?)".format(extra=extra, cmd=im.battler.shortcut)
+				if im.hex_descs: im.hex_descs[-1] += hint
+				else: im.lines[-1] += hint
 
 		result = [line
 			for index, im in enumerate(per_battler)
@@ -3456,7 +4001,7 @@ class ArenaView(Mode):
 		check(victim, isinstance(victim, Arena.Battler), "victim")
 		return "" if victim.fighter == self.player else victim.shortcut + "."
 
-	# Шкала очерёдности хода. В итоге по ней мало что можно понять, так что не используется.
+	# Шкала очерёдности хода. В итоге по ней мало что можно понять (и между render()'ами обычно все сделали ход и игрок снова в начале), так что не используется.
 	def build_atb_scale(self):
 		turn_queue = self.arena.turn_queue
 		# Построить первоначальную шкалу.
@@ -3493,22 +4038,87 @@ class ArenaView(Mode):
 	def estimate_good_atb_maximum(self):
 		return 1.2 * self.arena.BASELINE_SPD / max(1, min(b.fighter.spd for b in self.arena.turn_queue))
 
-	def receive_note(self, msg):
-		self.log.add(msg, self.next_player_turn)
+	def build_commands_desc(self, cmds):
+		desc = []
+		if self.player.unarmed:
+			desc.append("атака врукопашную (hit)")
+			def create_hit():
+				def hit(ai):
+					adv = next(self.arena.enemies(self.player), None)
+					if adv: self.player.act_attack_unarmed(adv, self.arena)
+				return lambda: self.decide(hit)
+			def create_help():
+				help = "Атака голыми руками."
+				return lambda: self.more(help)
+			cmds.add('hit', create_hit(), '?', create_help())
+		return desc
+
+class FixedLevels:
+	class One:
+		@classmethod
+		def create_arena(cls, before=None):
+			arena = Arena()
+			arena.limit_squad_members(Game.PLAYER_SQUAD, 3)
+			arena.limit_squad_members(Game.MONSTER_SQUAD, 3)
+			arena.deny_any_new_squads()
+			if before: before(arena)
+			cls.populate(arena)
+			return arena
+
+		@classmethod
+		def populate(cls, arena): raise NotImplementedError("populate")
+
+	class TestLevel_Rats(One):
+		@classmethod
+		def populate(cls, arena):
+			rat = Fighter()
+			rat.name = Noun.parse("{ручной крыс:a}")
+			arena.add(rat, Game.PLAYER_SQUAD, DummyAI())
+
+			rat = Fighter()
+			rat.name = Noun.parse("{второй ручной крыс:a}")
+			arena.add(rat, Game.PLAYER_SQUAD, DummyAI())
+
+			rat = Fighter()
+			rat.name = Noun.parse("{обычный крыс:a}")
+			rat.add_special(RageOnLowHP())
+			arena.add(rat, Game.MONSTER_SQUAD, DummyAI())
+
+			rat = Fighter()
+			rat.name = Noun.parse("{волшебный крыс:a}")
+			with rat.save_relative_vitals():
+				rat.base_mmp = 10
+			rat.learn_spell(Firestorm())
+			arena.add(rat, Game.MONSTER_SQUAD, DummyAI())
+
+	class Level1_CaveRat(One):
+		@classmethod
+		def populate(cls, arena):
+			rat = Fighter()
+			rat.name, rat.gender = Noun.parse("{пещерная крыса:af}", return_gender=True)
+			with rat.save_relative_vitals():
+				rat.base_spd = 120
+				rat.set_unarmed(Teeth())
+				rat.add_special(RageOnLowHP())
+			arena.add(rat, Game.MONSTER_SQUAD, MeleeAI(), shortcut_hint="Rat")
+
+	list = (Level1_CaveRat,)
 
 class AskName(Prompt):
-	def __init__(self, game, who=None, fixed=None):
+	def __init__(self, game, who=None, fixed=None, prefix=""):
 		self.game, self.who = game, who or game.player
-		prompt = (
+		prompt = prefix + (
 			"Вам нужно зарегистрироваться, прежде чем вас официально освободят.\nКак вас зовут? " if self.who == self.game.player else
 			"\nНазовите свой автомат, {0}: ".format(self.game.player.name) if self.who == self.game.player.weapon else
 			impossible(self.who, "who"))
 		super().__init__(prompt, lambda input, mode: self.handle_name_input(input, mode), casefold_input=False)
 		self.fixed = fixed
+		self.fixed_name_rejected = False
 
 	def handle_name_input(self, input, mode):
 		MIN, MAX = 3, 20
 		gender = Gender.UNKNOWN
+		fixed_proposed = False
 		if not input or MIN <= len(input) <= MAX:
 			if input:
 				name = cap_first(input) if self.who == self.game.player else input
@@ -3520,48 +4130,63 @@ class AskName(Prompt):
 					mode.session.previews.update()
 					self.fixed = mode.session.globals.recent_fixed_name_proposals < 1 and self.query_random_fixed_name()
 					if self.fixed:
-						name, gender = Noun.parse(self.fixed[0] if isinstance(self.fixed, tuple) else self.fixed, animate=True, gender=Gender.MALE, return_gender=True)
+						(name, gender), fixed_proposed = self.parse_fixed_player_name(self.fixed), True
 						self.session.globals.recent_fixed_name_proposals += 1
 					else:
-						rand = Noun.random_name(
-							ban = lambda type, part: part in self.session.globals.last_random_name_parts_seen or
-								self.session.previews.has_namesakes_of(part, {'adj': 'prefix', 'noun': 'suffix'}[type]),
-							see = lambda _type, part: self.session.globals.last_random_name_parts_seen.append(part), return_gender=True)
-						if rand:
-							name, gender = rand
-						else:
+						try:
+							name, gender = Noun.random_name(
+								ban = lambda type, part: part in self.session.globals.last_random_name_parts_seen or
+									self.session.previews.has_namesakes_of(part, {'adj': 'prefix', 'noun': 'suffix'}[type]),
+								see = lambda _type, part: self.session.globals.last_random_name_parts_seen.append(part), return_gender=True)
+						except Noun.RandomNamesExhausted:
 							return mode.more("Случайные имена закончились. Пожалуйста, придумайте своё.")
 				elif self.who == self.game.player.weapon:
-					if self.fixed and isinstance(self.fixed, tuple) and len(self.fixed) >= 2:
+					if self.fixed and isinstance(self.fixed, tuple) and len(self.fixed) >= 2 and not self.fixed_name_rejected:
 						if isinstance(self.fixed[1], tuple):
 							name_src, _index = choose(self.fixed[1])
 						else:
 							name_src = self.fixed[1]
-						name, gender = Noun.parse(name_src, gender=Gender.MALE, return_gender=True)
+						(name, gender), fixed_proposed = Noun.parse(name_src, gender=Gender.MALE, return_gender=True), True
 					else:
 						name, gender = Noun.parse("{Хуец}" if self.game.player.gender == Gender.FEMALE else "GAU-17", gender=Gender.MALE, return_gender=True)
 				else: impossible(self.who, "who")
 
+			def handle_answer(input, mode):
+				if not input or 'yes'.startswith(input):
+					self.complete_name(name, gender, mode)
+				else:
+					mode.revert()
+					if fixed_proposed: self.fixed_name_rejected = True
 			mode.prompt(
 				"{0} {1} (Y/n) ".format(
 					(f"Очень приятно, {name}." if input else f"Ваше имя — {name}.") if self.who == self.game.player else
 					(f"В ваших руках {name}." if input else f"Имя вашего автомата — {name}.") if self.who == self.game.player.weapon else
 					impossible(self.who, "who"),
-					"Всё верно?" if input else "Продолжить?"),
-				lambda input, mode: self.complete_name(name, gender, mode) if not input or 'yes'.startswith(input) else mode.revert())
+					"Всё верно?" if input else "Продолжить?"), handle_answer)
 		elif 'quit'.startswith(input):
 			mode.revert()
 		else:
-			mode.more("{0}. Длина имени должна быть от {1} до {2}.".format(
+			mode.more("{0}. Длина имени должна быть от {1} до {2}, либо \"q\"uit.".format(
 				plural(len(input), "Введ{ён/ено/ено} {N} символ{/а/ов}"), MIN, plural(MAX, "{N} символ{/а/ов}")))
 
 	def complete_name(self, name, gender, mode):
+		prefix = ""
+		# Найти среди предопределённых имён, даже если оно просто введено с клавиатуры.
+		if gender == Gender.UNKNOWN and self.who == self.game.player and not isinstance(name, Noun):
+			for index, fixed in enumerate(self.fixed_names):
+				f_name, f_gender = self.parse_fixed_player_name(fixed)
+				if str(f_name) == name:
+					if index not in self.session.globals.last_fixed_names_seen: self.session.globals.last_fixed_names_seen.append(index)
+					self.fixed, (name, gender) = fixed, (f_name, f_gender)
+					prefix = ":3\n"
+					break
+
 		if gender == Gender.UNKNOWN and self.who == self.game.player:
 			default_gender = Gender.detect(name)
-			mode.prompt("Вы мальчик или девочка? ({0}/q) ".format(highlight_variant("m/f", default_gender)),
+			mode.prompt(prefix + "Вы мальчик или девочка? ({0}/q) ".format(highlight_variant("m/f", default_gender)),
 				lambda input, mode: self.handle_gender_answer(input, mode, name, default_gender))
 		else:
-			self.complete(name, gender)
+			self.complete(name, gender, prefix)
 
 	def handle_gender_answer(self, input, mode, name, default_gender):
 		check(self.who == self.game.player, "not player?!")
@@ -3575,23 +4200,25 @@ class AskName(Prompt):
 		else:
 			mode.revert()
 
-	def complete(self, name, gender):
-		it_was_user_input = not isinstance(check(name, isinstance(name, str), "name"), Noun)
-		if it_was_user_input: name = Noun.guess(name, gender=gender, animate=True)
+	def complete(self, name, gender, prefix=""):
+		if not isinstance(check(name, isinstance(name, str), "name"), Noun): name = Noun.guess(name, gender=gender, animate=True)
 		self.who.name, self.who.gender = name, gender
 		if self.who == self.game.player:
 			# В handle_name_input выставляется fixed, т. о. если имя и пол на этот момент соответствуют последней fixed, полагается, что пользователь согласился.
-			fixed = self.fixed and name == Noun.parse(self.fixed[0] if isinstance(self.fixed, tuple) else self.fixed) and self.fixed
-			self.session.switch_to(AskName(self.game, self.game.player.weapon, fixed=fixed))
+			# Если бы не последующие запросы, опирающиеся на fixed с первого шага, было бы проще занулить fixed в начале handle_name_input.
+			fixed = self.fixed and (name, gender) == self.parse_fixed_player_name(self.fixed) and self.fixed
+			self.session.switch_to(AskName(self.game, self.game.player.weapon, fixed=fixed, prefix=prefix))
 		elif self.who == self.game.player.weapon:
 			self.game.save_nothrow(self, then=lambda success, mode: mode.switch_to(Respite(self.game)))
 		else:
 			impossible(self.who, "who")
 
 	fixed_names = \
-		"{Рика:f}", \
-		("{Мадока:f}", ("{Розочка:f}",)), \
+	(
+		("{Рика:f}", "<photon eraser>"),
+		("{Мадока:f}", ("{Розочка:f}",)),
 		("{Фрисия:f}", "{Хвост}")
+	)
 
 	def query_random_fixed_name(self):
 		seen, previews = self.session.globals.last_fixed_names_seen, self.session.previews
@@ -3600,6 +4227,9 @@ class AskName(Prompt):
 		if index >= 0:
 			seen.append(index)
 			return name # else None
+
+	def parse_fixed_player_name(self, fixed):
+		return Noun.parse(fixed[0] if isinstance(fixed, tuple) else fixed, animate=True, gender=Gender.MALE, return_gender=True)
 
 # Ввод-вывод, стек экранов, глобальности.
 class Session:
@@ -3615,11 +4245,21 @@ class Session:
 
 	def switch_to(self, new_mode, reverting=False):
 		check(isinstance(new_mode.prev_mode, bool) or new_mode == self.mode.prev_mode, "prev_mode?!")
-		# запомнить prev_mode только при условии, что а) это явно требуется (prev_mode = True) и б) это не возврат к prev_mode
-		if new_mode.prev_mode and not reverting: new_mode.prev_mode = self.mode
+		if reverting:
+			self.mode.deactivate()
+		# запомнить prev_mode при условии, что а) это явно требуется (prev_mode = True) и б) это не возврат к prev_mode (проверено по reverting)
+		elif new_mode.prev_mode:
+			new_mode.prev_mode = self.mode
+		else:
+			# НЕ reverting и НЕ запоминаются предыдущие режимы: деактивировать их все.
+			mode = self.mode
+			while mode:
+				mode.deactivate()
+				mode = mode.prev_mode
 		self.mode = new_mode
 		self.mode.session = self
-		if not reverting: self.mode.do_activate()
+		if not reverting: self.mode.activate()
+		self.mode.invalidated = False
 
 	def revert(self, n=1):
 		check(n > 0, "n?!")
@@ -3693,20 +4333,18 @@ class Session:
 		self.cls_once_requested = True
 		return self.mode
 
-	# Обычно родительские режимы не перерендериваются, а используется запомненная с последнего render картинка.
-	# invalidate форсирует перерисовку. Пример: после команды heal hp полоска немедленно перерисовывается, несмотря на то, что активно more-сообщение.
-	def invalidate(self, mode):
-		lines = []
-		mode.render(lines, DummyCommands())
-		mode.last_screen = "\n".join(lines)
-		return self.cls_once()
-
 	# Чтобы, например, вложенные more-сообщения корректно убирались, оставляя предыдущие,
 	# экран очищается и всё, что на нём должно было быть — перерисовывается.
 	def render_prev_modes(self, lines):
 		chain, mode = [], self.mode
 		while mode:
-			if mode != self.mode: chain.append(mode)
+			if mode != self.mode:
+				chain.append(mode)
+				if mode.invalidated:
+					L = []
+					mode.render(L, DummyCommands())
+					mode.last_screen = "\n".join(L)
+					mode.invalidated = False
 			if mode.do_cls: break
 			mode = mode.prev_mode
 		lines.extend(mode.last_screen + mode.last_input for mode in reversed(chain))
@@ -3732,9 +4370,8 @@ class Session:
 				self.seen      = False
 
 			def load_screen_desc(self, npad=0, first_line_extra=None):
-				star = "*NEW* "
-				if not self.seen: npad += len(star)
-				pad = ' ' * npad
+				star = "" if self.seen else "*NEW* "
+				pad = ' ' * (npad + len(star))
 				if self.bad:
 					bad_msg = "\n".join((pad if i > 0 else "") + exception_msg(e) for i, e in enumerate(self.bad))
 					if not bad_msg or not isinstance(self.bad, Game.BadSaveError) and bad_msg.find('оврежд') < 0 and bad_msg.find('orrupt') < 0:
@@ -3746,16 +4383,17 @@ class Session:
 					return "{0}\n{pad}[{1}]".format(bad_msg, self.full_save_path, pad = pad)
 				else:
 					pv = self.preview
+					# " ".join(str.split()) — против двойных пробелов, когда день месяца состоит из одной цифры: у меня бывает Tue Jan  9 etc.
 					dup_desc = f"-{1+self.namesake_index}" if self.namesake_index >= 1 else ""
 					return ("{star}{ts}{fle}\n" +
 						"{pad}{pn}{dd} {pl}\n" +
 						"{pad}{wn} {wl}\n" +
 						"{pad}D:{coming} ${gold}").format(
-						ts = time.asctime(pv.timestamp), fle = first_line_extra or "",
-						pn = pv.player_name, dd = dup_desc, pl = Living.xl_desc(pv.player_level, pv.player_next, short=True),
+						ts = " ".join(asctime(pv.timestamp).split()), fle = first_line_extra or "",
+						pn = cap_first(pv.player_name), dd = dup_desc, pl = Living.xl_desc(pv.player_level, pv.player_next, short=True),
 						wn = cap_first(pv.weapon_name), wl = Living.xl_desc(pv.weapon_level, pv.weapon_next, short=True),
 						coming = pv.next_level, gold = pv.gold,
-						pad = pad, star = '' if self.seen else star)
+						pad = pad, star = star)
 
 			def load_screen_desc_lines(self):
 				return 4 if self.preview else sum(len(exception_msg(e).splitlines()) + 2 for e in self.bad)
@@ -3777,12 +4415,9 @@ class Session:
 		# Возвращает (число новых, число удалённых) НЕУЧТЁННЫХ ЧЕРЕЗ NOTE_ с последнего update (для отладки) или None вместо (0, 0)
 		def update(self):
 			listing = []
-			try:
+			with suppress(StopIteration):
 				# walk: folder ⇒ dirpath, dirnames, filenames
 				listing.extend(fn for fn in next(os.walk(Game.SAVE_FOLDER))[2] if fn.endswith(Game.SAVE_SUFFIX))
-			except StopIteration:
-				# Папки не существовало
-				pass
 			listing.sort() # os.walk выдаёт произвольный порядок, для сравнений нужно сделать не произвольный
 			if listing == self.last_listing: # LIKELY
 				return
@@ -3840,7 +4475,7 @@ class Session:
 			# слишком много всего могло инвалидировать max_order_key, так что проще пересчитать его безусловно
 			self.max_order_key = self.calculate_max_order_key()
 
-			# помочь пользователю различить разных персонажей с одинаковыми именами
+			# различить на экране загрузки разных персонажей с одинаковыми именами
 			self.update_namesakes()
 
 			# последний штрих: запомнить состояние SAVE_FOLDER, под которое список подгонялся.
@@ -3948,7 +4583,7 @@ class Session:
 				assert self.sanitycheck()
 
 		def find_position_for(self, item):
-			return bisect_left(list(-order_key for order_key in self.order_keys(include_bad=True)), -(item.preview.order_key if item.preview else -1))
+			return bisect_left([-order_key for order_key in self.order_keys(include_bad=True)], -(item.preview.order_key if item.preview else -1))
 
 		def has_namesakes_of(self, name, mode='full'): # это очень медленно...
 			name = name.casefold()
@@ -3956,7 +4591,6 @@ class Session:
 				(lambda playername: playername.startswith(name)) if mode == 'prefix' else \
 				(lambda playername: playername.endswith(name)) if mode == 'suffix' else impossible(mode, "mode")
 			return any(item.preview and hit(item.preview.player_name.casefold()) for item in self.items)
-
 
 		def sanitycheck(self):
 			assert len(self.items) == len(self.fn2it) == len(self.last_listing) and \
@@ -3999,14 +4633,14 @@ def selftest():
 			count += 1
 		if account: tests.append(name + (f" x{count}" if count > 1 else ""))
 
-	if account: ticks = time.clock()
+	if account: ticks = clock()
 	for name, value in globals().items():
 		if isinstance(value, type) and issubclass(value, Test) and value is not Test:
 			test = value()
 			test.setup()
 			run(name[:-len("Test")] if name.endswith("Test") and len(name) > len("Test") else name, test.cases, test.one)
 			test.teardown()
-	if account: ticks = time.clock() - ticks
+	if account: ticks = clock() - ticks
 
 	if fails:
 		raise Test.Failed("\n".join(fails))
