@@ -1,2 +1,2 @@
 # Файтеры здоровой девочки-волшебницы
-Coming this Orthodox Christmas Eve on /dr/.
+Coming this February on /dr/.
