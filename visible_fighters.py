@@ -1,5 +1,5 @@
-﻿min_python_version = (3, 6)
-import sys, os, string, tempfile, pickle, pickletools, lzma, textwrap, enum, bisect, hashlib, functools, operator, locale, argparse, io
+﻿min_python_version = (3, 6) # меньше нельзя, f-строки слишком хороши...
+import sys, os, os.path as path, string, tempfile, pickle, pickletools, lzma, textwrap, enum, bisect, hashlib, functools, operator, locale, argparse, io, re
 from collections import namedtuple, OrderedDict, defaultdict, deque
 from collections.abc import Sequence
 from time import localtime, mktime, strftime
@@ -7,8 +7,11 @@ from random import random, randrange, uniform, normalvariate, sample
 from base64 import b85encode, b85decode
 from heapq import nlargest, nsmallest
 from math import floor, ceil, exp, log, e, pi, erf, fsum
+from numbers import Number
 from contextlib import suppress, AbstractContextManager
+with suppress(ImportError): from contextlib import nullcontext
 from unittest import TestCase, TestSuite, TextTestRunner, defaultTestLoader
+from warnings import warn, catch_warnings
 app_version, save_version = (0, 2), 1
 
 # FORMAT_RAW не хранит эти настройки в сжатом потоке, поэтому для распаковки нужно указать те же, которыми упаковывались.
@@ -71,6 +74,42 @@ def highlight_variant(s, id):
 # left_to_right("HP", "[....######]", "6/10", flip=True) = "6/10 [....######] HP"
 def left_to_right(*what, sep=" ", flip=False):
 	return sep.join(filter(None, reversed(what) if flip else what))
+
+# используется для распределения строк по элементам интерфейса
+# base — начальные значения, extra — сколько раскидать, lim — максимальные (опционально).
+# например: dispense([1, 2, 3], 3) => [2, 3, 4], каждая получила по 1.
+# другой пример (ниже описан по итерациям): dispense([1, 2, 3], 25, lim=[5, 10, 20]) => [5, 10, 16].
+def dispense(base, extra, lim=None):
+	assert not lim or len(lim) == len(base), "len(base) = {len(base)}, len(lim) = {len(lim)}"
+	result = base[:]
+
+	# йелдит (i, wanted), где i — индекс в result / lim, а wanted — максимум, сколько можно ещё упихать в эту ячейку (None, если сколько угодно).
+	def eligible():
+		for i in range(len(result)):
+			if (lim and lim[i]) is None or lim[i] > result[i]:
+				yield i, lim and lim[i] and lim[i] - result[i]
+
+	# Раскидывать всем, кому раскидывается (кто eligible), поровну.
+	# Для [1, 2, 3], extra=25, lim=[5, 10, 20] это сделает:
+	# на первой итерации — [5, 6, 7], т. е. всем по 4, extra = 25 - 4×3 = 13
+	# на второй итерации — [5, 10, 11], т. е. 2-й и 3-й по 4, extra = 13 - 4×2 = 5
+	# на третьей итерации — [5, 10, 16], т. е. 3-й всё оставшееся, extra = 0
+	while extra > 0:
+		eligible_count, lesser_common_dose = 0, None
+
+		for i, wanted in eligible():
+			eligible_count += 1
+			if wanted and (not lesser_common_dose or wanted < lesser_common_dose): lesser_common_dose = wanted
+
+		if not eligible_count: break # выйти, если реципиентов не осталось
+		for_one = min(filter(None, (max(extra // eligible_count, 1), lesser_common_dose)))
+
+		for i, _wanted in eligible():
+			assert _wanted is None or _wanted >= for_one
+			result[i] += for_one
+			extra -= for_one
+			if extra <= 0: break # и внешний while тоже
+	return result
 
 def join_with_lastsep(seq, sep, lastsep):
 	if not isinstance(seq, Sequence): seq = list(seq)
@@ -161,20 +200,27 @@ def subseq_occurences(ss, src):
 		else: return
 
 # поддержка key для функций из bisect (https://bugs.python.org/issue4356, https://stackoverflow.com/a/39501468)
-def makefuncs():
-	class KeyWrapper:
-		def __init__(self, list, key): self.list, self.key = list, key
-		def __getitem__(self, i): return self.key(self.list[i])
-		def __len__(self): return len(self.list)
+class SequenceMap:
+	def __init__(self, list, key, start=0): self.list, self.key, self.start = list, key, start
+	def __getitem__(self, i): return self.key(self.list[self.start + i if i >= 0 else i])
+	def __len__(self): return len(self.list) - self.start
 
+def makefuncs():
 	def with_key(origf):
 		def keyed(a, x, L=0, R=None, key=None):
-			return origf(a if key is None else KeyWrapper(a, key), x if key is None else key(x), L, R if R is not None else len(a))
+			return origf(a if key is None else SequenceMap(a, key), x if key is None else key(x), L, R if R is not None else len(a))
 		return keyed
 	bisect_left, bisect_right = with_key(bisect.bisect_left), with_key(bisect.bisect_right)
 	def insort_right(a, x, L=0, R=None, key=None): a.insert(bisect_right(a, x, L, R, key), x)
 	return bisect_left, bisect_right, insort_right
 bisect_left, bisect_right, insort_right = makefuncs(); del makefuncs
+
+# nullcontext для Python <3.7
+if 'nullcontext' not in globals():
+	class nullcontext(AbstractContextManager):
+		def __init__(self, enter_result=None): self.enter_result = enter_result
+		def __enter__(self): return self.enter_result
+		def __exit__(self, *excinfo): pass
 
 # Наивный байесовский классификатор, украденный из https://habrahabr.ru/post/120194/.
 # Коллбэк, передаваемый в конструктор, должен извлекать из классифицируемого объекта значащие признаки.
@@ -188,9 +234,6 @@ bisect_left, bisect_right, insort_right = makefuncs(); del makefuncs
 # Как учитывать margin — решать пользователю. Можно подобрать эмпирическое правило вроде
 # if margin > 0.4: (воспользоваться результатом) else: (придумать что-то другое).
 class BayesianGuesser:
-	# Чтобы можно было передавать в samples как словарь, так и список пар.
-	def pairs(self, samples): return samples.items() if isinstance(samples, dict) else samples
-
 	def __init__(self, get_feats, samples=None, cheat=False):
 		self.get_feats      = get_feats
 		self.total_samples  = 0
@@ -202,7 +245,7 @@ class BayesianGuesser:
 	def train(self, samples):
 		for sample, cls in self.pairs(samples):
 			if self.cheat is not None:
-				self.cheat[sample] = cls if sample not in self.cheat or self.cheat[sample] == cls else None
+				self.cheat[sample] = cls if self.cheat.get(sample, cls) == cls else None # два и более повторения sample дадут cheat[sample] = None.
 			self.total_of_class[cls] += 1
 			for feat in filter(None, self.get_feats(sample)):
 				self.total_of_cfeat[cls, feat] += 1
@@ -272,6 +315,9 @@ class BayesianGuesser:
 		key = lambda f: f.margin
 		return sorted(result_gen, key=key, reverse=True) if n is None else nlargest(n, result_gen, key=key)
 
+	# Чтобы можно было передавать в samples как словарь, так и список пар.
+	def pairs(self, samples): return samples.items() if isinstance(samples, dict) else samples
+
 class Gender(enum.IntEnum):
 	UNKNOWN, MALE, FEMALE, NEUTER, TOTAL = -1, 0, 1, 2, 3
 
@@ -285,8 +331,8 @@ class Gender(enum.IntEnum):
 
 		best_guess, best_margin = Gender.UNKNOWN, None
 		for _lit, word, _isend in Noun.split_into_words(name):
-			guess, margin = oracle.guess(word.casefold())
-			if guess is not None and (best_margin is None or margin > best_margin) and margin > 0.4:
+			guess, margin = oracle.guess(word.casefold()) if word else (None, None)
+			if guess is not None and (best_margin is None or margin > best_margin) and margin > 0.28:
 				best_guess, best_margin = guess, margin
 
 		return best_guess
@@ -295,7 +341,9 @@ class Gender(enum.IntEnum):
 	def ize(self, fmt):
 		def handle(piece):
 			if not piece: return ""
-			per_gender = piece.split('/', Gender.TOTAL-1)
+			per_gender = piece.split('/')
+			if not 1 <= len(per_gender) <= Gender.TOTAL:
+				raise ValueError("\"{}\", \"{}\" — {}, ожидается 1–{}.".format(fmt, piece, plural(len(per_gender), "{N} значени{е/я/й}"), Gender.TOTAL))
 			return per_gender[self if self != Gender.UNKNOWN and self < len(per_gender) else Gender.MALE]
 		return "".join(literal + handle(bracketed) for literal, bracketed, _, _ in string.Formatter.parse(None, fmt))
 
@@ -344,8 +392,11 @@ class Noun(str):
 	def __new__(cls, pieces):
 		if not isinstance(pieces, list): impossible(pieces, "исп. Noun.parse / Noun.guess" if isinstance(pieces, str) else "pieces")
 		self = super().__new__(cls, Noun.join_pieces(pieces, Case.NOMINATIVE))
-		self.pieces = pieces
 		return self
+
+	def __init__(self, pieces):
+		super().__init__()
+		self.pieces = pieces
 
 	@staticmethod
 	def join_pieces(pieces, case):
@@ -426,17 +477,16 @@ class Noun(str):
 			return word[:-len('а')], ('а', yi(word[-2:-1]), 'е', 'у', 'ой', 'е')
 		elif word.endswith('я'):
 			return word[:-len('я')], ('я', 'и', 'е', 'ю', 'ей', 'е')
-		elif any(word.endswith(sym) for sym in 'бвгджзклмнпрстфхцчшщ') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
-			if word.endswith('ок') or word.endswith('ёк'):
-				before = ("й" if word[-3:-2] in vowels else "ь") if word[-2:-1] in 'ё' else ""
-				return word[:-len('ок')], ngdip(word[-2:], before + 'ка', before + 'ку', before + 'ком', before + 'ке')
-			elif word.endswith('ец'):
-				if word[-3:-2] in vowels:
-					return word[:-len('ец')], ngdip('ец', 'йца', 'йцу', 'йцом' if word[-4:-3] in 'у' else 'йцем', 'йце')
-				else:
-					return word[:-len('ец')], ngdip('ец', 'ца', 'цу', 'цом', 'це')
+		elif word.endswith('ок') or word.endswith('ёк'):
+			before = ("й" if word[-3:-2] in vowels else "ь") if word[-2:-1] in 'ё' else ""
+			return word[:-len('ок')], ngdip(word[-2:], before + 'ка', before + 'ку', before + 'ком', before + 'ке')
+		elif word.endswith('ец'):
+			if word[-3:-2] in vowels:
+				return word[:-len('ец')], ngdip('ец', 'йца', 'йцу', 'йцом' if word[-4:-3] in 'у' else 'йцем', 'йце')
 			else:
-				return word, ngdip('', 'а', 'у', 'ом', 'е')
+				return word[:-len('ец')], ngdip('ец', 'ца', 'цу', 'цом', 'це')
+		elif any(word.endswith(sym) for sym in 'бвгджзклмнпрстфхцчшщ') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
+			return word, ngdip('', 'а', 'у', 'ом', 'е')
 		elif word.endswith('й') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
 			return word[:-len('й')], ngdip('й', 'я', 'ю', 'ем', 'е')
 		elif word.endswith('ь') and gender == Gender.FEMALE:
@@ -448,14 +498,18 @@ class Noun(str):
 
 	@staticmethod
 	def split_into_words(src):
-		def is_word_char(ch): return 'а' <= ch <= 'я' or 'А' <= ch <= 'Я' or ch in 'ёЁ-'
-		i = 0
+		def is_word_char(ch): return 'а' <= ch <= 'я' or 'А' <= ch <= 'Я' or ch in 'ёЁ-' or 'a' <= ch <= 'z' or 'A' <= ch <= 'Z'
+		i, last = 0, None
+		lit_start = i
 		while i < len(src):
-			lit_start = i
 			while i < len(src) and not is_word_char(src[i]): i += 1
 			word_start = i
 			while i < len(src) and is_word_char(src[i]): i += 1
-			yield src[lit_start:word_start], src[word_start:i], i == len(src)
+			if i > word_start:
+				if last: yield last + (False,)
+				last = src[lit_start:word_start], src[word_start:i]
+				lit_start = i
+		if last: yield last + (True,)
 
 	def src(self, sep="/"): return "".join(piece for literal, cases in self.pieces for piece in (literal, "{" + sep.join(cases) + "}" if cases else ""))
 	def cap_first(self): return cap_first(self)
@@ -513,7 +567,7 @@ class Noun(str):
 				continue
 
 			result = cap_first(adj) + ("" if adj.endswith('-') else " ") + name
-			if see: see('adj', adj); see('name', name)
+			if see: see('adj', adj); see('noun', name)
 			result = Noun.guess(result, animate=True, gender=gender)
 			return (result, gender) if return_gender else result
 Noun.PLACEHOLDER = Noun.parse("{баг}")
@@ -660,12 +714,12 @@ class Distribution:
 	def estimate_avg(self): raise NotImplementedError("estimate_avg")
 	def estimate_max(self): raise NotImplementedError("estimate_max")
 	def roll(self): raise NotImplementedError("roll")
-	# TODO: придумать что-нибудь с proba_dens, т. к. у константного распределения она вырождается в дельта-функцию T_T
+	def proba_dens(self, x): raise NotImplementedError("proba_dens")
 
 	@staticmethod
 	def guess(arg):
 		if isinstance(arg, Distribution): return arg
-		if isinstance(arg, (tuple, list)) and all(isinstance(x, (int, float)) for x in arg):
+		if isinstance(arg, (tuple, list)) and all(isinstance(x, Number) for x in arg):
 			if len(arg) == 1: return Distribution.Uniform(arg[0], arg[0])
 			if len(arg) == 2: return Distribution.Uniform(*arg)
 			if len(arg) == 3: return Distribution.Bell(*arg)
@@ -678,6 +732,7 @@ def makeclasses():
 		def estimate_avg(self): return 0.5 * (self.min + self.max)
 		def estimate_max(self): return self.max
 		def roll(self): return self.min if self.min == self.max else uniform(self.min, self.max)
+		def proba_dens(self, x): return 1 / (self.max - self.min) if self.min <= x <= self.max else 0
 
 	class Bell(Distribution):
 		def __init__(self, min, avg, max): self.min, self.avg, self.max = min, avg, max
@@ -685,6 +740,7 @@ def makeclasses():
 		def estimate_avg(self): return self.avg
 		def estimate_max(self): return self.max
 		def roll(self): return bell(self.min, self.avg, self.max)
+		def proba_dens(self, x): return bell.proba_dens(self.min, self.avg, self.max, x)
 	return Uniform, Bell
 Distribution.Uniform, Distribution.Bell = makeclasses(); del makeclasses
 
@@ -747,7 +803,12 @@ def wrap_feedback(text, width, maxlines=None):
 	return result
 
 def exception_msg(e):
-	return str(e) or repr(e)
+	msg = str(e)
+	# Некоторые исключения выдают в str() самодостаточное сообщение об ошибке, некоторые — нет.
+	# Например, ошибки ОС разворачиваются в красивые сообщения, а KeyError — в голый ключ.
+	# Это попытка угадать такие случаи и дописать впереди тип, не трогая нормальные.
+	if " " not in msg: msg = type(e).__name__ + (": " + msg if msg else "")
+	return msg
 
 # список команд, позволяющий сокращать их при отсутствии неоднозначностей
 # guess возвращает (1) ассоциированную с командой функцию, (2) список вариантов при неоднозначности, (3) список подсказок при ошибке
@@ -768,6 +829,9 @@ def exception_msg(e):
 # эквивалентно
 # .add("a b", funcAB)
 # .add("a b c d", funcABCD)
+#
+# Этот класс переделывался уже раз 5, поэтому стоило бы переписать его с нуля, чтобы сделать вдвое короче
+# и избавиться от странных вещей вроде «word_lens» и «filtered_*», но мне лень. ¯\(^͜^)/¯
 class Commands:
 	def __init__(self):
 		self.root = Commands.node("", None)
@@ -997,8 +1061,6 @@ class CommandsTest(TestCase):
 		for query in get_queries():
 			self.assertEqual(cmds.guess(query[0]), query[1:])
 
-class MultipadMarkupError(Exception): pass
-
 # ОЧЕ МАГИЧЕСКАЯ ФУНКЦИЯ (будет смешно, если такая есть готовая и более удобная).
 # Выравнивает строки по именованным маркерам вида [имя].
 #
@@ -1050,7 +1112,7 @@ def multipad(lines):
 	def make_marker_come_after(marker, after):
 		after.markers_after_this.append(marker)
 		if after in marker.markers_after_this:
-			raise MultipadMarkupError(f"Циклическая зависимость между маркерами [{marker.name}] и [{after.name}].")
+			raise ValueError(f"Циклическая зависимость между маркерами [{marker.name}] и [{after.name}].")
 		if after.has_after(marker): return
 
 		nonlocal first_marker, last_marker
@@ -1153,13 +1215,14 @@ class MultipadTest(TestCase):
 			 "INT   10 ->   15    $150 /  1",
 			 "SPEED 15 -> 1000   $9999 / 99"]
 		),
-		(["1[A]2[B]3", "4[B]5[A]6"], MultipadMarkupError))
+		(["1[A]2[B]3", "4[B]5[A]6"], ValueError))
 
 	def one(self, input, expect):
-		try:
-			self.assertEqual(multipad(input), expect)
-		except Exception as e:
-			if not isinstance(e, expect): raise
+		def do_mp(): return multipad(input)
+		if isinstance(expect, type) and issubclass(expect, Exception):
+			self.assertRaises(expect, do_mp)
+		else:
+			self.assertEqual(do_mp(), expect)
 
 def cls():
 	os.system('cls' if os.name == 'nt' else 'clear')
@@ -1179,6 +1242,7 @@ class Hex:
 			self.turns = self.turns_from_power(power) if turns is None else check(turns, turns > 0, "turns?!")
 		else:
 			self.turns = 1
+		self.skip_turns = 0
 
 	def apply(self, master, victim=None, arena=None):
 		check(not self.applied, "already applied", master.alive, "мастер мёртв", not victim or victim.alive, "жертва мертва")
@@ -1188,15 +1252,29 @@ class Hex:
 		with self.victim.lock_hexes() as hexes: hexes.add(self)
 		self.do_start()
 		self.applied = True
-
-		# Хекс тикает в конце хода персонажа, на которого наложен. Багофича такого подхода в том, что если персонаж применил хекс сам на себя на своём ходу,
-		# то хекс тикнет в конце этого же хода, т. е. практическая длительность окажется на единицу меньше.
-		if self.time_based and self.master == self.victim and arena and arena.whose_turn() == self.master: self.turns += 1
+		self.reapply(arena)
 
 	def unapply(self):
 		check(self.applied, "not applied", self.ran_out, "not ran_out")
 		with self.master.lock_caused_hexes() as caused_hexes: caused_hexes.remove(self)
 		with self.victim.lock_hexes() as hexes: hexes.remove(self)
+
+	def reapply(self, arena):
+		# В некоторых случаях лучше подкрутить фактическую длительность хекса.
+		if self.time_based and arena and (
+			# Случай 1. ХЕКСЫ В ХОД ЖЕРТВЫ
+			# Хекс тикает в конце хода персонажа, на которого наложен. Багофича такого подхода в том, что если хекс применён на ходу этого же персонажа,
+			# например, персонаж в свой ход наложил хекс сам на себя, то хекс тикнет в конце этого же хода, т. е. практическая длительность окажется на единицу меньше.
+			# Чтобы это обойти, используется skip_turns, по сути добавляемый к длительности хекса (не отображаемой — turns, но фактической).
+			arena.whose_turn() == self.victim
+
+			# Случай 2. ХЕКСЫ ОТ ИМЕНИ ИГРОКА
+			# Реальная длительность в (N + 1) нужна, чтобы, если наложить хекс, длящийся всего 1 ход, на противника, скорость которого равна твоей —
+			# на твоём следующем ходу хекс ещё остался висеть. Иначе в глазах человека длительность 1 будет подозрительно похожа на 0, 2 — на 1, и т. д.
+			# (С точки зрения механики этого НЕ следует делать, но...)
+			or arena.as_battler(self.master).game):
+
+			self.skip_turns += 1
 
 	def tick(self, arena):
 		check(self.applied, "not applied", not self.ran_out, "хекс истёк")
@@ -1204,8 +1282,11 @@ class Hex:
 		if self.ran_out: return
 
 		if self.time_based:
-			self.turns -= 1
-			if self.ran_out: self.end(Hex.TIMEOUT)
+			if self.skip_turns:
+				self.skip_turns -= 1
+			else:
+				self.turns -= 1
+				if self.ran_out: self.end(Hex.TIMEOUT)
 
 	def cancel(self, reason=CANCELLED):
 		check(self.applied, "not applied", not self.ran_out, "ran_out")
@@ -1305,8 +1386,7 @@ class RageHexTest(TestCase):
 	def cases(self): return (-1000, 1.2, 1.1), (0, 1.2, 1.1), (Hex.BASELINE_POWER, 1.5, 1.2), (1100, 4.5, 2.2), (1267, 5, 2.2), (9999, 5, 2.2)
 	def one(self, power, ref_physdam_x, ref_backlash_x):
 		self.dummy.power = power
-		self.assertEqual(round(self.dummy.physdam_x, 1), ref_physdam_x)
-		self.assertEqual(round(self.dummy.backlash_x, 1), ref_backlash_x)
+		self.assertEqual(tuple(round(value, 1) for value in (self.dummy.physdam_x, self.dummy.backlash_x)), (ref_physdam_x, ref_backlash_x))
 
 class DeathWordHex(Hex):
 	def do_finish(self, reason):
@@ -1486,7 +1566,7 @@ class WeaponUpgrade(Upgrade):
 	TARGET_CLASS = property(lambda self: Weapon)
 
 class StatUpgrade(FighterUpgrade):
-	STAT, AMOUNT, LIMIT = None, None, None
+	STAT = AMOUNT = LIMIT = None
 	statname, statgender = Noun.PLACEHOLDER, Gender.UNKNOWN
 
 	def __init__(self):
@@ -1511,12 +1591,13 @@ class StatUpgrade(FighterUpgrade):
 
 	@classmethod
 	def get_base_stat(cls, target): return getattr(target, 'base_' + cls.STAT)
-	def set_base_stat(cls, target, value):
+
+	def set_base_stat(self, target, value):
 		with target.save_relative_vitals():
-			setattr(target, 'base_' + cls.STAT, value)
+			setattr(target, 'base_' + self.STAT, value)
 
 	def do_sell_accusative(self, target): return "часть {0} {1} ({2} -> {3})".format(
-		self.statgender.ize('свое{й/го}'), self.statname.genitive, self.get_base_stat(target), self.get_base_stat(target) - self.amount)
+		self.statgender.ize('свое{го/й}'), self.statname.genitive, self.get_base_stat(target), self.get_base_stat(target) - self.amount)
 
 	@classmethod
 	def do_cost_preface(cls, target):
@@ -1723,9 +1804,9 @@ class Ammunition:
 			main.secondary_installations.remove(self)
 		elif self.secondary_installations:
 			# удаляется главная установка, имеющая вторичные — поставить одну из них главной
-			main_index = next(i for i, ammo in enumerate(target.ammos) if ammo == self)
-			target.ammos[main_index] = self.secondary_installations.pop()
-			target.ammos[main_index].secondary_installations = self.secondary_installations
+			index = target.ammos.index(self)
+			target.ammos[index] = self.secondary_installations.pop()
+			target.ammos[index].secondary_installations = self.secondary_installations
 			self.secondary_installations = []
 		else:
 			# убрать по-нормальному
@@ -1938,57 +2019,78 @@ class RageOnLowHP(Special):
 # Универсальная атака «чего угодно чем угодно». Реализует общее для атак поведение, такое как взаимодействие с бронёй и хексами.
 # Можно не проводить атаку, а просто оценить интересующие показатели (урон, шанс попадания).
 class Beam:
+	AC_reduction = namedtuple('AC_reduction', 'relative, absolute_avg, absolute_max')
+
 	# AC — показатель брони. В общем случае обеспечивает как относительное (постоянный процент), так и абсолютное (случайное от 0 до max) снижение урона.
 	# pierce регулирует абсолютную составляющую: атака с pierce=0.5 проигнорирует 50% абсолютного снижения, pierce=1.0 оставит только относительное.
 	@staticmethod
 	def ac_reduction(ac, pierce=0):
-		relative = 1 - (1 + ac/8)**-0.5
+		relative = 1 - (1 + ac/12)**-0.4
 		check(relative, 0 <= relative <= 1, "relative")
-		absolute_avg = ac/6 * max(0, 1-check(pierce, 0 <= pierce <= 1, "pierce"))
+		absolute_avg = ac/7 * max(0, 1-check(pierce, 0 <= pierce <= 1, "pierce"))
 		absolute_max = ac/3 * max(0, 1-pierce)
-		return relative, absolute_avg, absolute_max
+		return Beam.AC_reduction(relative, absolute_avg, absolute_max)
 
-	@staticmethod
-	def apply_ac(damage, ac, pierce=0):
-		relative_reduction, absolute_reduction_avg, absolute_reduction_max = Beam.ac_reduction(ac, pierce)
-		return max(0, damage * (1 - relative_reduction) - (bell(0, absolute_reduction_avg, absolute_reduction_max) if absolute_reduction_max else 0))
-
-	# TODO: придумать + проверить формулу
-	@staticmethod
-	def ac_reduced_avg_and_max(min, avg, max, ac, pierce):
-		raise NotImplementedError("ac_reduced_avg_and_max")
+	def apply_ac(self, damage, ac, pierce=0):
+		reduction = Beam.ac_reduction(ac, pierce)
+		return max(0, damage * (1 - reduction.relative) - (bell(0, reduction.absolute_avg, reduction.absolute_max) if reduction.absolute_max else 0))
 
 	class Ongoing:
-		def __init__(self):
-			self.hp = 0
-			self.denorm_ac, self.denorm_pierce = 0, 0
+		def __init__(self, mode='real'):
+			self.mode = mode
+			if mode != 'collect_names':
+				self.hp = 0
+				self.denorm_ac, self.denorm_pierce = 0, 0
 
-		def add_hp_damage(self, hp_dam, ac=0, pierce=0):
-			self.hp += hp_dam
-			self.denorm_ac += hp_dam * ac
-			self.denorm_pierce += hp_dam * pierce
+			if mode == 'collect_names':
+				self.names = OrderedDict()
+
+		def add_hp_damage(self, elem, dis, ac=0, pierce=0, force=None):
+			if force is not None: hp_dam = force
+			elif self.mode == 'real': hp_dam = dis.roll()
+			elif self.mode == 'collect_names': hp_dam = dis.estimate_avg()
+			else: impossible(self.mode, "mode")
+
+			if self.mode != 'collect_names':
+				self.hp += hp_dam
+				self.denorm_ac += hp_dam * ac
+				self.denorm_pierce += hp_dam * pierce
+
+			if self.mode == 'collect_names':
+				self.names[elem.do_name()] = self.names.get(elem.do_name(), 0) + hp_dam
 
 		def normalized_ac(self): return self.denorm_ac / (self.hp or 1)
 		def normalized_pierce(self): return self.denorm_pierce / (self.hp or 1)
 
 	class Element:
-		def do_apply(self, target, ongoing): raise NotImplementedError("do_apply")
+		def do_apply(self, target, ongoing, force=None): raise NotImplementedError("do_apply")
+		def do_minmax(self, target): raise NotImplementedError("do_minmax")
+		def do_proba_dens(self, target, x): raise NotImplementedError("do_proba_dens")
+		def do_name(self): return None
 
 	class Plain(Element):
 		def __init__(self, amount):
 			self.amount_dis = Distribution.guess(amount)
+
+		def do_minmax(self, target):
+			return self.amount_dis.estimate_min(), self.amount_dis.estimate_max()
+
+		def do_proba_dens(self, target, x):
+			return self.amount_dis.proba_dens(x)
 
 	class Physical(Plain):
 		def __init__(self, amount, pierce=0):
 			super().__init__(amount)
 			self.pierce = pierce
 
-		def do_apply(self, target, ongoing):
-			ongoing.add_hp_damage(self.amount_dis.roll(), target.ac, self.pierce)
+		def do_apply(self, target, ongoing, force=None):
+			ongoing.add_hp_damage(self, self.amount_dis, target.ac, self.pierce, force)
 
 	class Fire(Plain):
-		def do_apply(self, target, ongoing):
-			ongoing.add_hp_damage(self.amount_dis.roll(), target.ac * 0.8)
+		def do_apply(self, target, ongoing, force=None):
+			ongoing.add_hp_damage(self, self.amount_dis, target.ac * 0.8, force=force)
+
+		def do_name(self): return "огонь"
 
 	def __init__(self, master, target, arena):
 		self.master, self.target, self.arena = master, target, arena
@@ -2007,14 +2109,87 @@ class Beam:
 		for elem in elements:
 			elem.do_apply(self.target, ongoing)
 
-		precise_hp = Beam.apply_ac(ongoing.hp, ongoing.normalized_ac(), ongoing.normalized_pierce())
-		for hex in self.master.hexes:
-			if isinstance(hex, RageHex): precise_hp *= hex.physdam_x
-		for hex in self.target.hexes:
-			if isinstance(hex, RageHex): precise_hp *= hex.backlash_x
+		precise_hp = ongoing.hp
+		precise_hp = self.apply_ac(precise_hp, ongoing.normalized_ac(), ongoing.normalized_pierce())
+		precise_hp = self.post_ac(precise_hp)
 
 		rounded_hp = rand_round(precise_hp)
 		self.target.ouch(rounded_hp, self.arena, self.on_death_cause, self.on_death_note, hook=lambda fatal: self.on_hp_damage(rounded_hp, fatal))
+
+	def post_ac(self, hp):
+		for hex in self.master.hexes:
+			if isinstance(hex, RageHex): hp *= hex.physdam_x
+		for hex in self.target.hexes:
+			if isinstance(hex, RageHex): hp *= hex.backlash_x
+		return hp
+
+	class DamageEstimation:
+		def __init__(self, beam):
+			self.avg = 0
+			self.max = 0
+
+			elements = beam.get_elements()
+			self.avg = self.integrate_damage(beam, elements, [None] * len(elements), 0)
+			self.max = ceil(self.max)
+
+			ongoing_names = beam.Ongoing('collect_names')
+			for elem in elements:
+				elem.do_apply(beam.target, ongoing_names)
+			total = sum(ongoing_names.names.values())
+
+			self.elem_parts = total and OrderedDict((name, dam/total) for name, dam in ongoing_names.names.items() if name)
+
+		# Для оценки урона берётся N-кратный интеграл (!) по всем элементам и броне.
+		# Т. о. N = len(elements) + 1.
+		#
+		# В chain запоминаются значения на текущей итерации — они нужны Ongoing для расчёта эффективных значений брони в каждом конкретном случае.
+		# Например, если в конкретной атаке элемент A нанёс 20% общего урона, а B — 80%, при этом элемент A игнорирует 50% брони, а B — 0%,
+		# финальный процент игнорируемой брони будет взвешенной суммой, 20%×50% + 80%×0% = 10%.
+		def integrate_damage(self, beam, elements, chain, current):
+			steps = 10
+
+			if current >= len(elements):
+				ongoing = beam.Ongoing()
+				for element_index, element in enumerate(elements):
+					element.do_apply(beam.target, ongoing, force=chain[element_index])
+
+				reduction = Beam.ac_reduction(ongoing.normalized_ac(), ongoing.normalized_pierce())
+				dam = ongoing.hp * (1 - reduction.relative)
+				if reduction.absolute_max:
+					dam = integrate(lambda x: max(0, dam - x) * bell.proba_dens(0, reduction.absolute_avg, reduction.absolute_max, x), 0, reduction.absolute_max, steps)
+				dam = beam.post_ac(dam)
+
+				self.max = max(self.max, dam)
+				return dam
+			else:
+				L, R = elements[current].do_minmax(beam.target)
+				def int_x(x):
+					chain[current] = x
+					return elements[current].do_proba_dens(beam.target, x) * self.integrate_damage(beam, elements, chain, current + 1)
+				return integrate(int_x, L, R, steps)
+
+	def estimate_damage(self):
+		return self.DamageEstimation(self)
+
+	def human_damage(self, *, do_max=True, do_elems=True):
+		est = self.estimate_damage()
+		result = "Урон: ~{}".format(round(est.avg, 1))
+
+		note = ""
+		if do_max: note += "макс. {}".format(est.max)
+		if do_elems and est.elem_parts:
+			note += (", " if note else "") + ", ".join("{}% {}".format(round(part * 100), name) for name, part in est.elem_parts.items())
+		if note: result = "{} ({})".format(result, note)
+		return result
+
+	def human_tohit(self):
+		return self.on_tohit() and "Шанс попадания: {}%.".format(round(100 * self.arena.hit_chance(self.on_tohit(), self.on_ev())))
+
+	def human_stats(self, do_max=True):
+		result = self.human_damage(do_max=do_max)
+		t = self.human_tohit()
+		if t: result += "\n" + t
+		return result
 
 	def on_tohit(self): return None
 	def on_ev(self): return self.target.ev
@@ -2033,6 +2208,27 @@ class Beam:
 			elements = check((elements,) if isinstance(elements, self.Element) else list(filter(None, elements or ())),
 				lambda elements: all(isinstance(elem, self.Element) for elem in elements), f"{elements}: ожидается список Element")
 		return elements
+
+class DamageEstimationTest(TestCase):
+	class Beam(Beam):
+		def on_elements(self): return (self.Physical((1, 2, 4)), self.Fire((0, 1, 3)))
+
+	def cases(self): return (0, 100), (5, 70), (10, 40), (20, 8)
+
+	def one(self, ac, hp):
+		passes = 15
+		total_hits = total_dam = 0
+
+		for passno in range(passes):
+			dummy = Fighter()
+			dummy.base_ac = ac
+			with dummy.save_relative_vitals(): dummy.base_mhp = hp
+
+			beam = self.Beam(dummy, dummy, None)
+			while dummy.alive: beam.launch(); total_hits += 1
+			total_dam += hp
+
+		self.assertAlmostEqual(beam.estimate_damage().avg, total_dam/total_hits, delta=0.15)
 
 class UnarmedAttack(FighterAttribute):
 	class Beam(Beam):
@@ -2056,7 +2252,9 @@ class BareHands(UnarmedAttack):
 				return sink.youify("{Вы/F} " + how + "уклоняет{есь/ся}", self.target) + " от " + sink.youify("{вашего /}удара{/ F:G}", self.master) + "."
 			self.arena.note(get_note)
 
-		def on_elements(self): return self.Physical(tuple(x * self.master.str for x in (0, 0.12, 0.2)))
+		def on_elements(self):
+			return self.Physical(tuple(x * (1 + (self.master.str - 10)/(7 if self.master.str > 10 else 10)) for x in (0, 1.2, 2)))
+
 		def on_hp_damage(self, hp, fatal):
 			def get_note(sink):
 				msg = sink.youify("{Вы/F}", self.master)
@@ -2165,12 +2363,14 @@ class MessageBroadcaster:
 		self.sinks = []
 
 	def add_sink(self, sink):
-		check(sink not in self.sinks, lambda: f"add_sink({sink}) вызвана дважды")
+		assert sink not in self.sinks, f"add_sink({sink}) вызвана дважды"
 		self.sinks.append(sink)
-		check(len(self.sinks) == 1, "Нет, в принципе это возможно (иначе зачем было вообще городить sinks[]), но сейчас, когда игрок ровно один — означает баг.")
+		# Нет, в принципе это возможно (иначе зачем было вообще городить sinks[]), но сейчас, когда игрок ровно один — означает баг.
+		assert len(self.sinks) == 1, f"sinks = {self.sinks}"
 
-	def remove_sink(self, sink):
-		self.sinks.remove(sink)
+	def remove_sink(self, sink, maybe=False):
+		with suppress(ValueError) if maybe else nullcontext():
+			self.sinks.remove(sink)
 
 	def note(self, msg):
 		for sink in self.sinks:
@@ -2189,7 +2389,7 @@ class Living:
 
 	def receive_xp(self, amount):
 		self.xp += check(amount, amount >= 0, "amount")
-		def will_levelup(): return self.xp >= self.xp_for_levelup() and self.xl < self.LEVEL_CAP
+		def will_levelup(): return self.xl < self.LEVEL_CAP and self.xp >= self.xp_for_levelup()
 		if will_levelup():
 			with self.save_relative_vitals():
 				while True:
@@ -2200,7 +2400,7 @@ class Living:
 
 	def drain_xp(self, amount):
 		self.xp -= check(amount, amount >= 0, "amount")
-		def will_lose_level(): return self.xp < 0 and self.xl > 1
+		def will_lose_level(): return self.xl > 1 and self.xp < 0
 		if will_lose_level():
 			with self.save_relative_vitals():
 				while True:
@@ -2399,7 +2599,7 @@ class Fighter(Living, MessageBroadcaster):
 			def __init__(self, fighter, cntr): self.fighter, self.cntr, self.lock = fighter, cntr, None
 			def __enter__(self): self.lock = self.fighter.hexes_lock or self.fighter.HexesLock(self.fighter); self.lock.enter(); return self
 			def __exit__(self, et, e, tb): self.lock.leave(); self.lock = None
-			def __iter__(self): yield from filter(lambda hex: not any(q == (self.cntr, 'rem', hex) for q in self.lock.queries), self.cntr)
+			def __iter__(self): yield from filter(lambda hex: (self.cntr, 'rem', hex) not in self.lock.queries, self.cntr)
 			def add(self, hex): self.lock.queries.append(self.lock.Query(self.cntr, 'add', hex))
 			def remove(self, hex): self.lock.queries.append(self.lock.Query(self.cntr, 'rem', hex))
 
@@ -2407,7 +2607,7 @@ class Fighter(Living, MessageBroadcaster):
 	def lock_caused_hexes(self): return self.HexesLock.Context(self, self.caused_hexes)
 
 	def add_special(self, special):
-		assert not any((lambda a=special, b=type(sp): isinstance(a, b) or isinstance(b, a))() for sp in self.specials), "duplicate special"
+		assert not any(isinstance(sp, type(special)) or isinstance(special, type(sp)) for sp in self.specials), f"duplicate special {special}"
 		special.set_fighter(self)
 		insort_right(self.specials, special, key=lambda special: special.LIST_ORDER)
 
@@ -2433,7 +2633,7 @@ class Fighter(Living, MessageBroadcaster):
 			return sink.youify("{Вы/F} пропускает{е/} ход.", self)
 		self.note(get_note)
 
-	def attack_unarmed(self, target, arena):
+	def act_attack_unarmed(self, target, arena):
 		check(self.unarmed, "не задан флавор атаки голыми руками", self.alive, "dead")
 		self.unarmed.attack(target, arena)
 
@@ -2445,7 +2645,7 @@ class Fighter(Living, MessageBroadcaster):
 			self.relative_mp = char.mp / char.mmp if char.mmp > 0 else 1.0
 
 		def __exit__(self, et, e, tb):
-			self.char.cur_hp = clamp(round(self.char.mhp * self.relative_hp), 1, self.char.mhp)
+			self.char.cur_hp = clamp(round(self.char.mhp * self.relative_hp), min(1, self.char.mhp), self.char.mhp)
 			self.char.cur_mp = clamp(round(self.char.mmp * self.relative_mp), min(1, self.char.mmp), self.char.mmp)
 			super().__exit__(et, e, tb)
 
@@ -2544,10 +2744,11 @@ class Arena(MessageBroadcaster, MessageSink):
 		self.battlers.remove(battler)
 		self.squads[battler.squad_id].members.remove(battler)
 		self.turn_queue.remove(battler)
-		if self.started: battler.fighter.remove_sink(self)
+		if self.started: battler.fighter.remove_sink(self, maybe=True)
 
+	# по сути это противоположность start, но stop пошловато звучит.
 	def dismiss(self):
-		while self.battlers: self.remove(self.battlers[0])
+		while self.battlers: self.remove(self.battlers[-1])
 
 	def allies(self, fighter):
 		battler = self.as_battler(fighter)
@@ -2619,7 +2820,7 @@ class Arena(MessageBroadcaster, MessageSink):
 			i = 2 if tr else 1
 			while True: yield cap_first((tr[0] if tr else "") + str(i)); i += 1
 		else:
-			yield from (check(single, single == cap_first(transliterate(single.casefold())), "wrong naming") for single in name_or_list)
+			yield from (check(single, single == cap_first(transliterate(single.casefold())), "имя должно быть латиницей с большой буквы") for single in name_or_list)
 
 	def generate_shortcut(self, fighter, hint):
 		packs = (hint and self.suggest_shortcuts(hint), self.suggest_shortcuts(fighter.name))
@@ -2759,7 +2960,7 @@ class MeleeAI(AI):
 
 		if self.lock_on:
 			if self.fighter.unarmed:
-				self.fighter.attack_unarmed(self.lock_on, self.arena)
+				self.fighter.act_attack_unarmed(self.lock_on, self.arena)
 				self.lock_interest -= 1
 			else:
 				self.note(self.fighter.name + " не может найти свои руки (БАГ).")
@@ -2876,15 +3077,16 @@ class MainMenu(Mode):
 
 		ci = 1
 		lines.extend([
-			               "        VISIBLE FIGHTERS v.{0}       ".format(".".join(str(part) for part in app_version)),
+			               "        VISIBLE FIGHTERS v.{0}       ".format(".".join(map(str, app_version))),
 			             "({0})        - новая игра -        (new)".format(ci)])
 		add_multi((str(ci), 'new'), lambda: self.start_new_game(), '?', lambda: self.more("Начать новую игру."))
 		ci += 1
 
-		if os.path.exists(Game.SAVE_FOLDER):
-			lines.append("({0})      - продолжить игру -    (load)".format(ci))
-			add_multi((str(ci), 'load'), lambda: self.switch_to(LoadGame()), '?', lambda: self.more("Продолжить сохранённую игру."))
-			ci += 1
+		with suppress(OSError):
+			if any(Game.looks_like_save_file(entry.name) for entry in os.scandir(Game.SAVE_FOLDER)):
+				lines.append("({0})      - продолжить игру -    (load)".format(ci))
+				add_multi((str(ci), 'load'), lambda: self.switch_to(LoadGame()), '?', lambda: self.more("Продолжить сохранённую игру."))
+				ci += 1
 
 		lines.extend([
 			             "({0})         - справка -         (help)".format(ci),
@@ -2916,6 +3118,9 @@ class MainMenu(Mode):
 		"Можно сокращать команды: heal hp -> h h, b.fire? -> b.f?.\n"\
 		"                                               ^       ^\n"\
 		"                                       |\"?\" выводит справку по команде или подписанному элементу экрана."
+
+	def do_deactivate(self):
+		self.session.globals.recent_fixed_name_proposals = 0
 
 class LoadGame(Mode):
 	def __init__(self):
@@ -2973,8 +3178,7 @@ class LoadGame(Mode):
 		# Доступна ли прокрутка вниз, и какими будут новые first/show?
 		if self.first + self.show < len(previews.items):
 			self.first_dn = self.first + self.show
-			self.show_dn  = self.estimate_items_count(self.first_dn)
-			check(self.show_dn, self.show_dn > 0, "show_dn")
+			self.show_dn  = check(self.estimate_items_count(self.first_dn), lambda show_dn: show_dn > 0, "show_dn")
 		else:
 			self.first_dn = None
 
@@ -3036,7 +3240,7 @@ class LoadGame(Mode):
 		lines.append("\nУдалить сохранение ({0})".format(", ".join(remove_inscriptions)))
 		lines.append("Вернуться в главное меню (quit)")
 		cmds.add('force update', lambda: self.force_update(), '?', lambda: self.more("Перечитать содержимое папки с сохранениями."))
-		cmds.add('quit', lambda: self.switch_to(MainMenu()), '?', lambda: self.more("Вернуться в главное меню."))
+		cmds.add('quit', lambda: self.revert(), '?', lambda: self.more("Вернуться в главное меню."))
 
 	def do_handle_command(self, cmd):
 		if cmd == "":
@@ -3073,15 +3277,16 @@ class LoadGame(Mode):
 		return handler
 
 	def create_remove_request_handler(self, item, desc_pad, extra_reverts=0):
+		default_yes = item.bad
 		def confirm_remove(input, mode):
-			if not input and item.bad or input and 'yes'.startswith(input):
+			if not input and default_yes or input and 'yes'.startswith(input):
 				Game.remove_save_nothrow(mode, item.full_save_path, item, extra_reverts=1 + extra_reverts, note_success=True)
 			else:
 				mode.revert(1 + extra_reverts)
 
 		def handler():
 			self.prompt(
-				"\n{0}\n\nУдалить это сохранение? ({1}) ".format(self.save_desc(item, desc_pad), highlight_variant("y/n", 0 if item.bad else 1)),
+				"\n{0}\n\nУдалить это сохранение? ({1}) ".format(self.save_desc(item, desc_pad), highlight_variant("y/n", 0 if default_yes else 1)),
 				confirm_remove)
 		return handler
 
@@ -3095,7 +3300,6 @@ class LoadGame(Mode):
 					if not input:
 						mode.revert()
 						return
-
 					try:
 						index = int(input) - 1
 						if index >= 0 and index < count:
@@ -3174,7 +3378,7 @@ class Prompt(More):
 
 # Прогресс игрока и информация о сейве.
 class Game:
-	SAVE_FOLDER, SAVE_SUFFIX = os.path.join(os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__), 'save'), ".sav"
+	SAVE_FOLDER, SAVE_SUFFIX = path.join(path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__), 'save'), ".sav"
 	SAVE_FILE_BASE_NAME_DONT_TOUCH = '\x00/' # save_file_base_name нужна для обнаружения необходимости смены имени, это — маркер «не менять»
 	MAGIC = b'H,/m seX}Y', 2942819, 127
 	PLAYER_SQUAD = 0
@@ -3183,14 +3387,15 @@ class Game:
 	def __init__(self):
 		self.character_uid  = None # Для отслеживания сохранений с одинаковыми именами персонажей.
 		self.full_save_path = None
-		self.rel_save_path  = None # используется как ключ в PreviewsList и при сравнении известных превью с результатами os.walk().
-		                           # Весь этот цирк с full/rel обусловлен тем, что я иррационально не хочу дёргать os.path.basename(full_save_path).
+		self.rel_save_path  = None # используется как ключ в PreviewsList и при сравнении известных превью с результатами os.scandir().
+		                           # Весь этот цирк с full/rel обусловлен тем, что я иррационально не хочу дёргать path.basename(full_save_path).
 		self.save_file_base_name = None # это НЕ имя файла, это его «основа» (с именем персонажа, etc.)
 		                                # по несоответствию base_filename() обнаруживается необходимость переключиться на новый файл
 		self.gold           = None
 		self.player         = None
 		self.next_level     = None
 		self.god_mode       = False
+		self.completed_fights = []
 
 	def enough_gold_for(self, cost):
 		return self.gold >= cost
@@ -3207,7 +3412,7 @@ class Game:
 	def corrupted_save_error(what=None):
 		return Game.BadSaveError("Сохранение повреждено{0}.".format(f" ({what})" if what else ""))
 
-	# Превью для быстрой загрузки. Сохранение состоит из Preview.to_list() и Game.to_complement()
+	# Превью для быстрой загрузки. Сохранение состоит из Preview.to_list() и Complement.to_list().
 	class Preview:
 		__slots__ = (
 			'character_uid', 'order_key',
@@ -3234,7 +3439,6 @@ class Game:
 			('player_name', bytes), ('player_level', int), ('player_next', (int, type(None))),
 			('weapon_name', bytes), ('weapon_level', int), ('weapon_next', (int, type(None))),
 			('gold', int), ('next_level', int), ('timestamp', int)]
-		unchanged_fields = ('character_uid', 'gold', 'next_level', 'god_mode')
 		extra_flags = ['compress', 'god_mode']
 
 		def to_list(self):
@@ -3248,18 +3452,18 @@ class Game:
 				pcgxor(getattr(self, field).encode()) if field in ('player_name', 'weapon_name') else # не светить непосредственно
 				self.order_key << len(Game.Preview.extra_flags) | flag_bits if field == 'order_key' else
 				getattr(self, field)
-				for field, _ in Game.Preview.store_fields]
+				for field, _field_type in Game.Preview.store_fields]
 
 		@staticmethod
 		def from_list(d):
 			pv = Game.Preview()
 			if not isinstance(d, list) or len(d) < 1 or not isinstance(d[0], int):
-				raise Game.corrupted_save_error()
+				raise Game.corrupted_save_error("preview")
 
-			if d[0] != save_version or len(d) != 1 + len(Game.Preview.store_fields):
+			if d[0] != save_version or len(d) != 1 + len(pv.store_fields):
 				raise Game.BadSaveError("Несовместимая версия сохранения.")  # хотя можно и совместимость устроить... даже просто не проверять
 
-			for index, (field, field_type) in enumerate(Game.Preview.store_fields, 1):
+			for index, (field, field_type) in enumerate(pv.store_fields, 1):
 				value = d[index]
 				if not isinstance(value, field_type): raise Game.corrupted_save_error(f"{field}: {type(value)}")
 				elif field == 'timestamp': pv.timestamp = localtime(value)
@@ -3269,6 +3473,32 @@ class Game:
 					for i, flag in enumerate(Game.Preview.extra_flags): setattr(pv, flag, bool(value & 1<<i))
 				else: setattr(pv, field, value)
 			return pv
+
+	# Complement устроено аналогично Preview, содержит дополнение Preview до полного состояния игры.
+	class Complement:
+		def __init__(self, game=None):
+			self.player = game and game.player
+
+		store_fields = [('player', Fighter)]
+
+		def to_list(self):
+			return [getattr(self, field) for field, _field_type in Game.Complement.store_fields]
+
+		@staticmethod
+		def from_list(d):
+			complement = Game.Complement()
+			if not isinstance(d, list) or len(d) != len(complement.store_fields):
+				raise Game.corrupted_save_error("complement")
+
+			for index, (field, field_type) in enumerate(complement.store_fields):
+				value = d[index]
+				if not isinstance(value, field_type): raise Game.corrupted_save_error(f"{field}: {type(value)}")
+				setattr(complement, field, value)
+			return complement
+
+	# Поля Game, попадающие в preview/complement в неизменном виде.
+	preview_verbatim = ('character_uid', 'gold', 'next_level', 'god_mode')
+	complement_verbatim = ('player',)
 
 	@staticmethod
 	def load_preview(file):
@@ -3288,17 +3518,21 @@ class Game:
 		return "{0} Lv.{1} ({2} Lv.{3}) D{4}".format(
 			sanitize(self.player.name) or "Игрок", self.player.xl, sanitize(self.player.weapon.name) or "автомат", self.player.weapon.xl, self.next_level)
 
+	@staticmethod
+	def looks_like_save_file(fn):
+		return fn.endswith(Game.SAVE_SUFFIX)
+
 	def open_new_file(self):
-		file, full_path, rel_path, base, num = None, None, None, self.base_filename(), None
+		base, num = self.base_filename(), 1
 		while True:
 			try:
-				rel_path  = base + (f" ({num})" if num else "") + Game.SAVE_SUFFIX
-				full_path = os.path.join(self.SAVE_FOLDER, rel_path)
+				rel_path  = base + (f" ({num})" if num > 1 else "") + Game.SAVE_SUFFIX
+				full_path = path.join(self.SAVE_FOLDER, rel_path)
 				file = open(full_path, 'x+b')
 				break
 			except FileExistsError:
-				num = num + 1 if num else 2
-			if num > 99: raise RuntimeError(f"Слишком много сохранений вида \"{base}\".")
+				num += 1
+			if num > 99: raise RuntimeError(f"Слишком много сохранений вида \"{base + Game.SAVE_SUFFIX}\".")
 		return file, full_path, rel_path, base
 
 	@staticmethod
@@ -3337,20 +3571,12 @@ class Game:
 			os.mkdir(Game.SAVE_FOLDER)
 
 		# Придумать character_uid, если его ещё нет.
-		# Единственное, для чего он нужен — суффиксы вида «-2» на экране загрузки для разных персонажей с одинаковыми именами.
-		# Т. о. коллизии не критичны, 2**16=65536 достаточно. Ну не выведется с маленькой вероятностью суффикс, когда нужен, подумаешь.
+		# Пока что единственное, для чего он нужен — суффиксы вида «-2» на экране загрузки для разных персонажей с одинаковыми именами.
 		if self.character_uid is None:
-			self.character_uid = randrange(2**16)
+			self.character_uid = self.generate_character_uid(session)
 
-		# Вообще-то choose_order_key потенциально дёргает previews.update(), а она, в свою очередь, может сломать предположение,
-		# что self.rel_save_path есть в previews. Это всё работает только благодаря удачному сочетанию случайностей:
-		# больше никто не дёргает previews.update при активной Game, а сама choose_order_key дёргает,
-		# только когда ей не сообщили имя существующего сохранения, что возможно только при to_new_file or not self.rel_save_path,
-		# но в обоих этих случаях выполнение пойдёт по ветке note_add, т. е. полагается, что rel_save_path И НЕ БЫЛО в previews.
-		#
-		# Сейчас всё вроде бы стабильно работает без искусственной робастности, но когда-нибудь, возможно,
-		# несуществующие rel_save_path, переданные в previews.note_update (а также существующие, переданные в note_add)
-		# придётся там же тихо игнорировать/фиксить задним числом вместо ассертов.
+		# order_key — поле, по которому сортируются превью на экране загрузки.
+		# Файл свеженачатой игры будет вверху всех остальных, загруженной — останется на прежнем месте.
 		order_key = session.previews.choose_order_key(not to_new_file and self.rel_save_path)
 
 		# Записать сразу в новый файл, если:
@@ -3361,10 +3587,8 @@ class Game:
 		if to_new_file or self.will_autosave_to_new_file():
 			file, full_path, rel_path, base = self.open_new_file()
 			try:
-				try:
+				with file:
 					preview = self.save_to(file, order_key, compress=compress)
-				finally:
-					file.close()
 
 				# Если это автосохранение, удалить старый файл.
 				if not to_new_file and self.full_save_path:
@@ -3372,7 +3596,7 @@ class Game:
 
 					# Но пошаманить над превью так, чтобы оно осталось на месте — с корректными order_key разницы не будет,
 					# но если они сбились, это, в отличие от .note_remove + .note_add, оставит превью в старом месте списка.
-					session.previews.note_update(self.rel_save_path, preview, full_path, rel_path)
+					session.previews.note_update(self.full_save_path, self.rel_save_path, preview, full_path, rel_path)
 				else:
 					session.previews.note_add(full_path, rel_path, preview)
 
@@ -3384,18 +3608,28 @@ class Game:
 		else:
 			# Сохранение в тот же файл: записать временный, затем атомарно заменить существующий.
 			# (На самом деле лучше и для случая выше сохранять во временный, чтобы при выдёргивании вилки из розетки не оставлять недописанный .sav).
-			tmp_fd, tmp_path = tempfile.mkstemp(suffix = ".tmp", prefix = self.base_filename(), dir = self.SAVE_FOLDER)
+			tmp_fd, tmp_path = tempfile.mkstemp(suffix=".tmp", prefix=self.base_filename(), dir=self.SAVE_FOLDER)
 			# Не знаю, как с ними правильно работать, так что перестрахуюсь.
 			try:
 				with open(tmp_fd, 'wb') as file:
 					tmp_fd = 'CLOSED'
 					preview = self.save_to(file, order_key, compress=compress)
 				os.replace(tmp_path, self.full_save_path)
-				session.previews.note_update(self.rel_save_path, preview)
+				session.previews.note_update(self.full_save_path, self.rel_save_path, preview)
 			except:
 				if tmp_fd != 'CLOSED': os.close(tmp_fd)
 				Game.remove_from_save_folder(tmp_path, throw=False)
 				raise
+
+	def generate_character_uid(self, session):
+		session.previews.update()
+		for _tryIndex in range(10):
+			character_uid = randrange(2**16)
+			# Коллизии не критичны (см. зачем вообще нужен character_uid), тем не менее, по возможности хотелось бы их избегать.
+			if all(item.preview.character_uid != character_uid for item in session.previews.items if item.preview): return character_uid
+		else:
+			# Фоллбэк, гарантированно не совпадающий ни с одним из сейвов, ценой неограниченности сверху.
+			return max(item.preview.character_uid for item in session.previews.items if item.preview) + 1 + randrange(2**16)
 
 	def save_nothrow(self, mode, then=None, note_success=False, to_new_file=False, extra_error_comment=None, compress=True):
 		try:
@@ -3409,29 +3643,21 @@ class Game:
 				if then: mode.then(lambda mode: then(True, mode))
 			elif then: then(True, mode)
 
-	complement_fields = [('player', Fighter)]
-	def to_complement(self):
-		return [getattr(self, k) for k, _ in Game.complement_fields]
-
 	@staticmethod
 	def load_complement(file):
-		complement = pickle.load(file)
-		if not isinstance(complement, list) or len(complement) != len(Game.complement_fields): raise Game.corrupted_save_error('complement')
-		for index, (field, field_type) in enumerate(Game.complement_fields):
-			if not isinstance(complement[index], field_type): raise Game.corrupted_save_error(field + ": " + str(type(complement[index])))
-		return complement
+		return Game.Complement.from_list(pickle.load(file))
 
 	@staticmethod
 	def from_preview_and_complement(preview, complement, full_save_path, rel_save_path):
 		g = Game()
-		for k in Game.Preview.unchanged_fields:
-			setattr(g, k, getattr(preview, k))
-		for index, (k, _) in enumerate(Game.complement_fields):
-			setattr(g, k, complement[index])
+		# Некоторые поля preview и complement напрямую соответствуют полям Game.
+		for (pv_or_cp, fields) in (preview, Game.preview_verbatim), (complement, Game.complement_verbatim):
+			for field_name in fields:
+				setattr(g, field_name, getattr(pv_or_cp, field_name))
 
 		g.full_save_path, g.rel_save_path = full_save_path, rel_save_path
 		# если имя файла сформировано по тем же правилам, что сформировало бы само приложение...
-		if os.path.basename(g.rel_save_path).startswith(g.base_filename()):
+		if re.fullmatch(re.escape(g.base_filename()) + r"( \(\d+\))?", path.splitext(path.basename(g.rel_save_path))[0]):
 			g.save_file_base_name = g.base_filename() # ...то считать, что так и есть, и менять его как обычно
 		else:
 			# иначе пользователь переименовал файл (или изменились правила формирования имени, но этот случай опустим)
@@ -3444,11 +3670,9 @@ class Game:
 		file.write(pickletools.optimize(pickle.dumps(preview.to_list(), protocol=-1)))
 		file.write(pcgxor(*Game.MAGIC))
 
-		cf = lzma.open(file, 'wb', **LZMA_OPTIONS) if compress else file
-		try:
-			cf.write(pickletools.optimize(pickle.dumps(self.to_complement(), protocol=-1)))
-		finally:
-			if compress: cf.close()
+		complement = Game.Complement(game=self)
+		with lzma.open(file, 'wb', **LZMA_OPTIONS) if compress else nullcontext(file) as cf:
+			cf.write(pickletools.optimize(pickle.dumps(complement.to_list(), protocol=-1)))
 		return preview
 
 	@staticmethod
@@ -3459,11 +3683,8 @@ class Game:
 		if file.read(len(Game.MAGIC[0])) != pcgxor(*Game.MAGIC):
 			raise Game.corrupted_save_error('magic')
 
-		cf = lzma.open(file, 'rb', **LZMA_OPTIONS) if preview.compress else file
-		try:
+		with lzma.open(file, 'rb', **LZMA_OPTIONS) if preview.compress else nullcontext(file) as cf:
 			complement = Game.load_complement(cf)
-		finally:
-			if preview.compress: cf.close()
 		return Game.from_preview_and_complement(preview, complement, full_save_path, rel_save_path)
 
 	@staticmethod
@@ -3490,6 +3711,18 @@ class Game:
 
 	def marks(self, lspace=False, rspace=False): # self может быть Preview
 		return ((" " if lspace else "") + "*DEBUG*" + (" " if rspace else "")) if self.god_mode else ""
+
+	grade_breakpoints = [
+		(0, 'F'), (15, 'D-'), (20, 'D'), (30, 'D+'), (35, 'C-'), (40, 'C'), (50, 'C+'),
+		(55, 'B-'), (60, 'B'), (70, 'B+'), (75, 'A-'), (80, 'A'), (95, 'A+'), (100, 'S')]
+
+	@staticmethod
+	def grade_for_score(score):
+		return Game.grade_breakpoints[bisect_right(SequenceMap(Game.grade_breakpoints, lambda grade: grade[0], start=1), score)][1]
+
+	class CompletedFight:
+		def __init__(self, name, score):
+			self.name, self.score = name, score
 
 class NonCombatMode(Mode, MessageSink):
 	def __init__(self, game):
@@ -3529,6 +3762,7 @@ class Respite(NonCombatMode):
 
 		desc += "\n" + pad + player.hp_bar()
 		if player.hp < player.mhp:
+			# TODO: частичное лечение?
 			cost = clamp(round((1 - player.hp / player.mhp) * 30 + 0.25 * (player.mhp - player.hp)), 1, 50)
 			desc += "   восстановить: ${0}".format(cost)
 			if self.game.enough_gold_for(cost):
@@ -3588,22 +3822,18 @@ class Respite(NonCombatMode):
 				if ammo.needs_recharging():
 					line += "перезарядка: [recharge_cost]${0}[/recharge_cost]".format(ammo.recharge_cost())
 					if self.game.enough_gold_for(ammo.recharge_cost()):
-						def make_reload_func(ammo):
+						def make_reload_func(ammo=ammo):
 							def reload():
 								self.game.take_gold(ammo.recharge_cost())
 								ammo.recharge()
 							return reload
 						line += f" [reload_cmd](reload {cmd})"
-						cmds.add('reload ' + cmd, make_reload_func(ammo))
+						cmds.add('reload ' + cmd, make_reload_func())
 					else:
 						line += " :("
 				lines.append(line)
 		if lines: desc += "\n" + "\n".join(multipad(lines))
 		return desc
-
-	def do_process(self):
-		if self.game.player.hp > self.game.player.mhp: self.game.player.cur_hp = self.game.player.mhp
-		if self.game.player.mp > self.game.player.mmp: self.game.player.cur_mp = self.game.player.mmp
 
 	def do_render(self, lines, cmds):
 		game = self.game
@@ -3623,7 +3853,7 @@ class Respite(NonCombatMode):
 							game.give_gold(amount)
 							mode.revert()
 						else:
-							raise ValueError("Слишком много." if amount > max else "Неверное количество.")
+							raise ValueError(f"Слишком много, макс. {max}." if amount > max else "Неверное количество.")
 					except ValueError as e:
 						mode.more(exception_msg(e))
 				cmds.add('gold+', lambda: self.prompt(f"Сколько золота добавить? (ENTER — {default}) ", handle_gold_answer))
@@ -3643,7 +3873,7 @@ class Respite(NonCombatMode):
 									func(amount)
 									self.check_for_pending_notes(extra_reverts=1, maybe=True)
 								else:
-									raise ValueError("Слишком много." if amount > max else "Неверное количество.")
+									raise ValueError(f"Слишком много, макс. {max}." if amount > max else "Неверное количество.")
 							except ValueError as e:
 								mode.more(exception_msg(e)).reverts(2)
 						cmds.add(cmd, lambda: self.prompt(f"Сколько опыта{name and ' '}{name} {verb}? (ENTER — {default}) ", handle_xp_answer))
@@ -3660,6 +3890,7 @@ class Respite(NonCombatMode):
 
 	def do_handle_command(self, cmd):
 		if cmd == '*br':
+			# Недокументированная команда, бэкапящая текущее состояние игры.
 			self.split_soul()
 			return True
 		else:
@@ -3694,19 +3925,14 @@ class Respite(NonCombatMode):
 
 		self.prompt("Выйти из игры? ({0}) ".format(highlight_variant("y/n", 0 if default_yes else 1)), handle_confirmation)
 
-	def do_activate(self):
-		super().do_activate()
-		self.session.globals.recent_fixed_name_proposals = 0
-
 	def to_next_level(self):
-		self.game.save_nothrow(self, then=lambda success, mode: self.to_arena_entrance())
-
-	def to_arena_entrance(self):
-		def before(arena):
-			# За игроком всегда первый ход.
-			arena.add(self.game.player, Game.PLAYER_SQUAD, PlayerAI(), game=self.game, force_delay=0)
-		arena = FixedLevels.list[self.game.next_level-1].create_arena(before)
-		self.switch_to(ArenaEntrance(self.game, arena, self.game.next_level))
+		def to_arena_entrance():
+			def before(arena):
+				# За игроком всегда первый ход.
+				arena.add(self.game.player, Game.PLAYER_SQUAD, PlayerAI(), game=self.game, force_delay=0)
+			arena = FixedLevels.list[self.game.next_level-1].create_arena(before)
+			self.switch_to(ArenaEntrance(self.game, arena, self.game.next_level))
+		self.game.save_nothrow(self, then=lambda success, mode: to_arena_entrance())
 
 class Shop(NonCombatMode):
 	def __init__(self, game):
@@ -3809,7 +4035,7 @@ class ArenaEntrance(Mode):
 
 	# Здесь выполняется эдакий вертикальный multipad, части выравниваются по высоте:
 	#
-	#   Обычный крыс Lv.1              Волшебный крыс Lv.1      <-- имя (desc[0])
+	# Обычный крыс Lv.1 (O)           Волшебный крыс Lv.1 (V)   <-- имя (desc[0])
 	# HP: [##########] 10/10          HP: [##########] 10/10    <-- полоски HP/MP (desc[1])
 	#                                 MP: [##########] 10/10
 	#
@@ -3907,9 +4133,9 @@ class ArenaEntrance(Mode):
 		self.revert()
 
 	def to_arena(self):
-		def on_leave():
-			self.arena.dismiss()
-		self.switch_to(ArenaView(self.game, self.arena, self.game.player, on_leave))
+		def on_leave(av):
+			av.arena.dismiss()
+		self.switch_to(ArenaView(self.game, self.arena, on_leave))
 		self.arena.start()
 
 class ArenaView(Mode):
@@ -4021,60 +4247,50 @@ class ArenaView(Mode):
 
 		def clear(self): self.__init__()
 
-	def __init__(self, game, arena, player, on_leave):
+	# сейчас on_leave вызывается в очень тонкий момент (в Mode.do_deactivate лол), поэтому switch_to там делать нельзя.
+	def __init__(self, game, arena, on_leave):
 		super().__init__()
-		self.game, self.arena, self.player = game, arena, player
+		self.game, self.arena, self.player = game, arena, game.player
 		self.on_leave = on_leave
-		self.awaiting_decision = None
+		self.awaiting_decision = False
 		self.player_ai = None
 		self.atb_maximum = None
 
 		def receive_note(msg):
 			if self.player.alive:
-				self.log.add(msg, self.next_player_turn)
+				self.log.add(msg, self.current_player_turn)
 			elif not self.death_message:
 				# Хрупкое предположение, что первая заметка после смерти будет её описанием. Пока работает, но в будущем, возможно,
 				# понадобится цеплять к note'ам дополнительную информацию для таких случаев.
 				self.death_message = msg
 
 		self.log = self.MessageLog()
-		self.sink = MessageSink(player, receive_note)
+		self.sink = MessageSink(self.player, receive_note)
 		self.log_lines = None
 		self.render_log = True
 		self.log_area_height = None
-		self.next_player_turn = -1
+		self.current_player_turn = -1
 		self.your_turn_announced = False
 		self.start_log_at = None
-		self.extra_lines = None
 		self.do_prompt = True
 		self.death_message = None
 		self.okay_to_skip_turns = False
+		self.prev_single_target = False
 
 	def do_activate(self):
-		self.player_ai = self.arena.as_battler(self.player).ai
-		check(self.player_ai, isinstance(self.player_ai, PlayerAI), "player.ai")
+		self.player_ai = check(self.arena.as_battler(self.player).ai, lambda player_ai: isinstance(player_ai, PlayerAI), "player_ai")
 		self.atb_maximum = self.estimate_good_atb_maximum()
 		self.arena.add_sink(self.sink)
 
 	def do_deactivate(self):
-		if self.on_leave: self.on_leave()
+		if self.on_leave: self.on_leave(self)
 		self.arena.remove_sink(self.sink)
 
 	def do_process(self):
-		min_log_lines = self.min_log_lines()
-		min_lines_total = (
-			  self.min_lines_for_squads()
-			+ self.min_action_lines()
-			+ min_log_lines
-			+ self.reserve_lines())
-		if min_lines_total >= self.term_height: impossible(f"min_lines_total = {min_lines_total}, term_height = {self.term_height}")
-		extra_lines = self.term_height - min_lines_total
-		extra_log_lines = round(extra_lines/3/max(1, self.term_width/50))
-		self.extra_lines = extra_lines - extra_log_lines
-
+		layout = self.estimate_screen_layout()
 		self.awaiting_decision = False
 		self.do_prompt = True
-		self.log_area_height = min_log_lines + extra_log_lines
+		self.log_area_height = layout.log_lines
 		self.render_log = True
 		do_turn = True
 		while do_turn:
@@ -4083,12 +4299,12 @@ class ArenaView(Mode):
 				if not self.player_ai.decision:
 					self.awaiting_decision = True
 					do_turn = False
-				if not self.your_turn_announced:
-					self.next_player_turn += 1
-					put_extra_line = False and self.log.lines and len(self.log.lines[-1].line) > self.safe_term_width and self.log_area_height >= 7
+				if not self.your_turn_announced and next(self.arena.enemies(self.player), None):
+					self.current_player_turn += 1
+					put_extra_line = self.log.lines and self.log_area_height >= 7 and len(self.log.lines[-1].line) > self.safe_term_width
 					if put_extra_line:
-						self.log.add("", turn=self.next_player_turn, start_new_line=True)
-					self.log.add("_", turn=self.next_player_turn, next_sep="", start_new_line=True)
+						self.log.add("", turn=self.current_player_turn, start_new_line=True)
+					self.log.add("_", turn=self.current_player_turn, next_sep="", start_new_line=True)
 					self.your_turn_announced = True
 
 			# условие в really означает «прокрутить, если сейчас будет сообщение с \n(...) или render()».
@@ -4106,10 +4322,11 @@ class ArenaView(Mode):
 
 		if not self.player.alive:
 			self.disable_prompt_this_time()
-			if self.game.rel_save_path:
+			self.awaiting_decision = False
+			pv = self.session.previews.fn2it.get(self.game.rel_save_path, None)
+			if pv:
 				def handle_answer(input, mode):
 					if not input or 'yes'.startswith(input):
-						pv = self.session.previews.fn2it[self.game.rel_save_path]
 						Game.load_nothrow(pv, self, more_on_success=False, on_fail=lambda mode: mode.then(lambda mode: mode.switch_to(MainMenu())))
 					else:
 						mode.switch_to(MainMenu())
@@ -4118,29 +4335,35 @@ class ArenaView(Mode):
 				after_prompt = lambda input, mode: mode.switch_to(MainMenu())
 			self.invalidate().prompt("\n..." + check(self.death_message, "нет сообщения о смерти"), after_prompt)
 
+		elif not next(self.arena.enemies(self.player), None):
+			self.disable_prompt_this_time()
+			self.awaiting_decision = False
+			self.invalidate().more("\nПобеда!").then(lambda mode: self.to_results('won'))
+
 	def do_render(self, lines, cmds):
+		layout = self.estimate_screen_layout()
 		start_lines = len(lines)
 		reserve = self.reserve_lines()
 		squadA, squadB = tuple(nsmallest(2, self.arena.squads.keys()))
-		imA = self.build_squad_image(squadA, None, self.term_height - reserve - self.log_area_height - 1, False)
-		imB = self.build_squad_image(squadB, None, self.term_height - reserve - self.log_area_height - 1, True)
-		cmds_desc = self.build_commands_desc(cmds) if self.awaiting_decision else []
-		cmds_desc_shift = len(imA) + (1 if cmds_desc else 0)
+		imA = self.build_squad_image(squadA, layout.squad_lines, self.term_height - 1 - reserve - self.log_area_height, False)
+		imB = self.build_squad_image(squadB, layout.squad_lines, self.term_height - 1 - reserve - self.log_area_height, True)
+		cmds_desc = multipad(self.build_commands(cmds, layout.action_lines))
 
-		for lineno in range(max(cmds_desc_shift + len(cmds_desc), len(imB))):
-			left = imA[lineno] if lineno < len(imA) else cmds_desc[lineno - cmds_desc_shift] if 0 <= lineno - cmds_desc_shift < len(cmds_desc) else ""
+		for lineno in range(max(len(imA) + len(cmds_desc), len(imB))):
+			left = imA[lineno] if lineno < len(imA) else cmds_desc[lineno - len(imA)] if 0 <= lineno - len(imA) < len(cmds_desc) else ""
 			right = imB[lineno] if lineno < len(imB) else ""
 
 			limit = self.safe_term_width
 			if len(left) + len(right) > limit:
-				left = left[:limit - len(right)]
+				overflow = len(left) + len(right) - limit
+				if overflow <= len(right) // 2: right = right[overflow:]
 				if len(left) + len(right) > limit: impossible(f"Строка не умещается в ширину консоли: {left}/{right}.")
-			lines.append(left + " " * (limit - len(left) - len(right)) + right)
+			lines.append(left.ljust(limit - len(right)) + right)
 
 		lines_taken = len(lines) - start_lines
 		self.start_log_at = min(
-			lines_taken + 3 if self.start_log_at is None else self.start_log_at if self.start_log_at > lines_taken else lines_taken + 3,
-			self.term_height - reserve - max(len(self.log_lines), self.log_area_height))
+			lines_taken + 1 if self.start_log_at is None or self.start_log_at < lines_taken else self.start_log_at,
+			self.term_height - 1 - reserve - self.log_area_height)
 
 		lines.extend("" for _i in range(self.start_log_at - lines_taken))
 		# ^ сработает и перед тем more с (...) при переполненном логе
@@ -4161,6 +4384,7 @@ class ArenaView(Mode):
 							exist.power += 100
 							exist.turns += 10
 						else: pass
+						exist.reapply(self.arena)
 					else:
 						if cls == Bleeding: args = (200,)
 						elif cls == RageHex: args = (100,)
@@ -4187,14 +4411,22 @@ class ArenaView(Mode):
 			2 + # полоски HP/MP
 			1)  # новая строка
 
+	def max_lines_for_squads(self):
+		# Неэффективно: для подсчёта требуемого числа строк в результате без задней мысле строится сам результат.
+		return max(len(self.build_squad_image(squad, None, None, False)) for squad in self.arena.squads.values())
+
 	def min_action_lines(self):
-		return 4
+		return 4 # Игрок, новая строка, оружие, новая строка.
+
+	def max_action_lines(self):
+		# Неэффективно, см. max_lines_for_squads.
+		return len(self.build_commands(None))
 
 	def min_log_lines(self):
 		return 3
 
 	def reserve_lines(self):
-		return 5
+		return 6 # как минимум 2 = (1) >приглашение и команда, (2) новая строка. Плюс чуть-чуть.
 
 	def do_handle_command(self, cmd):
 		if cmd == '*atb':
@@ -4229,7 +4461,7 @@ class ArenaView(Mode):
 		self.do_prompt, self.last_input = False, ""
 
 	def build_squad_image(self, squad, cmds, lines_limit, flip):
-		squad = self.arena.squads[squad]
+		if not isinstance(squad, self.arena.Squad): squad = self.arena.squads[squad]
 		class PerBattler:
 			def __init__(self, fighter, battler):
 				self.fighter, self.battler = fighter, battler
@@ -4237,7 +4469,7 @@ class ArenaView(Mode):
 				self.hex_descs = []
 				self.hexes_gen = iter(fighter.hexes)
 		per_battler = []
-		total_lines = max(0, len(squad.members) - 1) # пустые строки между описаниями участников
+		total_lines = max(0, len(squad.members)) # пустые строки после каждого участника
 
 		# Обязательные строки.
 		for b in squad.members:
@@ -4297,11 +4529,20 @@ class ArenaView(Mode):
 
 		result = [line
 			for index, im in enumerate(per_battler)
-				for lines in (im.lines, im.hex_descs, None if index + 1 == len(per_battler) else ("",))
+				for lines in (im.lines, im.hex_descs, ("",))
 					if lines is not None
 						for line in lines]
 		if len(result) != total_lines: impossible(f"len(result) = {len(result)}, total_lines = {total_lines}")
 		return result
+
+	class ScreenLayout:
+		def __init__(self, av):
+			lines = [av.min_lines_for_squads(), av.min_action_lines(), av.min_log_lines()]
+			lim   = [av.max_lines_for_squads(), av.max_action_lines(), lines[2] + round((av.term_height - sum(lines))/3/max(1, av.term_width/50))]
+			self.squad_lines, self.action_lines, self.log_lines = tuple(dispense(lines, av.term_height - av.reserve_lines() - sum(lines), lim=lim))
+
+	def estimate_screen_layout(self):
+		return self.ScreenLayout(self)
 
 	def hex_cmd_prefix(self, hex, victim):
 		check(victim, isinstance(victim, Arena.Battler), "victim")
@@ -4344,20 +4585,125 @@ class ArenaView(Mode):
 	def estimate_good_atb_maximum(self):
 		return 1.2 * self.arena.BASELINE_SPD / max(1, min(b.fighter.spd for b in self.arena.turn_queue))
 
-	def build_commands_desc(self, cmds):
+	def build_commands(self, cmds, lines_limit=None):
 		desc = []
+		if not self.awaiting_decision or not self.player.alive: return desc
+		first_player_line = len(desc)
+
+		def add_single_targeted(*,
+			cmd_desc, cmd_base,
+			perform=lambda target, ai: throw(NotImplementedError("perform")),
+			help=lambda target: throw(NotImplementedError("help"))):
+
+			default_target = self.prev_single_target
+			if not default_target or not default_target.alive:
+				default_target = next(self.arena.enemies(self.player), None)
+
+			if default_target:
+				if cmds:
+					def add_for_target(target, extra):
+						def perform_(ai):
+							self.prev_single_target = target
+							perform(target, ai)
+
+						cmds.add(
+							cmd_base + (' ' + extra if extra else ''), lambda: self.decide(perform_),
+							'?', lambda: self.more(help(target)))
+
+					add_for_target(default_target, None)
+				count = 0
+				for target in self.arena.enemies(self.player):
+					if cmds: add_for_target(target, self.arena.as_battler(target).shortcut)
+					count += 1
+				desc.append("[player_cmd_desc]{} [player_cmd]({}{})".format(cmd_desc, cmd_base, " <цель>" if count > 1 else ""))
+
 		if self.player.unarmed:
-			desc.append("атака врукопашную (hit)")
-			def create_hit():
-				def hit(ai):
-					adv = next(self.arena.enemies(self.player), None)
-					if adv: self.player.attack_unarmed(adv, self.arena)
-				return lambda: self.decide(hit)
-			def create_help():
-				help = "Атака голыми руками."
-				return lambda: self.more(help)
-			cmds.add('hit', create_hit(), '?', create_help())
+			def perform(target, ai):
+				self.player.act_attack_unarmed(target, ai.arena)
+			def help(target):
+				return "Ударить {} голыми руками.\n{}".format(target.name.genitive, self.player.unarmed.beam(target, self.arena).human_stats(do_max=self.game.god_mode))
+			add_single_targeted(cmd_desc="атака врукопашную", cmd_base='hit', perform=perform, help=help)
+
+		if len(desc) > first_player_line:
+			desc.append("")
+		else:
+			first_player_line = None
+
+		weapon = self.player.weapon
+		if weapon:
+			first_weapon_line = len(desc)
+			desc.append("[weapon_cmd_desc]удар прикладом [weapon_cmd](kick)")
+
+			ammo_descs = []
+			had_shoot = False
+			for ammo in weapon.ammos:
+				if ammo.finite_charges:
+					ammo_cmds = ammo.cmd()
+				else:
+					ammo_cmds = 'shoot'
+					had_shoot = True
+				ammo_descs.append("[weapon_cmd_desc]{} [weapon_cmd]({})".format(ammo.name(weapon), ammo_cmds))
+			if not had_shoot:
+				ammo_descs.append("[weapon_cmd_desc]огонь [weapon_cmd](shoot)")
+
+			desc.extend(ammo_descs)
+			if len(desc) > first_weapon_line:
+				desc[first_weapon_line] = multipad.escape(weapon.name) + ": " + desc[first_weapon_line]
+				desc.append("")
+
+		if first_player_line is None: first_player_line = len(desc)
+		desc.append("[player_cmd_desc]отступить [player_cmd](retreat)")
+		desc.append("")
+
+		if first_player_line is not None:
+			desc[first_player_line] = multipad.escape(self.player.name) + ": " + desc[first_player_line]
+
+		if lines_limit is not None and len(desc) > check(lines_limit, lines_limit >= 2, "lines_limit"):
+			cut = len(desc) - lines_limit
+			actual_commands_cut = sum(1 for lineno in range(len(desc) - 1 - cut, len(desc) - 1) if desc[lineno])
+			del desc[-1-cut:-1]
+			while len(desc) > 2 and not desc[-2]: del desc[-2]
+			desc[-2] += " (+{}, cmds)".format(actual_commands_cut)
+
 		return desc
+
+	def to_results(self, outcome):
+		# BattleResults нужна информация о бойцах, а on_leave может сделать arena.dismiss(). Поэтому отдать свою on_leave в BattleResults.
+		on_leave, self.on_leave = self.on_leave, None
+		on_leave_results = on_leave and (lambda _battle_results: on_leave(self))
+		self.switch_to(BattleResults(self.game, self.arena, outcome, on_leave=on_leave_results))
+
+class BattleResults(NonCombatMode):
+	def __init__(self, game, arena, outcome, *, on_leave):
+		super().__init__(game)
+		self.arena, self.player, self.outcome = arena, game.player, outcome
+		self.on_leave = on_leave
+
+	def do_render(self, lines, cmds):
+		lines.append("BattleResults: TODO")
+
+	def do_handle_command(self, cmd):
+		def handle_answer(input, mode):
+			if not input or 'yes'.startswith(input):
+				self.proceed()
+			else:
+				mode.revert()
+		self.prompt("Продолжить? (Y/n)", handle_answer)
+		return True
+
+	def do_activate(self):
+		self.player.remove_sink(self.arena, maybe=True)
+		super().do_activate()
+
+	def do_deactivate(self):
+		if self.on_leave: self.on_leave(self)
+		super().do_deactivate()
+
+	def proceed(self):
+		# fight = Game.CompletedFight()
+		# level = check(self.game.next_level, lambda level: 1 <= level <= 1 + len(self.game.completed_fights), "next_level")
+		# self.game.completed_fights[]
+		self.switch_to(Respite(self.game))
 
 class FixedLevels:
 	class One:
@@ -4392,6 +4738,7 @@ class FixedLevels:
 
 			rat = Fighter()
 			rat.name = Noun.parse("{волшебный крыс:a}")
+			rat.base_ac = 10
 			with rat.save_relative_vitals():
 				rat.base_mmp = 10
 			rat.learn_spell(Firestorm())
@@ -4419,17 +4766,19 @@ class AskName(Prompt):
 			"\nНазовите свой автомат, {0}: ".format(self.game.player.name) if self.who == self.game.player.weapon else
 			impossible(self.who, "who"))
 		super().__init__(prompt, lambda input, mode: self.handle_name_input(input, mode), casefold_input=False)
-		self.fixed = fixed
-		self.fixed_name_rejected = False
+		self.fixed, self.fixed_name_rejected = fixed, False
 
 	def handle_name_input(self, input, mode):
-		MIN, MAX = 3, 20
+		MAX = 20
 		gender = Gender.UNKNOWN
 		fixed_proposed = False
-		if not input or MIN <= len(input) <= MAX:
+
+		if input and 'quit'.startswith(input):
+			mode.revert()
+		elif not input or len(input) <= MAX:
 			if input:
 				name = cap_first(input) if self.who == self.game.player else input
-				if input == name: return self.complete_name(name, gender, mode)
+				if input == name: self.complete_name(name, gender, mode); return
 			else:
 				if self.who == self.game.player:
 					# ну не дёргать же update на каждую has_namesakes_of, лучше уж руками.
@@ -4446,7 +4795,8 @@ class AskName(Prompt):
 									self.session.previews.has_namesakes_of(part, {'adj': 'prefix', 'noun': 'suffix'}[type]),
 								see=lambda type, part: self.session.globals.last_random_name_parts_seen.append((type, part)), return_gender=True)
 						except Noun.RandomNamesExhausted:
-							return mode.more("Случайные имена закончились. Пожалуйста, придумайте своё.")
+							mode.more("Случайные имена закончились. Пожалуйста, придумайте своё.")
+							return
 				elif self.who == self.game.player.weapon:
 					if self.fixed and isinstance(self.fixed, tuple) and len(self.fixed) >= 2 and not self.fixed_name_rejected:
 						name_src = choose(self.fixed[1]) if isinstance(self.fixed[1], tuple) else self.fixed[1]
@@ -4459,19 +4809,19 @@ class AskName(Prompt):
 				if not input or 'yes'.startswith(input):
 					self.complete_name(name, gender, mode)
 				else:
+					if fixed_proposed:
+						self.fixed_name_rejected = True
+						if self.who == self.game.player: self.fixed = None
 					mode.revert()
-					if fixed_proposed: self.fixed_name_rejected = True
 			mode.prompt(
 				"{0} {1} (Y/n) ".format(
 					(f"Очень приятно, {name}." if input else f"Ваше имя — {name}.") if self.who == self.game.player else
 					(f"В ваших руках {name}." if input else f"Имя вашего автомата — {name}.") if self.who == self.game.player.weapon else
 					impossible(self.who, "who"),
 					"Всё верно?" if input else "Продолжить?"), handle_answer)
-		elif 'quit'.startswith(input):
-			mode.revert()
 		else:
-			mode.more("{0}. Длина имени должна быть от {1} до {2}, либо \"q\"uit.".format(
-				plural(len(input), "Введ{ён/ено/ено} {N} символ{/а/ов}"), MIN, plural(MAX, "{N} символ{/а/ов}")))
+			mode.more("{0}. Длина имени должна быть не более {1}, либо \"q\"uit.".format(
+				plural(len(input), "Введ{ён/ено/ено} {N} символ{/а/ов}"), plural(MAX, "{N} символ{/а/ов}")))
 
 	def complete_name(self, name, gender, mode):
 		prefix = ""
@@ -4480,14 +4830,15 @@ class AskName(Prompt):
 			for index, fixed in enumerate(self.fixed_names):
 				f_name, f_gender = self.parse_fixed_player_name(fixed)
 				if str(f_name) == name:
-					if index not in self.session.globals.last_fixed_names_seen: self.session.globals.last_fixed_names_seen.append(index)
+					with suppress(ValueError): self.session.globals.last_fixed_names_seen.remove(index)
+					self.session.globals.last_fixed_names_seen.append(index)
 					self.fixed, (name, gender) = fixed, (f_name, f_gender)
 					prefix = ":3\n"
 					break
 
 		if gender == Gender.UNKNOWN and self.who == self.game.player:
 			default_gender = Gender.detect(name)
-			mode.prompt(prefix + "Вы мальчик или девочка? ({0}/q) ".format(highlight_variant("m/f", default_gender)),
+			mode.prompt("{0}Вы мальчик или девочка? ({1}/q) ".format(prefix, highlight_variant("m/f", default_gender)),
 				lambda input, mode: self.handle_gender_answer(input, mode, name, default_gender))
 		else:
 			self.complete(name, gender, prefix)
@@ -4508,10 +4859,7 @@ class AskName(Prompt):
 		if not isinstance(check(name, isinstance(name, str), "name"), Noun): name = Noun.guess(name, gender=gender, animate=True)
 		self.who.name, self.who.gender = name, gender
 		if self.who == self.game.player:
-			# В handle_name_input выставляется fixed, т. о. если имя и пол на этот момент соответствуют последней fixed, полагается, что пользователь согласился.
-			# Если бы не последующие запросы, опирающиеся на fixed с первого шага, было бы проще занулить fixed в начале handle_name_input.
-			fixed = self.fixed and (name, gender) == self.parse_fixed_player_name(self.fixed) and self.fixed
-			self.session.switch_to(AskName(self.game, self.game.player.weapon, fixed=fixed, prefix=prefix))
+			self.session.switch_to(AskName(self.game, self.game.player.weapon, fixed=self.fixed, prefix=prefix))
 		elif self.who == self.game.player.weapon:
 			self.game.save_nothrow(self, then=lambda success, mode: mode.switch_to(Respite(self.game)))
 		else:
@@ -4537,7 +4885,6 @@ class AskName(Prompt):
 
 # Ввод-вывод, стек экранов, глобальности.
 class Session:
-	__slots__ = ('mode', 'quit_posted', 'cls_once_requested', 'term_width', 'term_height', 'safe_term_width', 'previews', 'globals')
 	def __init__(self, start=None):
 		self.mode               = None
 		self.quit_posted        = False
@@ -4545,10 +4892,12 @@ class Session:
 		self.term_width = self.term_height = self.safe_term_width = None
 		self.previews           = Session.PreviewsList()
 		self.globals            = Session.Globals()
+		self.inside_switch_to   = False
 		self.switch_to(start or MainMenu())
 
 	def switch_to(self, new_mode, reverting=False):
-		check(isinstance(new_mode.prev_mode, bool) or new_mode == self.mode.prev_mode, "prev_mode?!")
+		check(isinstance(new_mode.prev_mode, bool) or new_mode == self.mode.prev_mode, "prev_mode?!", not self.inside_switch_to, "рекурсивный Session.switch_to")
+		self.inside_switch_to = True
 		if reverting:
 			self.mode.deactivate()
 		# запомнить prev_mode при условии, что а) это явно требуется (prev_mode = True) и б) это не возврат к prev_mode (проверено по reverting)
@@ -4564,6 +4913,7 @@ class Session:
 		self.mode.session = self
 		if not reverting: self.mode.activate()
 		self.mode.invalidated = False
+		self.inside_switch_to = False
 
 	def revert(self, n=1):
 		check(n > 0, "n?!")
@@ -4610,12 +4960,14 @@ class Session:
 			return
 
 		fn, matches, suggestions = cmds.guess(cmd)
-		if fn: fn()
-		elif mode.handle_command(cmd): pass
-		elif matches: mode.more("Неоднозначная команда: {0}.".format(", ".join(matches)))
-		elif suggestions: mode.more("Неизвестная команда. Попробуйте {0}.".format(", ".join(suggestions)))
-		elif cmd and not cmd.isspace(): mode.more("Неизвестная команда." + (" Попробуйте \"?\"." if has_default_commands else ""))
-		return not self.quit_posted
+		with catch_warnings(record=True) as warnings:
+			if fn: fn()
+			elif mode.handle_command(cmd): pass
+			elif matches: mode.more("Неоднозначная команда: {0}.".format(", ".join(matches)))
+			elif suggestions: mode.more("Неизвестная команда. Попробуйте {0}.".format(", ".join(suggestions)))
+			elif cmd and not cmd.isspace(): mode.more("Неизвестная команда." + (" Попробуйте \"?\"." if has_default_commands else ""))
+			if warnings: self.mode.more("\n".join(str(warning.message) for warning in warnings))
+			return not self.quit_posted
 
 	def post_quit(self):
 		self.quit_posted = True
@@ -4660,7 +5012,7 @@ class Session:
 	# (и, наоборот, обновлять при необходимости).
 	# Если пользователь не будет хулиганить в папке save, каждое сохранение прочитается максимум по одному разу за сеанс,
 	# поскольку Game.save и подобные методы дружат со списком и уведомляют его об изменениях.
-	# Изменения в случае хулиганства (и в первый раз) обнаруживаются по os.walk(), так что механизм можно обмануть;
+	# Изменения в случае хулиганства (и в первый раз) обнаруживаются по os.scandir(), так что механизм можно обмануть;
 	# но максимум, что это собьёт — уникальность order_key и данные на экране загрузки.
 	class PreviewsList:
 		# Можно было бы засунуть поля в Preview и хранить сразу Preview, но там и так много всего.
@@ -4699,7 +5051,7 @@ class Session:
 							pn = cap_first(pv.player_name), dd = dup_desc, pl = Living.xl_desc(pv.player_level, pv.player_next, short=True),
 							wn = cap_first(pv.weapon_name), wl = Living.xl_desc(pv.weapon_level, pv.weapon_next, short=True),
 							coming = pv.next_level, gold = pv.gold, gm = Game.marks(pv, rspace=True),
-							pad = pad, star = star, okey = f"[order_key = {pv.order_key}] " if display_order_key else "")
+							pad = pad, star = star, okey = f"[order_key = {pv.order_key}, character_uid = {pv.character_uid}] " if display_order_key else "")
 
 			def load_screen_desc_lines(self):
 				return 4 if self.preview else sum(len(exception_msg(e).splitlines()) + 2 for e in self.bad)
@@ -4721,10 +5073,10 @@ class Session:
 		# Возвращает (число новых, число удалённых) НЕУЧТЁННЫХ ЧЕРЕЗ NOTE_ с последнего update (для отладки) или None вместо (0, 0)
 		def update(self):
 			listing = []
-			with suppress(StopIteration):
-				# walk: folder ⇒ dirpath, dirnames, filenames
-				listing.extend(fn for fn in next(os.walk(Game.SAVE_FOLDER))[2] if fn.endswith(Game.SAVE_SUFFIX))
-			listing.sort() # os.walk выдаёт произвольный порядок, для сравнений нужно сделать не произвольный
+			with suppress(OSError): # Есть смысл всё, кроме FileNotFoundError, выбрасывать наружу и как-нибудь обрабатывать в терминах Session, но мне лень.
+			                        # (Пример: если заранее создать ФАЙЛ save, вылетит NotADirectoryError.)
+				listing.extend(entry.name for entry in os.scandir(Game.SAVE_FOLDER) if entry.is_file() and Game.looks_like_save_file(entry.name))
+			listing.sort() # os.scandir выдаёт произвольный порядок, для сравнений нужно сделать не произвольный
 			if listing == self.last_listing: # LIKELY
 				return
 
@@ -4743,7 +5095,7 @@ class Session:
 					item.confirmed = True
 				else:
 					# Обнаружено новое превью. Загружаем!~
-					item = Session.PreviewsList.Item(os.path.join(Game.SAVE_FOLDER, rel_path), rel_path)
+					item = Session.PreviewsList.Item(path.join(Game.SAVE_FOLDER, rel_path), rel_path)
 					try:
 						with open(item.full_save_path, 'rb') as f:
 							item.preview = Game.load_preview(f)
@@ -4791,10 +5143,46 @@ class Session:
 
 		def note_add(self, full_save_path, rel_save_path, preview):
 			assert self.sanitycheck()
+			item = self.fn2it.get(rel_save_path, None)
+			if item:
+				self.warn("add", rel_save_path, False)
+				self.trusted_remove(item)
+			self.trusted_add(full_save_path, rel_save_path, preview)
+			assert self.sanitycheck()
+
+		def note_update(self, full_save_path, rel_save_path, preview, new_full_save_path=None, new_rel_save_path=None):
+			assert self.sanitycheck()
+			item = self.fn2it.get(rel_save_path, None)
+			if item:
+				assert full_save_path == item.full_save_path, f"{full_save_path} <-> {item.full_save_path}"
+				assert rel_save_path == item.rel_save_path, f"{rel_save_path} <-> {item.rel_save_path}"
+				self.trusted_update(item, preview, new_full_save_path, new_rel_save_path)
+			else:
+				self.warn("update", rel_save_path, True)
+				self.trusted_add(new_full_save_path or full_save_path, new_rel_save_path or rel_save_path, preview)
+			assert self.sanitycheck()
+
+		def note_remove(self, rel_path_or_item):
+			assert self.sanitycheck()
+			if isinstance(rel_path_or_item, str):
+				rel_save_path = rel_path_or_item
+				item = self.fn2it.get(rel_save_path, None)
+				if not item: self.warn("remove", rel_save_path, True); return
+			elif isinstance(rel_path_or_item, Session.PreviewsList.Item):
+				item = rel_path_or_item
+				if item.rel_save_path not in self.fn2it: self.warn("remove", item.rel_save_path, True); return
+			else: impossible(item, 'item')
+
+			self.trusted_remove(item)
+			assert self.sanitycheck()
+
+		def warn(self, routine, rel_save_path, expected_to_exist):
+			warn("Сохранени{} \"{}\" {} существовало! ({})".format("я" if expected_to_exist else "е", rel_save_path, "не" if expected_to_exist else "уже", routine))
+
+		def trusted_add(self, full_save_path, rel_save_path, preview):
 			check(full_save_path, "full_save_path?!", rel_save_path, "rel_save_path?!")
 			check(full_save_path, full_save_path.startswith(Game.SAVE_FOLDER), "абсолютный плес")
 			check(rel_save_path, not rel_save_path.startswith(Game.SAVE_FOLDER) and full_save_path.endswith(rel_save_path), "относительный плес")
-			if rel_save_path in self.fn2it: impossible("сохранение {0} уже существует, исп. note_update".format(rel_save_path)) # ух, паранойя замучила
 
 			item = Session.PreviewsList.Item(full_save_path, rel_save_path)
 			item.preview = preview
@@ -4808,15 +5196,12 @@ class Session:
 
 			self.max_order_key = max(self.max_order_key, preview.order_key)
 			self.update_namesakes(of=item.preview.player_name)
-			assert self.sanitycheck()
 
-		def note_update(self, rel_save_path, preview, new_full_save_path=None, new_rel_save_path=None):
-			assert self.sanitycheck()
-			item = self.fn2it[rel_save_path]
-			assert item.rel_save_path == rel_save_path
+		def trusted_update(self, item, preview, new_full_save_path=None, new_rel_save_path=None):
 			if new_rel_save_path is not None:
 				assert new_full_save_path is not None
 				assert new_rel_save_path not in self.fn2it, "сохранение {0} уже существует".format(new_rel_save_path)
+				rel_save_path = item.rel_save_path
 				item.full_save_path, item.rel_save_path = new_full_save_path, new_rel_save_path
 
 				del self.fn2it[rel_save_path]
@@ -4825,19 +5210,14 @@ class Session:
 				del self.last_listing[self.last_listing_index(rel_save_path)]
 				insort_right(self.last_listing, new_rel_save_path)
 			item.preview, item.bad = preview, None
-			assert self.sanitycheck()
 
-		def note_remove(self, item):
-			assert self.sanitycheck()
-			check(item, isinstance(item, (str, Session.PreviewsList.Item)), "item?!")
-			if isinstance(item, str): item = self.fn2it[item]
+		def trusted_remove(self, item):
 			assert item is self.items[item.index], "сбился индекс"
 			del self.fn2it[item.rel_save_path]
 			del self.items[item.index]
 			self.fix_indices(item.index)
 			del self.last_listing[self.last_listing_index(item.rel_save_path)]
 			if item.preview: self.bookkeep_removed_preview(item.preview)
-			assert self.sanitycheck()
 
 		def calculate_max_order_key(self):
 			return max((item.preview.order_key for item in self.items if item.preview), default=-1)
@@ -4855,8 +5235,13 @@ class Session:
 					item.namesake_index = name_to_uid_to_namesake_index[item.preview.player_name][item.preview.character_uid]
 
 		def choose_order_key(self, rel_save_path=None):
-			if not rel_save_path: self.update()
-			return self.fn2it[rel_save_path].preview.order_key if rel_save_path else self.max_order_key + 1
+			item = self.fn2it.get(rel_save_path, None)
+			if item:
+				return item.preview.order_key
+			else:
+				if rel_save_path: self.warn("choose_order_key", rel_save_path, True)
+				self.update()
+				return self.max_order_key + 1
 
 		def last_listing_index(self, rel_save_path):
 			index = bisect_left(self.last_listing, rel_save_path)
@@ -4916,7 +5301,7 @@ class Session:
 	class Globals:
 		def __init__(self):
 			self.recent_fixed_name_proposals = 0
-			self.last_fixed_names_seen       = deque(maxlen=(len(AskName.fixed_names) + 1) // 2)
+			self.last_fixed_names_seen       = deque(maxlen=min(12, (len(AskName.fixed_names) + 1) // 2))
 			self.last_random_name_parts_seen = deque(maxlen=24)
 			self.last_answers = {}
 
@@ -4925,8 +5310,11 @@ class Session:
 			return highlight_variant(pattern, last_answer if last_answer is not None else default)
 
 		def judge_answer(self, id, input, default=1):
-			answer = (0 if 'yes'.startswith(input) else 1) if input else self.last_answers.get(id, default)
-			self.last_answers[id] = answer
+			if input:
+				answer = 0 if 'yes'.startswith(input) else 1
+				self.last_answers[id] = answer
+			else:
+				answer = self.last_answers.get(id, default)
 			return answer
 
 def parse_cmdline():
@@ -4936,9 +5324,10 @@ def parse_cmdline():
 
 def selftest(verbose):
 	poop = io.StringIO()
-	stats = TextTestRunner(stream=poop, verbosity=2 if verbose else 0, tb_locals=True).run(
-		TestSuite(defaultTestLoader.loadTestsFromTestCase(value) for name, value in globals().items()
-			if isinstance(value, type) and issubclass(value, TestCase) and value is not TestCase))
+	stats = TextTestRunner(stream=poop, verbosity=2 if verbose else 0, tb_locals=True).run(TestSuite(
+		defaultTestLoader.loadTestsFromTestCase(value) for name, value in globals().items()
+			if isinstance(value, type) and issubclass(value, TestCase) and value is not TestCase
+			and not (value is DamageEstimationTest and not verbose)))
 
 	if verbose or not stats.wasSuccessful():
 		print(poop.getvalue().rstrip(), end='')
