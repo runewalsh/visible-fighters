@@ -6,7 +6,7 @@ from enum import IntEnum
 from string import Formatter, whitespace, digits
 from time import localtime, mktime, strftime, strptime
 from datetime import date
-from random import random, randrange, uniform, normalvariate, sample
+from random import random, randrange, uniform, normalvariate, sample, shuffle
 from base64 import b85encode, b85decode
 from math import floor, ceil, exp, log, log2, e, pi, erf, fsum
 from numbers import Number
@@ -1429,8 +1429,15 @@ class Beam:
 			else: impossible(self.mode, "mode")
 
 			if isinstance(elem, Beam.Fire):
+				barr = target.find_hex(BarrierHex)
+				if barr: hp_dam *= (1 - barr.fire_resist())
+
 				vuln = next((sp for sp in target.specials if isinstance(sp, FireVulnerability)), None)
 				if vuln: hp_dam *= 1 + max(0, vuln.amount)
+
+			elif isinstance(elem, Beam.Electricity):
+				barr = target.find_hex(BarrierHex)
+				if barr: hp_dam *= (1 - barr.elec_resist())
 
 			if self.mode != 'collect_elems':
 				self.hp += hp_dam
@@ -1473,9 +1480,22 @@ class Beam:
 			self.pierce = pierce
 
 		def do_apply(self, target, ongoing, force=None):
+			if target.preset == 'lightning': return
 			ongoing.add_hp_damage(self, target, self.amount_dis, target.ac * 1.2, self.pierce, force)
 
 		def do_name(self): return "огонь"
+
+	class Electricity(Plain):
+		def __init__(self, amount):
+			super().__init__(amount)
+
+		def do_apply(self, target, ongoing, force=None):
+			if target.preset == 'lightning': return
+			eff_ac = target.ac
+			if not target.find_hex(BarrierHex): eff_ac /= 2
+			ongoing.add_hp_damage(self, target, self.amount_dis, eff_ac, 0, force)
+
+		def do_name(self): return "электричество"
 
 	def __init__(self, master, target, arena, master_imagination=None, target_imagination=None):
 		self.master, self.target, self.arena, self.master_imagination, self.target_imagination = master, target, arena, master_imagination, target_imagination
@@ -1506,7 +1526,7 @@ class Beam:
 		precise_hp = self.post_ac(precise_hp)
 
 		rounded_hp = rand_round(precise_hp)
-		self.target.ouch(rounded_hp, self.master, self.arena, hook=lambda fatal: self.on_hp_damage(rounded_hp, fatal), account=self.on_account())
+		self.target.ouch(rounded_hp, self.master, self.arena, hook=lambda fatal: self.on_hp_damage(rounded_hp, fatal), account=self.on_account(), elems=elements)
 
 	def post_ac(self, hp):
 		multiplier = 1
@@ -1618,6 +1638,11 @@ class Beam:
 			elements = check((elements,) if isinstance(elements, self.Element) else list(filter(None, elements or ())),
 				lambda elements: all(isinstance(elem, self.Element) for elem in elements), "ожидается список Element")
 		return elements
+
+	@staticmethod
+	def damage_paren(hp, mp=None, prefix=" "):
+		desc = " + ".join(filter(None, (hp and str(hp), mp and f"{mp} MP"))) or str(hp)
+		return f"{prefix}({desc})"
 
 class DamageEstimationTest(TestCase):
 	class Beam(Beam):
@@ -1741,12 +1766,13 @@ class Hex:
 	def do_finish(self, reason, arena): pass
 	def do_change_power(self, power, turns): pass
 	def do_merge(self, hex, succeed): pass
+	def do_respite_remove_cost_verb_and_prefix(self, game): return None
 
 	def end(self, reason, arena):
 		self.unapply()
 		self.do_finish(reason, arena)
 
-	def short_desc(self, cmd_prefix="", for_multipad=False, flip=False):
+	def short_desc(self, cmd_prefix="", for_multipad=False, flip=False, with_cmd=False):
 		# desc [cmd]cmd [turns]turns[/turns]
 		# или
 		# turns[/turns] cmd[/cmd] desc[/desc]
@@ -1755,8 +1781,7 @@ class Hex:
 		desc = cap_first(name)
 		if for_multipad and flip: desc += "[/desc]"
 
-		cmd = ("" if not for_multipad or flip else "[cmd]") + "(" + cmd_prefix + self.cmd() + ")" + ("[/cmd]" if for_multipad and flip else "")
-		cmd = None
+		cmd = with_cmd and ("" if not for_multipad or flip else "[cmd]") + "(" + cmd_prefix + self.cmd() + ")" + ("[/cmd]" if for_multipad and flip else "")
 		turns = self.time_based and ("" if not for_multipad or flip else "[turns]") + str(self.turns) + "t" + ("[/turns]" if for_multipad else "")
 		dispelling = None
 		if self.dispell_amount:
@@ -1780,13 +1805,13 @@ class Hex:
 	@classmethod
 	def do_name(cls, instance, flip): raise NotImplementedError("do_name")
 
-	def detail(self): return self.do_detail()
-	def do_detail(self): raise NotImplementedError("do_detail")
+	def detail(self, game): return self.do_detail(game)
+	def do_detail(self, game): raise NotImplementedError("do_detail")
 
 	@classmethod
-	def cmd(self): return self.do_cmd()
+	def cmd(cls): return cls.do_cmd()
 	@classmethod
-	def do_cmd(self): raise NotImplementedError("do_cmd")
+	def do_cmd(cls): raise NotImplementedError("do_cmd")
 
 	def turns_from_power(self, power): return self.do_turns_from_power(power)
 	def do_turns_from_power(self, power): return 10
@@ -1849,11 +1874,11 @@ class RageHex(Hex):
 		m = instance and round(instance.physdam_x, 1)
 		return "ярость" + (f" {m}x" if m is not None and m != 1.5 else "")
 
-	def do_detail(self): return \
+	def do_detail(self, game): return \
 		"Увеличивает физическую атаку (x{:.1g}) и любой получаемый урон (x{:.1g}).".format(self.physdam_x, self.backlash_x)
 
 	@classmethod
-	def do_cmd(self): return 'rage'
+	def do_cmd(cls): return 'rage'
 	def do_turns_from_power(self, power): return clamp(ceil(10*power**0.2), 3, 20)
 
 class RageHexTest(TestCase):
@@ -1873,18 +1898,23 @@ class DeathWordHex(Hex):
 	def do_finish(self, reason, arena):
 		if reason == Hex.TIMEOUT:
 			check(self.master.alive, "мастер мёртв", self.victim.alive, "жертва мертва")
-			self.victim.die(hook=lambda: self.victim.note(lambda sink: sink.youify("{Вы/F} умирает{е/} в исполнение Смертного приговора.", self.victim)))
+			self.victim.die(arena, hook=lambda: self.victim.note(lambda sink: sink.youify("{Вы/F} умирает{е/} в исполнение Смертного приговора.", self.victim)))
 		elif reason == Hex.CANCELLED:
 			self.victim.note(lambda sink: sink.youify("{Вы/F} больше не чувствует{е/} дыхание смерти.", self.victim))
 
 	@classmethod
 	def do_name(cls, instance, flip): return "смертный приговор"
-	def do_detail(self): return \
-		"Смерть через {turns}.\n"\
-		"Вы можете снять этот хекс с помощью Развеивания либо убив мага, наложившего заклинание.".format(turns = plural(self.turns, "{N} ход{/а/ов}"))
+	def do_detail(self, game):
+		msg = "Смерть через {turns}.".format(turns = plural(self.turns, "{N} ход{/а/ов}"))
+		if game and self.victim is game.player:
+			msg += "\nВы можете снять этот хекс с помощью Развеивания либо убив мага, наложившего заклинание."
+		return msg
+
+	def do_respite_remove_cost_verb_and_prefix(self, game):
+		return 40 if self.turns >= 10 else 80, "снять", 'break'
 
 	@classmethod
-	def do_cmd(self): return 'deathword'
+	def do_cmd(cls): return 'deathword'
 	def do_turns_from_power(self, power): return clamp(ceil(16 * power**-0.7), 8, 20)
 	def dispellable(self): return True
 	def merge_behavior(self): return 'strongest'
@@ -1903,8 +1933,10 @@ class Bleeding(Hex):
 
 	@classmethod
 	def do_name(cls, instance, flip): return "кровотечение" + (instance.exclamations() if instance else "")
-	def do_detail(self): return \
-		"-{0:.1g}% HP/ход; уменьшает ловкость (-{1}).".format(self.precise_hp_percentile_decay, round(self.dex_debuff))
+	def do_detail(self, game): return "-{0:.1g}% HP/ход; уменьшает ловкость (-{1}).".format(self.precise_hp_percentile_decay, round(self.dex_debuff))
+
+	def do_respite_remove_cost_verb_and_prefix(self, game):
+		return clamp(round(self.turns * 2), 5, 30), "вылечить", 'cure'
 
 	def do_start(self):
 		self.victim.note(lambda sink: sink.youify("У {вас/F:G} идёт кровь", self.victim) + (self.exclamations() or "."))
@@ -1914,7 +1946,11 @@ class Bleeding(Hex):
 		dmg = floor(self.precise_damage)
 		if dmg > 0:
 			def get_note(sink, fatal):
-				return (sink.youify("{Вы/F} умирает{е/} от потери крови", self.victim) if fatal else sink.youify("У {вас/F:G} идёт кровь", self.victim)) + f" ({dmg})."
+				if fatal:
+					msg = sink.youify("{Вы/F} умирает{е/} от потери крови", self.victim)
+				else:
+					msg = sink.youify("У {вас/F:G} идёт кровь", self.victim)
+				return msg + Beam.damage_paren(dmg) + "."
 			self.victim.ouch(dmg, self.master, arena, hook=lambda fatal: self.victim.note(lambda sink: get_note(sink, fatal)), count_as_attack=False)
 			self.precise_damage -= dmg
 		self.power = self.decay_power(self.power)
@@ -1928,7 +1964,7 @@ class Bleeding(Hex):
 			self.victim.note(lambda sink: sink.youify("{ваше /}кровотечение{/ F:G} усиливается", self.victim) + (self.exclamations(power) or "."))
 
 	@classmethod
-	def do_cmd(self): return 'bleeding'
+	def do_cmd(cls): return 'bleeding'
 
 	def decay_power(self, power): return power * self.POWER_DECAY
 	def do_turns_from_power(self, power): return clamp(ceil(log(0.5 / power, self.POWER_DECAY)), 3, 20)
@@ -1940,7 +1976,7 @@ class Bleeding(Hex):
 class FrailnessHex(Hex):
 	@classmethod
 	def do_name(cls, instance, flip): return "хрупкость"
-	def do_detail(self):
+	def do_detail(self, game):
 		ac_with = self.victim.ac
 		ac_without = self.victim.calculate_ac(Imagination().remove(self))
 		if ac_without > ac_with:
@@ -1969,23 +2005,36 @@ class FrailnessHex(Hex):
 		return max(0, min(ac, max(minimum, ceil(absolute + ac * relative))))
 
 	@classmethod
-	def do_cmd(self): return 'frailness'
+	def do_cmd(cls): return 'frailness'
 	def do_turns_from_power(self, power): return clamp(round(11 * power**0.5), 3, 20)
 	def dispellable(self): return True
 
 class Poison(Hex):
-	@classmethod
-	def do_name(cls, instance, flip): return ("смертельный " if instance and instance.expected_total_damage() >= instance.victim.hp else "") + "яд"
+	def __init__(self, power, *, turns=None):
+		super().__init__(power, turns=turns)
+		self.hp_dam_per_turn = 1
+		self.mp_dam_per_turn = 1
+		self.kind = 'plain'
 
 	@classmethod
-	def do_cmd(self): return 'poison'
-	def do_detail(self):
-		return "-1 HP и MP/ход."
+	def do_name(cls, instance, flip):
+		name = ("смертельный " if instance and instance.expected_total_damage() >= instance.victim.hp else "") + "яд"
+		if instance and instance.kind == 'poison2': name += " II"
+		return name
+
+	@classmethod
+	def do_cmd(cls): return 'poison'
+	def do_detail(self, game):
+		return "-{} HP{}/ход.".format(self.hp_dam_per_turn,
+			" и MP" if self.hp_dam_per_turn == self.mp_dam_per_turn else " и {} MP".format(self.mp_dam_per_turn))
 	def do_turns_from_power(self, power): return clamp(round(4 * power**0.5), 2, 20)
+
+	def do_respite_remove_cost_verb_and_prefix(self, game):
+		return clamp(round(self.turns * (1 + self.hp_dam_per_turn + 2 * self.mp_dam_per_turn)), 10, 50), "вылечить", 'cure'
 
 	def expected_total_damage(self, power=None, turns=None):
 		if turns is None: turns = self.turns
-		return 1 * turns
+		return self.hp_dam_per_turn * turns
 
 	def do_start(self):
 		self.victim.note(lambda sink: sink.youify("{вы/F} отравлен{ы//а/о}", self.victim) + ".")
@@ -2006,13 +2055,15 @@ class Poison(Hex):
 			self.victim.note(get_note)
 
 	def do_tick(self, arena):
-		dam = 1
-		mp_dam = max(0, min(1, self.victim.mp))
+		dam = self.hp_dam_per_turn
+		mp_dam = max(0, min(self.mp_dam_per_turn, self.victim.mp)) if self.victim.has_magic() else 0
 		self.victim.cur_mp -= mp_dam
 		def get_note(sink, fatal):
-			msg = sink.youify("{вы/F:G} умирает{е/} от яда", self.victim) if fatal else sink.youify("Яд течёт по{ вашим/} венам{/ F:G}", self.victim)
-			msg += " (" + str(dam) + (f" + {mp_dam} MP" if mp_dam else "") + ")"
-			return msg + "."
+			if fatal:
+				msg = sink.youify("{вы/F:G} умирает{е/} от яда", self.victim)
+			else:
+				msg = sink.youify("Яд течёт по{ вашим/} венам{/ F:G}", self.victim)
+			return msg + Beam.damage_paren(dam, mp=mp_dam) + "."
 		self.victim.ouch(dam, self.master, arena, hook=lambda fatal: self.victim.note(lambda sink: get_note(sink, fatal)), count_as_attack=False)
 
 class FetterHex(Hex):
@@ -2021,8 +2072,8 @@ class FetterHex(Hex):
 	def do_name(cls, instance, flip): return "оковы"
 
 	@classmethod
-	def do_cmd(self): return 'fetter'
-	def do_detail(self):
+	def do_cmd(cls): return 'fetter'
+	def do_detail(self, game):
 		ev_with = self.victim.ev
 		ev_without = self.victim.calculate_ev(Imagination().remove(self))
 		msg = "Не дают атаковать врукопашную"
@@ -2045,7 +2096,7 @@ class FetterHex(Hex):
 
 	def phys_break_power_dis(self, attacker):
 		pow = 0.5 * (attacker.str / 10) ** 0.7
-		return Distribution.Bell(0, pow, pow * 1.5)
+		return Distribution.Bell(pow * 0.3, pow, pow * 1.5)
 
 	def phys_break(self, attacker, arena):
 		self.dispell(self.phys_break_power_dis(attacker).roll(), magical=False, arena=arena)
@@ -2065,7 +2116,7 @@ class GraspHex(Hex):
 	def do_name(cls, instance, flip): return "захват" + (instance.exclamations() if instance else "")
 
 	@classmethod
-	def do_cmd(self): return 'grasp'
+	def do_cmd(cls): return 'grasp'
 
 	def do_start(self):
 		self.victim.note(lambda sink: sink.youify("{Вы/F} заключает{е/}", self.master) + sink.youify(" {вас/F:A} в свои объятия", self.victim) + ".")
@@ -2082,9 +2133,10 @@ class GraspHex(Hex):
 			def get_note(sink):
 				if hp:
 					if fatal:
-						msg = sink.youify("{Вы/F} окончательно задыхает{есь/ся} в", self.target) + sink.youify("{ ваших/} объятиях{/ F:G}", self.master) + f" ({hp})" + "."
+						msg = sink.youify("{Вы/F}", self.target) + Beam.damage_paren(hp) + sink.youify(" окончательно задыхает{есь/ся} в", self.target)
+						msg += sink.youify("{ ваших/} объятиях{/ F:G}", self.master) + "."
 					else:
-						msg = sink.youify("{Вы/F} душит{е/}", self.master) + sink.youify(" {вас/F:A}.", self.target) + f" ({hp})" + "."
+						msg = sink.youify("{Вы/F} душит{е/}", self.master) + sink.youify(" {вас/F:A}", self.target) + Beam.damage_paren(hp) + "."
 					return msg
 			self.arena.note(get_note)
 
@@ -2101,7 +2153,7 @@ class GraspHex(Hex):
 			if self.dispell_amount: self.dispell_amount = max(0, self.dispell_amount - self.master.str / 200)
 		self.ticks += 1
 
-	def do_detail(self):
+	def do_detail(self, game):
 		ev_with = self.victim.ev
 		ev_without = self.victim.calculate_ev(Imagination().remove(self))
 		msg = "Не даёт атаковать врукопашную."
@@ -2117,7 +2169,7 @@ class GraspHex(Hex):
 
 		if arena:
 			vb = arena.as_battler(self.victim, maybe=True)
-			if vb: vb.cooldowns['grasp_immunity'] = max(1+randrange(2,4), vb.cooldowns['grasp_immunity'])
+			if vb: vb.set_cooldown('grasp_immunity', 1+randrange(2))
 
 	def ev_malus(self, ev, power=None):
 		if power is None: power = self.power
@@ -2125,7 +2177,7 @@ class GraspHex(Hex):
 
 	def phys_break_power_dis(self, attacker):
 		pow = 0.75 * (attacker.str / self.master.str) ** 0.5
-		return Distribution.Bell(0, pow, pow * 1.5)
+		return Distribution.Bell(pow * 0.3, pow, pow * 1.5)
 
 	def phys_break(self, attacker, arena):
 		self.struggled_on_this_turn = True
@@ -2140,8 +2192,8 @@ class SlimeHex(Hex):
 	def do_name(cls, instance, flip): return "слизь" + (instance.exclamations() if instance else "")
 
 	@classmethod
-	def do_cmd(self): return 'slime'
-	def do_detail(self):
+	def do_cmd(cls): return 'slime'
+	def do_detail(self, game):
 		imag = Imagination().remove(self)
 		v = self.victim
 		str_wo, int_wo, dex_wo, spd_wo = v.calculate_str(imag), v.calculate_int(imag), v.calculate_dex(imag), v.calculate_spd(imag)
@@ -2153,6 +2205,9 @@ class SlimeHex(Hex):
 			dex_with < dex_wo and "-{} DEX".format(dex_wo - dex_with)]
 		return (", ".join(filter(None, parts)) or "Не оказывает эффекта") + "."
 	def do_turns_from_power(self, power): return clamp(round(9 * power**0.5), 2, 20)
+
+	def do_respite_remove_cost_verb_and_prefix(self, game):
+		return clamp(round(self.turns * self.power), 10, 50), "снять", 'clean'
 
 	def do_start(self):
 		self.victim.note(lambda sink: sink.youify("{вы/F} покрывает{есь/ся} слизью", self.victim) + ".")
@@ -2190,11 +2245,15 @@ class ParasiteHex(Hex):
 	def do_name(cls, instance, flip): return "паразит"
 
 	@classmethod
-	def do_cmd(self): return 'parasite'
-	def do_detail(self):
-		return ("Внутри вас растут личинки с парализующими укусами. Следующая через {}.\n"
-			"Вы можете заражать других.").format(plural(self.turns, "{N} ход{/а/ов}"))
-	def do_turns_from_power(self, power): return 12
+	def do_cmd(cls): return 'parasite'
+	def do_detail(self, game):
+		is_you = game and self.victim == game.player
+		msg = "Внутри {} растут личинки с парализующими укусами.".format("вас" if is_you else self.victim.name.genitive)
+		if is_you: msg += "\nВы можете заражать других."
+	def do_turns_from_power(self, power): return 13
+
+	def do_respite_remove_cost_verb_and_prefix(self, game):
+		return 300, "вылечить", 'cure'
 
 	def do_start(self):
 		self.victim.add_special(Impregnation(self))
@@ -2205,21 +2264,21 @@ class ParasiteHex(Hex):
 
 		if reason in (self.TIMEOUT, self.CANCELLED):
 			def get_note(sink):
-				return sink.youify("{Вы/F} больше не инкубирует{е/} личинок.", self.victim)
+				return sink.youify("Личинки внутри {вас/F:G} погибают.", self.victim)
 			self.victim.note(get_note)
 
 	def do_tick(self, arena):
 		if self.ran_out:
 			Impregnation.give_birth(self.victim, arena)
-			self.turns = randrange(10, 15)
+			self.turns = randrange(12, 16)
 
 class ParalysisHex(Hex):
 	@classmethod
 	def do_name(cls, instance, flip): return "паралич"
 
 	@classmethod
-	def do_cmd(self): return 'paralysis'
-	def do_detail(self):
+	def do_cmd(cls): return 'paralysis'
+	def do_detail(self, game):
 		return "{} вы не сможете сделать ничего.".format("На следующем ходу" if self.turns == 1 else plural(self.turns, "Следующие {N} ход{/а/ов}"))
 	def do_turns_from_power(self, power): return clamp(round(power ** 0.5), 1, 3)
 
@@ -2233,12 +2292,61 @@ class ParalysisHex(Hex):
 
 			if arena:
 				vb = arena.as_battler(self.victim, maybe=True)
-				if vb: vb.cooldowns['paralysis_immunity'] = max(1+randrange(2,4), vb.cooldowns['paralysis_immunity'])
+				if vb: vb.set_cooldown('paralysis_immunity', 2+randrange(2))
+
+class SilenceHex(Hex):
+	@classmethod
+	def do_name(cls, instance, flip): return "тишина"
+
+	@classmethod
+	def do_cmd(cls): return 'silence'
+	def do_detail(self, game): return "Не даёт читать заклинания."
+	def do_turns_from_power(self, power): return clamp(rand_round(3.8 * power ** 0.4), 2, 12)
+	def merge_behavior(self): return 'strongest'
+
+	def do_respite_remove_cost_verb_and_prefix(self, game):
+		return clamp(round(self.turns * 6), 10, 50), "снять", 'break'
+
+	def do_start(self):
+		self.victim.note(lambda sink: sink.youify("{Вас/F:A} окружает мёртвая тишина.", self.victim))
+
+	def do_change_power(self, power, turns):
+		if power >= self.power:
+			self.victim.note(lambda sink: sink.youify("Тишина вокруг {вас/F:G} набирает силу.", self.victim))
+
+	def do_finish(self, reason, arena):
+		if reason in (self.TIMEOUT, self.CANCELLED):
+			self.victim.note(lambda sink: sink.youify("Тишина вокруг {вас/F:G} рассеивается.", self.victim))
+
+class BarrierHex(Hex):
+	@classmethod
+	def do_name(cls, instance, flip): return "барьер"
+	@classmethod
+	def do_cmd(cls): return 'barrier'
+	def victim_usefulness(self): return 'good'
+	def merge_behavior(self): return 'strongest'
+	def do_detail(self, game): return "Щит против физического (+{} AC), и элементального (rFire+, rElec+) урона.".format(self.ac_bonus())
+	def dispellable(self): return True
+
+	def do_start(self):
+		self.victim.note(lambda sink: sink.youify("Вокруг {вас/F:G} формируется защитный барьер.", self.victim))
+
+	def do_finish(self, reason, arena):
+		if reason in (self.CANCELLED, self.TIMEOUT):
+			if arena:
+				arena.note(lambda sink: sink.youify("Барьер вокруг {вас/F:G} рассеивается.", self.victim))
+				vb = arena.as_battler(self.victim, maybe=True)
+				if vb: vb.set_cooldown('barrier', 2)
+
+	def do_turns_from_power(self, power): return clamp(round(8 * power ** 0.5), 4, 16)
+	def ac_bonus(self): return max(3, round(9 * self.power ** 0.5))
+	def fire_resist(self): return 1 - (1 + self.power) ** -0.5
+	def elec_resist(self): return self.fire_resist()
 
 # По инстансу на каждое запомненное заклинание у каждого бойца.
 class Spell:
 	LIST_ORDER = 0
-	TARGETING = 'single' # 'single', 'mass', 'dispell-like'
+	TARGETING = 'single' # 'single', 'mass', 'n/a', 'dispell-like', 'self'
 	@classmethod
 	def name(cls, mode): return cls.do_name(mode)
 	@classmethod
@@ -2254,11 +2362,13 @@ class Spell:
 
 	def validate_target(self, master, target, arena):
 		if self.TARGETING == 'single':
-			assert isinstance(target, Fighter)
-		elif self.TARGETING == 'mass':
-			assert not target
+			assert isinstance(target, Fighter), self
+		elif self.TARGETING == 'mass' or self.TARGETING == 'n/a':
+			assert not target, self
 		elif self.TARGETING == 'dispell-like':
-			assert Dispell.valid_target(master, target, arena)
+			assert Dispell.valid_target(master, target, arena), self
+		elif self.TARGETING == 'self':
+			assert master == target, self
 		else: impossible(self.TARGETING, "targeting")
 
 	def cast(self, master, target, arena):
@@ -2430,7 +2540,7 @@ class StrUpgrade(StatUpgrade):
 	statname, statgender = Noun.parse("{сила:f}", return_gender=True)
 
 	@classmethod
-	def do_gold_cost(cls, target): return 120 + 30 * cls.count(target)
+	def do_gold_cost(cls, target): return 120 + 40 * cls.count(target)
 
 	def do_apply_message(self, target): return "Ваши мускулы наливаются силой."
 	def do_revert_message(self, target): return "Ваши мускулы слабеют."
@@ -2440,7 +2550,7 @@ class IntUpgrade(StatUpgrade):
 	statname, statgender = Noun.parse("{интеллект}", return_gender=True)
 
 	@classmethod
-	def do_gold_cost(cls, target): return 135 + 35 * cls.count(target)
+	def do_gold_cost(cls, target): return 130 + 45 * cls.count(target)
 
 	def do_apply_message(self, target): return "Ваш ум заостряется."
 	def do_revert_message(self, target): return "Вы начинаете хуже соображать."
@@ -2450,7 +2560,7 @@ class DexUpgrade(StatUpgrade):
 	statname, statgender = Noun.parse("{ловкость:f}", return_gender=True)
 
 	@classmethod
-	def do_gold_cost(cls, target): return 70 + 15 * cls.count(target)
+	def do_gold_cost(cls, target): return 70 + 30 * cls.count(target)
 
 	def do_apply_message(self, target): return "Ваши рефлексы улучшаются."
 	def do_revert_message(self, target): return "Вы чувствуете себя {0}.".format(target.gender.ize("неповоротлив{ым/ой}"))
@@ -2481,12 +2591,15 @@ class Firestorm(Spell):
 		def on_hp_damage(self, hp, fatal):
 			def get_note(sink):
 				if hp:
-					if fatal:
-						msg = sink.youify("{Вы/F}", self.target) + f" ({hp})" + sink.youify(" превращает{есь/ся} в кучку пепла.", self.target)
+					if fatal and self.target.flavored_death:
+						msg = sink.youify("{Вы/F}", self.target) + Beam.damage_paren(hp) + sink.youify(" превращает{есь/ся} в кучку пепла.", self.target)
+					elif hp >= 5:
+						msg = ((self.target.gender.ize("опаленн{ый/ая/ое}, ") if self.target == sink.you else "") +
+							sink.youify("{вы/}{/опаленн}{/ый/ая/ое}{/ F} корчит{есь/ся} от боли", self.target) + Beam.damage_paren(hp) + ".")
 					else:
-						msg = sink.youify("{вы/}{/опаленн}{/ый/ая/ое}{/ F} корчит{есь/ся} от боли", self.target) + f" ({hp})."
+						msg = sink.youify("{вы/F} слегка опален{ы/}", self.target) + Beam.damage_paren(hp) + "."
 				else:
-					msg = sink.youify("Огонь не наносит {вам/F:D} заметного урона", self.target) + f" ({hp})" + "."
+					msg = sink.youify("Огонь не наносит {вам/F:D} заметного урона", self.target) + Beam.damage_paren(hp) + "."
 				return msg
 			self.arena.note(get_note)
 
@@ -2570,10 +2683,13 @@ class Dispell(Spell):
 			usefulness = target.victim_usefulness()
 			if usefulness == 'mixed': return True
 
-			are_enemies = arena.are_enemies(master, target.victim)
-			if usefulness == 'bad': return not are_enemies
-			elif usefulness == 'good': return are_enemies
-			else: impossible(usefulness, "usefullness")
+			if arena:
+				are_enemies = arena.are_enemies(master, target.victim)
+				if usefulness == 'bad': return not are_enemies
+				elif usefulness == 'good': return are_enemies
+				else: impossible(usefulness, "usefullness")
+
+			return True
 
 		elif isinstance(target, Fighter):
 			return target.dispellable and arena.are_enemies(master, target)
@@ -2598,8 +2714,11 @@ class Dispell(Spell):
 			score_power = power * target.victim.mhp * 0.1
 			usefulness = target.victim_usefulness()
 			k = 0.5 if usefulness == 'mixed' else 1
-			if usefulness == 'bad' and master != target.master or usefulness == 'mixed': target.master.count_an_attack(score_power * k, master, arena, 'magical', 1 * k)
-			if usefulness == 'good' and master != target.victim or usefulness == 'mixed': target.victim.count_an_attack(score_power * k, master, arena, 'magical', 1 * k)
+			if arena:
+				if usefulness == 'bad' and master != target.master or usefulness == 'mixed':
+					target.master.count_an_attack(score_power * k, master, arena, 'magical', 1 * k)
+				if usefulness == 'good' and master != target.victim or usefulness == 'mixed':
+					target.victim.count_an_attack(score_power * k, master, arena, 'magical', 1 * k)
 
 			target.dispell(power, hook=hook, arena=arena)
 		elif isinstance(target, Fighter):
@@ -2608,7 +2727,7 @@ class Dispell(Spell):
 			def hook(fatal):
 				def get_note(sink):
 					msg = sink.youify("{вы/F} " + ("залатали" if fatal else "латает{е/}") + " дыру в реальности", master)
-					msg += sink.youify(" вокруг {вас/F:G}", target) + f" ({hp})" + "."
+					msg += sink.youify(" вокруг {вас/F:G}", target) + Beam.damage_paren(hp) + "."
 					return msg
 				master.note(get_note)
 			target.ouch(hp, master, arena, hook=hook, account='magical')
@@ -2616,7 +2735,7 @@ class Dispell(Spell):
 
 	def dispell_creature_amount_dis(self, master, target, arena):
 		check(target, isinstance(target, Fighter) and target.dispellable, "target")
-		base = (master.int + 0.1 * target.mhp) * master.int / (master.int + target.int)
+		base = (master.int + (1 - master.int ** -0.15) * target.mhp) * master.int / (master.int + 0.3 * target.int)
 		return Distribution.Bell(0.5 * base, base, 1.5 * base)
 
 	def dispell_hex_amount_dis(self, master, hex, arena):
@@ -2634,7 +2753,7 @@ class Dispell(Spell):
 	def do_help(self, master, target, arena, game, mode):
 		if isinstance(target, Fighter):
 			msg = "Нанести ~{} ед. урона призванно{} {}.".format(
-				self.dispell_creature_amount_dis(master, target, arena).estimate_avg(), target.gender.ize("{му/й}"), target.name.dative)
+				round(self.dispell_creature_amount_dis(master, target, arena).estimate_avg(), 1), target.gender.ize("{му/й}"), target.name.dative)
 		elif isinstance(target, Hex):
 			msg = "Развеять"
 			if target.victim == game.player: msg += " с себя"
@@ -2645,21 +2764,21 @@ class Dispell(Spell):
 		return msg
 
 	@staticmethod
-	def human_estimate_turns_left(hex, decay_dis):
+	def human_estimate_turns_left(hex, decay_dis, respite=False):
 		avg_turns, max_turns = tuple(max(1, ceil((hex.power - hex.dispell_amount) / sample)) for sample in (decay_dis.estimate_avg(), decay_dis.estimate_min()))
 		if avg_turns == max_turns:
-			if avg_turns == 1: msg = "Вы уверены в успехе."
-			else: msg = "Вам понадобится " + plural(avg_turns, "{N} ход{/а/ов}") + "."
+			if avg_turns == 1:
+				msg = "Вы уверены в успехе{}.".format(" развеивания" if respite else "")
+			else:
+				msg = ("Для развеивания в" if respite else "В") + "ам понадобится " + plural(avg_turns, "{N} " + ("попыт{ка/ки/ок}" if respite else "ход{/а/ов}")) + "."
 		else:
-			msg = "Вам понадобится ~{}, максимум {}.".format(avg_turns, plural(max_turns, "{N} ход{/а/ов}"))
+			msg = ("Для развеивания в" if respite else "В") + "ам понадобится ~{}, максимум {}.".format(
+				avg_turns, plural(max_turns, "{N} " + ("попыт{ка/ки/ок}" if respite else "ход{/а/ов}")))
 		return msg
 
-class HexSpell(Spell):
-	hex_class = Hex
+class ResistibleSpell(Spell):
 	def do_power(self, master, target, master_imagination=None, target_imagination=None): return master.calculate_int(master_imagination) / 10
 	def do_mr(self, master, target, master_imagination=None, target_imagination=None): return target.calculate_int(target_imagination) / 20
-	@classmethod
-	def do_cmd(cls): return cls.hex_class.do_cmd()
 
 	def save_throw(self, master, target, master_imagination=None, target_imagination=None):
 		return (self.do_power(master, target, master_imagination, target_imagination), self.do_mr(master, target, master_imagination, target_imagination),
@@ -2678,18 +2797,6 @@ class HexSpell(Spell):
 		pow *= (1 - self.resistance(master, target, master_imagination, target_imagination))
 		return pow
 
-	def do_cast(self, master, target, arena):
-		self.do_prologue(master, target, arena)
-		dodged, chance, roll = arena.dodge(*self.save_throw(master, target))
-		if dodged:
-			self.do_dodged(master, target, arena, chance, roll)
-		else:
-			power = self.power(master, target)
-			if master != target:
-				score_power = power * target.mhp * 0.1
-				target.count_an_attack(score_power, master, arena, 'magical', 1)
-			self.hex_class(power).apply(master, target, arena)
-
 	def do_prologue(self, master, target, arena): pass
 	def do_dodged(self, master, target, arena, chance, roll):
 		arena.note(lambda sink: sink.youify("{Вы/F} не поддаёт{есь/ся}.", target))
@@ -2701,6 +2808,28 @@ class HexSpell(Spell):
 		return (
 			"Шанс: {:.0%}.".format(self.chance(master, target, arena)) if mode == 'attack' else
 			"Сопротивление: {:.0%}.".format(self.resistance(master, target)) if mode == 'entrance' else impossible(mode, "mode"))
+
+	def do_cast(self, master, target, arena):
+		self.do_prologue(master, target, arena)
+		dodged, chance, roll = arena.dodge(*self.save_throw(master, target))
+		if dodged:
+			self.do_dodged(master, target, arena, chance, roll)
+		else:
+			power = self.power(master, target)
+			self.do_apply(power, master, target, arena)
+
+	def do_apply(self, power, master, target, arena): raise NotImplementedError("do_apply")
+
+class HexSpell(ResistibleSpell):
+	hex_class = Hex
+	@classmethod
+	def do_cmd(cls): return cls.hex_class.do_cmd()
+
+	def do_apply(self, power, master, target, arena):
+		if master != target:
+			score_power = power * target.mhp * 0.1
+			target.count_an_attack(score_power, master, arena, 'magical', 1)
+		self.hex_class(power).apply(master, target, arena)
 
 class Frailness(HexSpell):
 	LIST_ORDER = 2
@@ -2748,6 +2877,252 @@ class Fetter(HexSpell):
 		def get_note(sink):
 			return sink.youify("{Вы/F} проворачивает{е/} руку в", master) + sink.youify("{ вашу/} сторону{/ F:G}", target) + "."
 		arena.note(get_note)
+
+class SummonGhost(Spell):
+	TARGETING = 'n/a'
+	@classmethod
+	def do_name(cls, mode):
+		return "призыв призрака" if mode == 'long' else "приз. призрака" if mode == 'short' else "призрак" if mode == 'veryshort' else impossible(mode, "mode")
+
+	@classmethod
+	def do_cmd(cls): return 'ghost'
+
+	def do_help(self, master, target, arena, game, mode):
+		return "Призывает призрака на сторону заклинателя."
+
+	def do_mp_cost(self): return 5
+
+	GHOST_SUBTYPES = 'magic', 'bread', 'pudding', 'war', 'gun'
+	def do_cast(self, master, target, arena):
+		master_b = arena.as_battler(master)
+		existing = set()
+		for b in arena.squads[master_b.squad_id].members:
+			if b.fighter.preset == 'ghost':
+				existing.add(b.fighter.props['ghost_subtype'])
+		subtype = choose(self.GHOST_SUBTYPES, lambda item, _index: 0 if item in existing else 1, default=None)
+		if subtype is None: subtype = choose(self.GHOST_SUBTYPES)
+
+		ghost = Fighter()
+		ghost.preset = 'ghost'
+		ghost.props['ghost_subtype'] = subtype
+		ghost.summoned = True
+		ghost.name, ghost.gender = (
+			Noun.parse("{волшебный призрак:a}", return_gender=True) if subtype == 'magic' else
+			Noun.parse("{призрак:a} хлеба", return_gender=True) if subtype == 'bread' else
+			Noun.parse("{призрак:a} пудинга", return_gender=True) if subtype == 'pudding' else
+			Noun.parse("{призрак:a} войны", return_gender=True) if subtype == 'war' else
+			Noun.parse("{призрак:a} пушки", return_gender=True) if subtype == 'gun' else impossible(subtype, "subtype"))
+
+		with ghost.save_relative_vitals():
+			ghost.xl = max(1, rand_round(master.xl * (1 - (1 + master.int ** 0.5) ** -0.5)))
+			base = master.int * (2/3)
+			ghost.base_str = max(5, rand_round(base if subtype in ('pudding') else base / 2 if subtype in ('magic', 'gun') else base / 1.5))
+			ghost.base_int = max(5, rand_round(base if subtype in ('magic',) else base / 2 if subtype in ('pudding',) else base / 1.5))
+			ghost.base_dex = max(5, rand_round(base if subtype in ('gun', 'war') else base / 2 if subtype in ('pudding',) else base / 1.5))
+			ghost.base_spd = 100 + 2 * master.int if subtype in ('magic', 'gun') else 80 + master.int if subtype in ('pudding',) else 100 + master.int
+		ghost.set_unarmed(BareHands())
+		arena.add(ghost, master_b.squad_id, UniversalAI(), shortcut_hint="Ghost")
+		arena.note(lambda sink: sink.youify("{вы/F} шепчет{е/} заклинание, и рядом с {вами/ним/ней}", master) + " материализуется " + ghost.name + ".")
+
+class DrainLife(Spell):
+	@classmethod
+	def do_name(cls, mode):
+		return "похищение жизни" if mode == 'long' else "похищ. жизни" if mode == 'short' else "вамп." if mode == 'veryshort' else impossible(mode, "mode")
+
+	@classmethod
+	def do_cmd(cls): return 'lifedrain'
+
+	def do_help(self, master, target, arena, game, mode):
+		dis = self.drain_dis(master, target)
+		master_has_summons = any(isinstance(sp, SummonGhost) for sp in master.spells)
+		return "Высасывает ~{} (макс. {}) ед. жизни противника и {}.".format(
+			round(dis.estimate_avg(), 1), ceil(dis.estimate_max()),
+			"{} её часть {}".format(*("распределяет", "между заклинателем и его друзьями") if master_has_summons else ("передаёт", "заклинателю")))
+
+	def drain_dis(self, master, target, master_imagination=None, target_imagination=None):
+		master_int, target_int = master.calculate_int(master_imagination), target.calculate_int(target_imagination)
+		base = master_int ** 0.7 * master_int / (master_int + 0.5 * target_int)
+		return Distribution.Bell(0.5 * base, base, 1.2 * base)
+
+	def do_mp_cost(self): return 3
+
+	def do_cast(self, master, target, arena):
+		amount = min(max(1, round(self.drain_dis(master, target).roll())), target.hp)
+		heal = rand_round(amount / 2)
+		heal_desc = ""
+		if heal:
+			heal_targets = [arena.as_battler(ally) for ally in arena.allies(master, include_itself=True) if ally.hp < ally.mhp]
+			shuffle(heal_targets)
+			healed = dispense([ally_b.fighter.hp for ally_b in heal_targets], heal, [ally_b.fighter.mhp for ally_b in heal_targets])
+			heal_desc = ", ".join("{}+{}".format(ally.shortcut, rhp - ally.fighter.hp) for ally, rhp in zip(heal_targets, healed) if rhp > ally.fighter.hp)
+
+		def hook(fatal):
+			def get_note(sink):
+				if fatal:
+					msg = sink.youify("{Вы/F} высасывает{е/} из", master) + sink.youify(" {вас/F:G} остатки жизни", target)
+				else:
+					msg = sink.youify("{Вы/F} высасывает{е/} из", master) + sink.youify(" {вас/F:G} жизнь", target)
+				return msg + " ({})".format(", ".join(filter(None, (str(amount), heal_desc)))) + "."
+			arena.note(get_note)
+
+		target.ouch(amount, master, arena, hook=hook, account='magical')
+		if heal:
+			for i, ally in enumerate(heal_targets):
+				if healed[i] > ally.fighter.hp: ally.fighter.cur_hp = healed[i]
+
+class Barrier(Spell):
+	TARGETING = 'self'
+	@classmethod
+	def do_name(cls, mode):
+		return "барьер" if mode == 'long' or mode == 'short' or mode == 'veryshort' else impossible(mode, "mode")
+
+	@classmethod
+	def do_cmd(cls): return 'barrier'
+
+	def do_mp_cost(self): return 4
+	def power(self, master): return master.int / 10
+
+	def do_help(self, master, target, arena, game, mode):
+		return BarrierHex(self.power(master)).detail(game)
+
+	def do_cast(self, master, target, arena):
+		arena.note(lambda sink: sink.youify("{Вы/F} проворачивает{есь/ся} на месте.", target))
+		BarrierHex(self.power(master)).apply(master, target, arena)
+
+class BallLightning(Spell):
+	TARGETING = 'n/a'
+
+	@classmethod
+	def do_name(cls, mode):
+		return "шаровая молния" if mode == 'long' else "шар. молния" if mode == 'short' else "шар. молн." if mode == 'veryshort' else impossible(mode, "mode")
+
+	@classmethod
+	def do_cmd(cls): return 'b.lightning'
+
+	def do_help(self, master, target, arena, game, mode):
+		est = self.beam(master, game.player, arena).estimate_damage()
+		elem_parts = ", ".join(est.describe_elem_parts())
+		return ("Призывает шаровую молнию, взрыв которой наносит урон (~{}, макс. {}{}) всем окружающим.\n"
+			"Молния наносит меньший урон или не наносит урон вовсе при преждевременном уничтожении.").format(
+				round(est.avg, 1), round(est.max, 1), ", " + elem_parts if elem_parts else "")
+
+	def do_mp_cost(self): return 5
+
+	def do_cast(self, master, target, arena):
+		lightning = Fighter()
+		lightning.preset = 'lightning'
+		lightning.summoned = True
+		def exists(postfix):
+			return any(b.fighter.preset == 'lightning' and b.fighter.props.get('lightning_postfix', None) == postfix for b in arena.battlers)
+		postfix = None if not exists(None) else choose((postfix for postfix in map(chr, range(ord('A'), ord('Z'))) if not exists(postfix)), default=None)
+
+		lightning.name, lightning.gender = Noun.parse("{шаровая молния:af}", return_gender=True)
+		if postfix:
+			lightning.name += f" {postfix}"
+			lightning.props['lightning_postfix'] = postfix
+		lightning.props['master'] = master
+		lightning.props['remaining_life'] = lightning.props['orig_life'] = 3 + randrange(3)
+
+		with lightning.save_relative_vitals():
+			lightning.xl = 1
+			lightning.base_mhp = 1
+			lightning.base_ev = 18
+			lightning.base_spd = 150
+			lightning.add_special(BallLightningTimeoutAndExplodeOnDeathOrTouch())
+		arena.add(lightning, arena.as_battler(master).squad_id, BallLightningAI(), shortcut_hint="Lightning")
+		arena.note(lambda sink: sink.youify("{вы/F} трёт{е/} эбонитовую палочку о шерсть, и рядом с {вами/ним/ней}", master) + " всплывает " + lightning.name + ".")
+
+	@classmethod
+	def beam(cls, master, target, arena, power_mod=1):
+		return cls.Beam(master, target, arena, power_mod=power_mod)
+
+	class Beam(Beam):
+		def __init__(self, master, target, arena, master_imagination=None, target_imagination=None, power_mod=1):
+			super().__init__(master, target, arena, master_imagination, target_imagination)
+			self.power_mod = power_mod
+
+		def on_elements(self):
+			pow = self.power_mod * max(3, 4.5 + signed_pow(self.master_int(), 0.65))
+			return Beam.Electricity((pow/1.8, pow/1.2, pow*1.2))
+
+		def on_hp_damage(self, hp, fatal):
+			def get_note(sink):
+				if hp:
+					msg = sink.youify("{Вы/F} получает{е/}", self.target)
+					spark_obj = " разряд тока"
+					if fatal: msg += " смертельный"
+					elif hp <= 3: msg += " лёгкий"; spark_obj = " удар током"
+					msg += spark_obj
+				else:
+					msg = sink.youify("{Вы/F} остаёт{есь/ся} невредим{ы//а/о}", self.target)
+				return msg + Beam.damage_paren(hp) + "."
+			self.target.note(get_note)
+
+	@classmethod
+	def act_explode(cls, lightning, arena):
+		assert lightning.dead
+		fizzled, rem, orig = False, *(lightning.props[prop_name] for prop_name in ('remaining_life', 'orig_life'))
+		if rem > 0:
+			if random() < 0.9 * (rem / orig) ** 1.5:
+				arena.note(lambda sink: sink.youify("{вы/F} тает{е/} в воздухе.", lightning))
+				fizzled = True
+
+		if not fizzled:
+			power_mod = 0.1 + 0.9 * (1 - rem / orig)
+			arena.note(lambda sink: sink.youify("{вы/F}" + (" взрывает{есь/ся}!" if power_mod > 0.5 else " вспыхивает."), lightning))
+			for victim_b in arena.battlers:
+				if not victim_b.fighter.alive: continue # пропустит также саму эту молнию
+				cls.beam(lightning.props['master'], victim_b.fighter, arena, power_mod).launch()
+
+class Chronosphere(Spell):
+	TARGETING = 'n/a'
+	@classmethod
+	def do_name(cls, mode):
+		return "хроносфера" if mode == 'long' else "хроносф." if mode == 'short' else "хроно" if mode == 'veryshort' else impossible(mode, "mode")
+
+	@classmethod
+	def do_cmd(cls): return 'chronosphere'
+
+	def do_mp_cost(self): return 9
+
+	def do_help(self, master, target, arena, game, mode):
+		return "Останавливает время для всех, кроме заклинателя, на {}.".format(plural(self.turns(master), "{N} ход{/а/ов}"))
+
+	def turns(self, master):
+		return 4
+
+	def do_cast(self, master, target, arena):
+		arena.note(lambda sink: sink.youify("{Вы/F} запускает{е/} руку в ткань 3+1-пространства.", master))
+		arena.stop_time(self.turns(master))
+
+class DrainXP(ResistibleSpell):
+	@classmethod
+	def do_name(cls, mode):
+		return "высасывание опыта" if mode == 'long' else "высасывание" if mode == 'short' else "высас." if mode == 'veryshort' else impossible(mode, "mode")
+
+	@classmethod
+	def do_cmd(cls): return 'drain'
+
+	def do_mp_cost(self): return 3
+
+	def do_help(self, master, target, arena, game, mode):
+		return ("Это может снизить ваш уровень. Если вы задействовали больше очков умений, чем позволяет новый уровень, "
+			"вы будете терять апгрейды в порядке, обратном порядку приобретения.\n" + super().do_help(master, target, arena, game, mode))
+
+
+	def do_dodged(self, master, target, arena, chance, roll):
+		arena.note(lambda sink: sink.youify("{Вы/F} пытает{есь/ся} высосать", master) + sink.youify(" {вас/F:A}, но {вы/он/она/оно} не поддаёт{есь/ся}.", target))
+
+	def do_apply(self, power, master, target, arena):
+		amount = bell(power / 20, power / 12, power / 8)
+		xl, _xp = target.drain_xp(amount, relative=True, emulate=True)
+		def get_note(sink):
+			arena.note(lambda sink: sink.youify("{Вы/F} высасывает", master) + sink.youify(" {вас/F:A} через трубочку", target) + f" (-{amount:.0%}).")
+		target.note(get_note)
+
+		if xl != target.xl:
+			target.note(lambda sink: sink.youify("{Вы/F} теперь уровня", target) + f" {xl}!")
+		target.drain_xp(amount, relative=True)
 
 class SpellUpgrade(FighterUpgrade):
 	SPELL_CLASS = Spell
@@ -2891,7 +3266,7 @@ class Ammunition:
 	def shop_name(cls, target): return cls.do_name(None, target, 'battle')
 	def respite_name(self, target): return self.do_name(self, target, 'respite')
 	@classmethod
-	def noun_name(cls, shorter=False):  return cls.do_name(None, None, 'noun_shorter' if shorter else 'noun')
+	def noun_name(cls, shorter=False): return cls.do_name(None, None, 'noun_shorter' if shorter else 'noun')
 
 	@classmethod
 	# mode = 'battle', 'respite', 'noun'
@@ -2930,7 +3305,7 @@ class IncendiaryAmmunition(Ammunition):
 		return (
 			"зажиг. патроны" + (cls.name_up(target, 0) or "") if mode == 'battle' else
 			f"заж.{instance.human_times(instance.times())}" if mode == 'respite' else
-			Noun.parse("{зажигательные патроны}") if mode in ('noun', 'noun_shorter') else impossible(mode, 'mode'))
+			Noun.parse("{зажигательный патрон}") if mode in ('noun', 'noun_shorter') else impossible(mode, 'mode'))
 
 	@classmethod
 	def do_name_up(cls, target, up):
@@ -2943,24 +3318,25 @@ class IncendiaryAmmunition(Ammunition):
 
 class SilenceAmmunition(Ammunition):
 	LIST_ORDER = 1
-	MAX_CHARGES = 3
+	MAX_CHARGES = 4
 
-	def do_recharge_cost(self): return 50
+	def do_recharge_cost(self): return 60
 	@classmethod
 	def do_name(cls, instance, target, mode):
 		return (
 			"тишина" if mode == 'battle' else
 			"тиш." if mode == 'respite' else
-			Noun.parse("{патроны} тишины") if mode in ('noun', 'noun_shorter') else impossible(mode, 'mode'))
+			Noun.parse("{патрон} тишины") if mode in ('noun', 'noun_shorter') else impossible(mode, 'mode'))
 
 	@classmethod
 	def do_cmd(cls): return 'silence'
 
-	def do_to_hit_bonus(self): return 16
+	def do_to_hit_bonus(self): return 18
 
 class TimestopAmmunition(Ammunition):
 	LIST_ORDER = 2
-	MAX_CHARGES = 2
+	MAX_CHARGES = 3
+	turns = 4
 
 	def do_recharge_cost(self): return 80
 	@classmethod
@@ -2968,12 +3344,12 @@ class TimestopAmmunition(Ammunition):
 		return (
 			"ост. времени" if mode == 'battle' else
 			"врем." if mode == 'respite' else
-			Noun.parse("{патроны} ост" + ("." if mode == 'noun_shorter' else "ановки") + " времени") if mode in ('noun', 'noun_shorter') else impossible(mode, 'mode'))
+			Noun.parse("{патрон} ост" + ("." if mode == 'noun_shorter' else "ановки") + " времени") if mode in ('noun', 'noun_shorter') else impossible(mode, 'mode'))
 
 	@classmethod
 	def do_cmd(cls): return 'timestop'
 
-	def do_to_hit_bonus(self): return 35
+	def do_to_hit_bonus(self): return 30
 
 class AmmunitionUpgrade(WeaponUpgrade):
 	AMMUNITION_CLASS = Ammunition
@@ -3045,7 +3421,7 @@ class SilenceAmmunitionUpgrade(AmmunitionUpgrade):
 	def do_ap_cost(cls, target): return 2
 
 	@classmethod
-	def do_gold_cost(cls, target): return 200
+	def do_gold_cost(cls, target): return 140
 
 	@classmethod
 	def genitive_ammunition_module_name(cls): return "патронов тишины"
@@ -3053,10 +3429,10 @@ class SilenceAmmunitionUpgrade(AmmunitionUpgrade):
 class TimestopAmmunitionUpgrade(AmmunitionUpgrade):
 	AMMUNITION_CLASS = TimestopAmmunition
 	@classmethod
-	def do_ap_cost(cls, target): return 3
+	def do_ap_cost(cls, target): return 2
 
 	@classmethod
-	def do_gold_cost(cls, target): return 250
+	def do_gold_cost(cls, target): return 200
 
 	@classmethod
 	def genitive_ammunition_module_name(cls): return "патронов остановки времени"
@@ -3085,8 +3461,9 @@ class Special(FighterAttribute):
 	def detail(self, game): return self.do_detail(game)
 	def do_detail(self, game): raise NotImplementedError("do_detail")
 
-	def do_ouch(self, arena): pass
+	def do_ouch(self, arena, elems): pass
 	def do_tick(self, arena): pass
+	def do_die(self, arena): pass
 
 	def should_display(self): return self.do_should_display()
 	def do_should_display(self): return True
@@ -3102,7 +3479,7 @@ class RageOnLowHP(Special):
 		return "{}, {} до {} HP, приходит в ярость и начинает наносить и получать повышенный урон.".format(
 			self.fighter.name.cap_first(), self.fighter.gender.ize("ранен{ый/ая}"), self.hp_threshold())
 
-	def do_ouch(self, arena):
+	def do_ouch(self, arena, elems):
 		if not self.proceed and self.fighter.hp <= self.hp_threshold():
 			self.rage().apply(self.fighter, arena=arena)
 			self.proceed = True
@@ -3126,7 +3503,8 @@ class Thievery(Special):
 
 	def chance(self, victim, arena): return Arena.hit_chance(arena, *self.save_throw(victim))
 	def save_throw(self, victim): return self.fighter.dex, victim.dex, Arena.Cumulative(self.fighter, victim, 'steal')
-	def max_amount(self, victim, game): return max(10, round((50 + 0.1 * max(0, game.gold)) * (self.fighter.dex / max(1, self.fighter.dex + victim.dex))))
+	def max_amount(self, victim, game):
+		return max(10, round((3 * self.fighter.dex + 0.2 * max(0, game.gold)) * (self.fighter.dex / max(1, self.fighter.dex + victim.dex))))
 	def roll(self, victim, game): return max(0, min(game.gold, randrange(self.max_amount(victim, game))))
 
 	def act_steal_gold(self, target_b, arena):
@@ -3149,26 +3527,26 @@ class Thievery(Special):
 			self.fighter.note(lambda sink: sink.youify("{вам/F:D} не удаётся отобрать золото у", self.fighter) + sink.youify(" {вас/F:G}", target_b.fighter) + ".")
 
 class Grasp(Special):
-	def save_throw(self, master, target, master_imagination=None, target_imagination=None):
-		return (master.calculate_dex(master_imagination), 0.5 * target.calculate_dex(target_imagination))
+	def save_throw(self, target, master_imagination=None, target_imagination=None):
+		return (5 + self.fighter.calculate_dex(master_imagination), 0.5 * target.calculate_dex(target_imagination))
 
 	def do_name(self): return "удушение"
 	def do_detail(self, game):
 		return "{} может крепко обвить противника, ограничив возможность вести рукопашный бой и нанося урон каждый ход.\nУклонение: {:.0%}.".format(
-			self.fighter.name.cap_first(), 1 - Arena.hit_chance(None, *self.save_throw(self.fighter, game.player)))
+			self.fighter.name.cap_first(), 1 - Arena.hit_chance(None, *self.save_throw(game.player)))
 
-	def act_grasp(self, master, target, arena):
-		dodged, chance, roll = arena.dodge(*self.save_throw(master, target))
+	def act_grasp(self, target, arena):
+		dodged, chance, roll = arena.dodge(*self.save_throw(target))
 		if dodged:
 			def get_note(sink):
-				msg = sink.youify("{Вы/F} пытает{есь/ся} схватить", master)
+				msg = sink.youify("{Вы/F} пытает{есь/ся} схватить", self.fighter)
 				msg += sink.youify(" {вас/F:A}, но {вы/он/она/оно}", target)
 				msg += UnarmedAttack.Beam.how_dodged(chance, roll, barely="в последний момент")
 				msg += sink.youify(" уворачивает{есь/ся}", target)
 				return msg + "."
 			target.note(get_note)
 		else:
-			GraspHex(min(1, master.str / 10)).apply(master, target, arena)
+			GraspHex(min(1, self.fighter.str / 10)).apply(self.fighter, target, arena)
 
 class Impregnation(Special):
 	def __init__(self, hex=None):
@@ -3177,18 +3555,18 @@ class Impregnation(Special):
 
 	def do_name(self): return "паразиты"
 	def do_detail(self, game): return "{} может отложить яйца внутрь захваченного противника.".format(self.fighter.name.cap_first())
-	def save_throw(self, master, target): return master.dex, 0.5 * target.dex, Arena.Cumulative(master, target, 'impregnate')
+	def save_throw(self, target): return 5 + self.fighter.dex, 0.5 * target.dex, Arena.Cumulative(self.fighter, target, 'impregnate')
 
-	def act_impregnate(self, master, target, arena):
+	def act_impregnate(self, target, arena):
 		assert target.can_be_impregnated
-		dodged, _chance, _roll = arena.dodge(*self.save_throw(master, target))
+		dodged, _chance, _roll = arena.dodge(*self.save_throw(target))
 		def something(sink):
-			return "личинок" if sink.you == master else "что-то"
+			return "личинок" if sink.you == self.fighter else "что-то"
 
 		if dodged:
 			def get_note(sink):
-				msg = sink.youify("{Вы/F} пытает{есь/ся}", master)
-				if master.is_mammal:
+				msg = sink.youify("{Вы/F} пытает{есь/ся}", self.fighter)
+				if self.fighter.is_mammal:
 					msg += " поцеловать" + sink.youify(" {вас/F:A}, но {вы/он/она/оно} уворачивает{есь/ся}.", target)
 				else:
 					msg += " затолкнуть " + something(sink) + sink.youify(" внутрь {вас/F:G}, но {вы/он/она/оно} уворачивает{есь/ся}.", target)
@@ -3196,19 +3574,19 @@ class Impregnation(Special):
 			arena.note(get_note)
 		else:
 			def get_note(sink):
-				if master.is_mammal:
-					msg = sink.youify("{Вы/F} целует{е/}", master) + sink.youify(" {вас/F:A}", target)
-					msg += sink.youify(" и оставляет{е/}", master) + (" что-то" if sink.you == master else "") + sink.youify(" внутри {вас/него/неё}", target)
-					msg += (" личинок" if sink.you == master else "")
+				if self.fighter.is_mammal:
+					msg = sink.youify("{Вы/F} целует{е/}", self.fighter) + sink.youify(" {вас/F:A}", target)
+					msg += sink.youify(" и оставляет{е/}", self.fighter) + (" что-то" if sink.you == self.fighter else "") + sink.youify(" внутри {вас/него/неё}", target)
+					msg += (" личинок" if sink.you == self.fighter else "")
 				else:
-					msg = sink.youify("{Вам/F:D} удаётся протолкнуть", master) + " " + something(sink)
+					msg = sink.youify("{Вам/F:D} удаётся протолкнуть", self.fighter) + " " + something(sink)
 					msg += sink.youify(" внутрь {вас/F:G}", target)
 				msg += "."
-				if target == sink.you: msg += " Ай, он{} шевел{}тся!".format(*("и", "я") if sink.you == master else ("о", "и"))
+				if target == sink.you: msg += " Ай, он{} шевел{}тся!".format(*("и", "я") if sink.you == self.fighter else ("о", "и"))
 				return msg
 			arena.note(get_note)
 
-			ParasiteHex(1).apply(master, target, arena)
+			ParasiteHex(1).apply(self.fighter, target, arena)
 
 	@staticmethod
 	def give_birth(mother, arena):
@@ -3226,8 +3604,8 @@ class Impregnation(Special):
 			larva.summoned = True
 			larva.dispellable = False
 			with larva.save_relative_vitals():
-				larva.base_str = max(6, rand_round(uniform(mother.base_str / 2, mother.base_str / 3)))
-				larva.base_dex = max(6, rand_round(uniform(mother.base_dex / 2, mother.base_dex / 3)))
+				larva.base_str = max(5, rand_round(uniform(mother.base_str / 4, mother.base_str / 3)))
+				larva.base_dex = max(5, rand_round(uniform(mother.base_dex / 4, mother.base_dex / 3)))
 			larva.set_unarmed(ParalyzingStinger())
 			arena.add(larva, squad_id, UniversalAI(), shortcut_hint="Larva", force_delay=mother_b.initiative + uniform(0.1, 0.9) * arena.delay_base(larva))
 
@@ -3235,18 +3613,65 @@ class Impregnation(Special):
 			msg = sink.youify("Личинка вырывается из{ вашего/} тела{/ F:G}", mother)
 			if space:
 				you_b = arena.as_battler(sink.you, maybe=True)
-				if you_b:
-					msg += " и встаёт"
-					if arena.squads_are_enemies(squad_id, you_b.squad_id):
-						msg += " против вас"
-					else:
-						msg += " с вашей стороны"
+				if you_b: msg += " и встаёт " + ("против вас" if arena.squads_are_enemies(squad_id, you_b.squad_id) else "с вашей стороны")
 			else:
 				msg += " и уползает восвояси"
 			return msg + "."
 		arena.note(get_note)
 
 		Bleeding(bell(0.4, 0.7, 1.2)).apply(mother, arena=arena)
+
+class Marauding(Special):
+	def do_name(self): return "мародёр"
+	def do_detail(self, game):
+		return "{} может отнять оружие противника.\nУклонение: {:.0%}.".format(
+			self.fighter.name.cap_first(), 1 - Arena.hit_chance(None, *self.save_throw(game.player)))
+	def save_throw(self, victim): return self.fighter.dex, victim.dex, Arena.Cumulative(self.fighter, victim, 'steal_wpn')
+
+	def act_maraud(self, target, arena):
+		assert target.weapon and 'weapon_stolen_from' not in self.fighter.props
+		dodged, chance, roll = arena.dodge(*self.save_throw(target))
+		if dodged:
+			def get_note(sink):
+				msg = sink.youify("{Вы/F}", target) + UnarmedAttack.Beam.how_dodged(chance, roll, barely="в последний момент") + sink.youify(" отдёргивает{е/}", target)
+				msg += target.weapon.gender.ize(" сво{й/ю/ё}") if target == sink.you else target.gender.ize(" {его/её}")
+				msg += " " + target.weapon.name.accusative + sink.youify(" от {вас/F:G}", self.fighter)
+				return msg + "."
+			target.note(get_note)
+		else:
+			def get_note(sink):
+				msg = sink.youify("{Вы/F} отбирает{е/}", self.fighter)
+				msg += target.weapon.gender.ize(" ваш{/у/е}") if target == sink.you else target.gender.ize(" {его/её}")
+				msg += " " + target.weapon.name.accusative
+				return msg + "!"
+			target.note(get_note)
+			self.fighter.props['weapon_stolen_from'] = target
+			weapon = target.weapon
+			target.set_weapon(None)
+			self.fighter.set_weapon(weapon)
+
+class PsionicThievery(Special):
+	def do_name(self): return "псионик"
+	def do_detail(self, game):
+		return "{} может заставить противника забыть заклинание.\nСопротивление: {:.0%}.".format(
+			self.fighter.name.cap_first(), 1 - Arena.hit_chance(None, *self.save_throw(game.player)))
+	def save_throw(self, victim): return self.fighter.int, victim.int, Arena.Cumulative(self.fighter, victim, 'steal_spl')
+
+	def act_psi_steal(self, target, arena):
+		assert any(isinstance(up, SpellUpgrade) for up in target.upgrades)
+		dodged, chance, roll = arena.dodge(*self.save_throw(target))
+		if dodged:
+			def get_note(sink):
+				msg = sink.youify("{Вы/F}", target) + UnarmedAttack.Beam.how_dodged(chance, roll) + sink.youify(" выдерживает{е/}", target)
+				msg += sink.youify("{ вашу/} пси-атаку{/ F:G}", self.fighter)
+				return msg + "."
+			target.note(get_note)
+		else:
+			def get_note(sink):
+				return sink.youify("{Вы/F} шарит{е/} в", self.fighter) + sink.youify("{ вашей/} памяти{/ F:G}...", target)
+			target.note(get_note)
+			up = choose(up for up in target.upgrades if isinstance(up, SpellUpgrade))
+			up.revert(target)
 
 class FireVulnerability(Special):
 	def __init__(self, amount=0.2):
@@ -3256,6 +3681,20 @@ class FireVulnerability(Special):
 	def do_name(self): return "Уязвимость к огню"
 	def do_detail(self, game):
 		return "{} получает на {:.0%} больший урон от огня.".format(self.fighter.name.cap_first(), self.amount)
+
+class BallLightningTimeoutAndExplodeOnDeathOrTouch(Special):
+	def do_ouch(self, arena, elems):
+		if elems and all(isinstance(elem, (Beam.Fire, Beam.Electricity)) for elem in elems): return
+		self.fighter.die(arena)
+
+	def do_tick(self, arena):
+		remaining_life = self.fighter.props['remaining_life'] = self.fighter.props['remaining_life'] - 1
+		if remaining_life <= 0: self.fighter.die(arena)
+
+	def do_die(self, arena):
+		BallLightning.act_explode(self.fighter, arena)
+	def do_name(self): return "Самоуничтожение"
+	def do_detail(self, game): return BallLightning.beam(self.fighter.props['master'], game.player, None).human_stats()
 
 class UnarmedAttack(FighterAttribute):
 	class Beam(Beam):
@@ -3307,8 +3746,8 @@ class BareHands(UnarmedAttack):
 					msg += sink.youify(" наносит{е/} удар", self.master) + sink.youify(" по {вам/F:D}" if not fatal else "", self.target)
 				else:
 					msg += sink.youify(" касает{есь/ся} ", self.master) + sink.youify("{вас/F:G}", self.target)
-				msg += self.note_bare_hands(sink) + f" ({hp})"
-				if fatal:
+				msg += self.note_bare_hands(sink) + Beam.damage_paren(hp)
+				if fatal and self.target.flavored_death:
 					verb = "умирает{е/}" if self.target.is_mammal else "рассыпает{есь/ся}" if self.target.is_bone else "погибает{е/}"
 					msg += sink.youify(", и {вы/F} " + verb, self.target)
 				return msg + "."
@@ -3344,7 +3783,7 @@ class Teeth(UnarmedAttack):
 				else:
 					msg += sink.youify(" скользит{е/} зубами ", self.master)
 					msg += sink.youify("сам{и//а/о} по себе" if self.master == self.target else "по {вам/F:D}", self.target)
-				msg += f" ({hp})"
+				msg += Beam.damage_paren(hp)
 				if fatal: msg += sink.youify(" и умирает{е/}" if self.master == self.target else ", и {вы/F} умирает{е/}", self.target)
 				return msg + "."
 			self.arena.note(get_note)
@@ -3367,8 +3806,7 @@ class Spines(UnarmedAttack):
 					msg += sink.youify(" выворачивает{е/}", self.master) + sink.youify("{ ваши/} кишки{/ F:G} наружу", self.target)
 				else:
 					msg += sink.youify(" колет{е/}" if hp else " скользит{е/} по", self.master) + sink.youify((" {вас/F:A}" if hp else " {вам/F:D}") + " шипами", self.target)
-				msg += f" ({hp})."
-				return msg
+				return msg + Beam.damage_paren(hp) + "."
 			self.arena.note(get_note)
 
 			if hp and not fatal and random() < hp / (hp + 1):
@@ -3399,8 +3837,8 @@ class TeethAndClaws(UnarmedAttack):
 				def get_note(sink):
 					msg = sink.youify("{Вы/F}" + (" вспарывает{е/}" if fatal else " царапает{е/}" if hp else " скользит{е/}"), self.master)
 					msg += sink.youify("{ ваше/} брюхо{/ F:G}" if fatal else " {вас/F:A}" if hp else " по {вам/F:D}", self.target)
-					msg += " когтями" + (", и" if fatal else "") + f" ({hp})" + (sink.youify(" {вы/F} умирает{е/}", self.target) if fatal else "") + "."
-					return msg
+					msg += " когтями" + (", и" if fatal else "") + Beam.damage_paren(hp) + (sink.youify(" {вы/F} умирает{е/}", self.target) if fatal else "")
+					return msg + "."
 				self.arena.note(get_note)
 			else: impossible(self.flavor, "flavor")
 
@@ -3416,17 +3854,17 @@ class SlimyTouch(UnarmedAttack):
 			return self.Physical(tuple(x * base for x in (0, 1, 2)))
 
 		def on_hp_damage(self, hp, fatal):
-			slimify = not fatal and random() < (hp + 1) / (hp + 5)
+			slimify = not fatal and random() < 1 - (2 + hp) ** -1
 			def get_note(sink):
 				if fatal:
-					msg = sink.youify("{Вы/F} ломает{е/}", self.master) + sink.youify("{ вам/} позвоночник{/ F:D}", self.target) + f" ({hp})" + "."
+					msg = sink.youify("{Вы/F} ломает{е/}", self.master) + sink.youify("{ вам/} позвоночник{/ F:D}", self.target)
 				else:
-					msg = sink.youify("{Вы/F}" + (" обвивает{е/}" if slimify else " хлещет{е/}"), self.master) + sink.youify(" {вас/F:A}", self.target) + f" ({hp})" + "."
-				return msg
+					msg = sink.youify("{Вы/F}" + (" обвивает{е/}" if slimify else " хлещет{е/}"), self.master) + sink.youify(" {вас/F:A}", self.target)
+				return msg + Beam.damage_paren(hp) + "."
 			self.arena.note(get_note)
 
 			if slimify:
-				SlimeHex(bell(0.5, 1, 1.5) * (self.master.str ** 0.5) / 5).apply(self.master, self.target, self.arena)
+				SlimeHex(bell(0.5, 1, 1.5) * ((self.master.str ** 0.5 + 0.5 * hp) / 6)).apply(self.master, self.target, self.arena)
 
 	def do_name(self): return "слизь"
 	def do_detail(self, game):
@@ -3442,18 +3880,18 @@ class ParalyzingStinger(UnarmedAttack):
 			return self.Physical(tuple(x * (1 + (self.master_str() - 10)/(5 if self.master_str() > 10 else 10)) for x in (0, 1, 2)), pierce=1)
 
 		def on_hp_damage(self, hp, fatal):
-			paralyze = (hp and not fatal and 'paralysis_immunity' not in self.arena.as_battler(self.target).cooldowns and
-				not any(isinstance(hex, ParalysisHex) for hex in self.target.hexes) and
+			paralyze = (hp and not fatal and self.target.flavored_death and 'paralysis_immunity' not in self.arena.as_battler(self.target).cooldowns and
+				not self.target.find_hex(ParalysisHex) and
 				random() < hp / (hp + 1.5))
 
 			def get_note(sink):
 				if hp:
 					msg = sink.youify("{Вы/F}" + (" парализует{е/}" if paralyze else " жалит{е/}"), self.master) + sink.youify(" {вас/F:A}", self.target)
-					if fatal: msg += ", и"
+					if fatal and self.target.flavored_death: msg += ", и"
 				else:
 					msg = sink.youify("{ваше /}жало{/ F:G} проходит вскользь", self.master)
-				msg += f" ({hp})"
-				if fatal: msg += sink.youify(" {вы/он/она/оно} умирает{е/} от анафилаксии", self.target)
+				msg += Beam.damage_paren(hp)
+				if fatal and self.target.flavored_death: msg += sink.youify(" {вы/он/она/оно} умирает{е/} от анафилаксии", self.target)
 				return msg + "."
 			self.arena.note(get_note)
 
@@ -3475,7 +3913,7 @@ class MessageSink:
 			self.extra_props = {}
 
 	def receive_note(self, msg):
-		msg = check(msg(self) if callable(msg) else msg, lambda msg: not msg or isinstance(msg, str), "должна быть строка")
+		msg = check(msg if isinstance(msg, str) or not callable(msg) else msg(self), lambda msg: not msg or isinstance(msg, str), "должна быть строка")
 		if msg: self.on_note(cap_first(msg))
 
 	# {вы/не вы}, {вы/F:падеж}, {вы/не вы мужского рода/не вы женского рода...}
@@ -3667,7 +4105,7 @@ class Living:
 # fighter.calculate_mhp(imagination)
 # — рассчитает максимальный HP с одним дополнительным апгрейдом силы.
 #
-# frailness = next(hex for hex in fighter.hexes if isinstance(hex, FrailnessHex))
+# frailness = fighter.find_hex(FrailnessHex)
 # imagination.remove(frailness)
 # fighter.calculate_ac(imagination)
 # — рассчитает AC без действующей хрупкости.
@@ -3772,11 +4210,12 @@ class Fighter(Living, MessageBroadcaster):
 
 	def calculate_ac(self, imagination=None):
 		ac = self.base_ac
-		frailness = None
+		frailness = barrier = None
 		for hex in Imagination.hexes(imagination, self):
-			if isinstance(hex, FrailnessHex):
-				frailness = hex
+			if isinstance(hex, FrailnessHex): frailness = hex
+			elif isinstance(hex, BarrierHex): barrier = hex
 		if frailness: ac -= frailness.ac_malus(ac)
+		if barrier: ac += barrier.ac_bonus()
 		return ac
 
 	def calculate_ev(self, imagination=None):
@@ -3829,16 +4268,17 @@ class Fighter(Living, MessageBroadcaster):
 			elif account == 'ranged': add_from(master, 0.4); add_from(master.weapon, 0.6)
 			else: impossible(account, "account")
 
-			master_b = arena.as_battler(master, maybe=True)
-			perf = master_b and master_b.game and master_b.game.performance
-			if perf:
-				if account == 'master': pass
-				elif account in ('unarmed', 'melee', 'ranged', 'magical'): add_to(getattr(perf, account))
-				else: impossible(account, "account")
+			if master.alive:
+				master_b = arena.as_battler(master, maybe=True)
+				perf = master_b and master_b.game and master_b.game.performance
+				if perf:
+					if account == 'master': pass
+					elif account in ('unarmed', 'melee', 'ranged', 'magical'): add_to(getattr(perf, account))
+					else: impossible(account, "account")
 		else:
 			add_from(master) # засчитается «мистеру None»
 
-	def ouch(self, hp_dam, master, arena, *, hook=lambda fatal: None, account='master', count_as_attack=True):
+	def ouch(self, hp_dam, master, arena, *, hook=lambda fatal: None, account='master', count_as_attack=True, elems=None):
 		check(hp_dam >= 0, "hp_dam?!")
 		assert account in ('master', 'unarmed', 'melee', 'ranged', 'magical')
 		if self.dead: return
@@ -3848,13 +4288,13 @@ class Fighter(Living, MessageBroadcaster):
 
 		self.cur_hp -= hp_dam
 		if self.cur_hp <= 0:
-			self.die(hook=lambda: hook(True))
+			self.die(arena, hook=lambda: hook(True))
 		else:
 			hook(False)
 			for sp in self.specials:
-				sp.do_ouch(arena)
+				sp.do_ouch(arena, elems)
 
-	def die(self, *, hook=lambda: None):
+	def die(self, arena, *, hook=lambda: None):
 		check(not self.dead, "not dead")
 		self.alive = False
 		if hook: hook()
@@ -3869,6 +4309,9 @@ class Fighter(Living, MessageBroadcaster):
 				if hex.ran_out: continue
 				if isinstance(hex, (DeathWordHex, GraspHex)):
 					hex.cancel()
+
+		for sp in self.specials:
+			sp.do_die(arena)
 
 	def end_turn(self, arena):
 		with self.lock_hexes() as hexes:
@@ -3936,6 +4379,10 @@ class Fighter(Living, MessageBroadcaster):
 	def remove_special(self, special):
 		self.specials.remove(special)
 		special.reset_fighter(self)
+	
+	def find_hex(self, hex_type):
+		assert issubclass(hex_type, Hex), hex_type
+		return next((hex for hex in self.hexes if isinstance(hex, hex_type)), None)
 
 	def set_unarmed(self, unarmed):
 		if self.unarmed: self.unarmed.reset_fighter(self)
@@ -3957,7 +4404,7 @@ class Fighter(Living, MessageBroadcaster):
 	def hp_bar(self, flip=False): return self.generic_bar("HP", self.hp, self.mhp, flip)
 	def mp_bar(self, flip=False): return self.generic_bar("MP", self.mp, self.mmp, flip)
 
-	def silenced(self): return False
+	def silenced(self): return self.find_hex(SilenceHex)
 
 	def can_cast(self, spell=None):
 		return not self.silenced() and (not spell or self.enough_mp(spell.mp_cost()))
@@ -4024,9 +4471,11 @@ class Fighter(Living, MessageBroadcaster):
 		self.props['dispellable'] = value
 
 	transient = property(lambda self: self.summoned)
-	is_mammal = property(lambda self: self.preset in ('player', 'rat', 'bear', 'thief', 'executioner'))
+	is_mammal = property(lambda self: self.preset in ('player', 'rat', 'bear', 'thief', 'executioner', 'necromancer', 'magius'))
 	is_plant  = property(lambda self: self.preset in ('flower',))
-	is_bone   = property(lambda self: self.preset in ())
+	is_bone   = property(lambda self: self.preset in ('death',))
+	is_ghost  = property(lambda self: self.preset in ('ghost'))
+	flavored_death = property(lambda self: self.preset not in ('lightning',))
 	can_be_impregnated = property(lambda self: not self.transient and not next((sp for sp in self.specials if isinstance(sp, Impregnation)), None))
 
 	def __getstate__(self):
@@ -4055,21 +4504,20 @@ del _to_props
 
 class Weapon(Living):
 	ap_limit = property(lambda self: 1 + (self.xl - 1))
-	LEVEL_CAP = 5
+	LEVEL_CAP = 6
 
 	def do_xp_for_levelup(self, xl):
-		return 1.25 * super().do_xp_for_levelup(xl)
+		return super().do_xp_for_levelup(xl)
 
 	def __init__(self):
 		Living.__init__(self)
 		self.owner = None
 		self.ammos = []
-		self.melee_precision = 0
 
 	def __getstate__(self):
 		return {k: v for k, v in super().__getstate__().items() if k not in (
 			'owner', # резолвится Fighter
-			) and not (k in ('ammos', 'melee_precision') and not v)}
+			) and not (k in ('ammos') and not v)}
 
 	def __setstate__(self, state):
 		super().__setstate__(state)
@@ -4088,7 +4536,7 @@ class Weapon(Living):
 			self.arena.note(get_note)
 
 	class MeleeBeam(Beam):
-		def on_tohit(self): return 8 + self.weapon.melee_precision + self.master_dex()
+		def on_tohit(self): return 16 + self.master_dex()
 		def on_account(self): return 'melee'
 	ShotBeam = None
 
@@ -4099,10 +4547,10 @@ class Weapon(Living):
 
 		def on_tohit(self):
 			return (
-				4 + 0.5 * self.master_dex() + (self.ammo.do_to_hit_bonus() if self.ammo else 0) if self.mode == 'single' else
+				5 + 0.65 * self.master_dex() + (self.ammo.do_to_hit_bonus() if self.ammo else 0) if self.mode == 'single' else
 
 				# На данный момент точность очереди равна точности одиночного выстрела. Штраф — только отсутствие cumulative.
-				4 + 0.5 * self.master_dex() if self.mode == 'rapid' else impossible(self.mode, 'mode'))
+				5 + 0.65 * self.master_dex() if self.mode == 'rapid' else impossible(self.mode, 'mode'))
 		def on_account(self): return 'ranged'
 		def can(self, mode): return self.mode == 'single'
 
@@ -4117,6 +4565,7 @@ class Weapon(Living):
 
 	def shoot(self, target, arena, ammo):
 		if ammo: ammo.draw_charge()
+		if isinstance(ammo, TimestopAmmunition): self.owner.note("*Зайн!*")
 		self.shot_beam(target, arena, ammo).launch()
 
 	def rapid(self, targets, arena, ammo):
@@ -4128,29 +4577,32 @@ class Weapon(Living):
 
 class MachineGun(Weapon):
 	class MeleeBeam(Weapon.MeleeBeam):
+		def on_tohit(self):
+			return 8 + self.master_dex()
+
 		def on_elements(self):
 			return self.Physical(tuple(x * (1 + (self.master_str() - 10)/(7 if self.master_str() > 10 else 10)) for x in (0, 1.5, 3)), pierce=0.2)
-
-		def on_cumulative(self): return 'mg-kick'
 
 		def on_hp_damage(self, hp, fatal):
 			def get_note(sink):
 				msg = sink.youify("{Вы/F} ударяет{е/} ", self.master) + sink.youify("{вас/F:A}", self.target) + " прикладом"
-				if fatal:
+				if fatal and self.target.flavored_death:
 					if self.target.is_mammal:
 						roll = randrange(2)
-						if roll == 0: msg += f" и ({hp})" + sink.youify(" проламывает{е/} ", self.master) + sink.youify("{вам/ему/ей}", self.target) + " череп"
-						else: msg += f" и ({hp})" + sink.youify(" ломает{е/} ", self.master) + sink.youify("{вам/ему/ей}", self.target) + " позвоночник"
+						if roll == 0:
+							msg += " и" + Beam.damage_paren(hp) + sink.youify(" проламывает{е/} ", self.master) + sink.youify("{вам/ему/ей}", self.target) + " череп"
+						else:
+							msg += " и" + Beam.damage_paren(hp) + sink.youify(" ломает{е/} ", self.master) + sink.youify("{вам/ему/ей}", self.target) + " позвоночник"
 					elif self.target.is_plant:
-						msg += f" и ({hp})" + sink.youify(" сбивает{е/} ", self.master) + sink.youify("{вас/его/её}", self.target) + " с корней"
+						msg += " и" + Beam.damage_paren(hp) + sink.youify(" сбивает{е/} ", self.master) + sink.youify("{вас/его/её}", self.target) + " с корней"
 					elif self.target.is_bone:
-						msg += f", и ({hp}) " + sink.youify("{вы/он/она/оно} рассыпает{есь/ся}", self.target)
+						msg += ", и" + Beam.damage_paren(hp) + sink.youify(" {вы/он/она/оно} рассыпает{есь/ся}", self.target)
 					else:
-						msg += f", и ({hp}) " + sink.youify("{вы/он/она/оно} погибает{е/}", self.target)
+						msg += ", и" + Beam.damage_paren(hp) + sink.youify(" {вы/он/она/оно} погибает{е/}", self.target)
 				elif hp:
-					msg += f" ({hp})"
+					msg += Beam.damage_paren(hp)
 				else:
-					msg += f", но ({hp}) не " + sink.youify("наносит{е/}", self.master) + " вреда"
+					msg += ", но" + Beam.damage_paren(hp) + " не" + sink.youify("наносит{е/}", self.master) + " вреда"
 				return msg + "."
 			self.arena.note(get_note)
 
@@ -4160,16 +4612,20 @@ class MachineGun(Weapon):
 
 			if isinstance(self.ammo, IncendiaryAmmunition):
 				times = self.ammo.times()
-				elements.append(self.Fire((0, 1.5 * times, 4.5 * times), pierce=0.7))
+				elements.append(self.Fire((0, 1.6 * times, 4.5 * times), pierce=0.7))
 			return elements
 
 		def on_cumulative(self):
-			return self.mode == 'single' and Arena.Cumulative(self.master, self.target, 'mg-shot' + ('-' + self.ammo.cmd() if self.ammo else ''), 0.6)
+			return self.mode == 'single' and Arena.Cumulative(self.master, self.target, 'shot' + ('-' + self.ammo.cmd() if self.ammo else ''), 0.6)
 
 		def on_hp_damage(self, hp, fatal):
 			def get_note(sink):
 				msg = sink.youify("{Вы/F} попадает{е/}", self.master) + " в" + sink.youify(" {вас/F:A}", self.target)
-				if fatal:
+				master_b = self.arena.as_battler(self.master, maybe=True)
+				if not (master_b and master_b.game):
+					msg += " " + "пулей"
+
+				if fatal and self.target.flavored_death:
 					def heap_of(what, gender=Gender.UNKNOWN, plural=False, heap_adj=None):
 						what_or_heap_adj = ""
 						if isinstance(self.ammo, IncendiaryAmmunition):
@@ -4183,51 +4639,77 @@ class MachineGun(Weapon):
 							(" " + what if what else ""))
 
 					msg += (
-						f" и ({hp}) " + sink.youify("превращает{е/}", self.master) + sink.youify(" {вас/его/её}", self.target) +
+						" и" + Beam.damage_paren(hp) + sink.youify(" превращает{е/}", self.master) + sink.youify(" {вас/его/её}", self.target) +
 						" в " + (
 							heap_of("мяса", Gender.NEUTER) if self.target.is_mammal else
 							heap_of("листьев", plural=True) if self.target.is_plant else
 							heap_of("костей", plural=True) if self.target.is_bone else
 							heap_of(None, heap_adj="бесформенную")) + ".")
 				elif hp:
-					msg += f" ({hp})."
+					msg += Beam.damage_paren(hp) + "."
 				else:
-					msg += f", но ({hp}) не " + sink.youify("наносит{е/}", self.master) + " вреда."
+					msg += ", но" + Beam.damage_paren(hp) + sink.youify(" не наносит{е/} вреда", self.master) + "."
 				return msg
 			self.arena.note(get_note)
 
-class PoisonedDagger(Weapon):
-	def __init__(self):
+			if not fatal:
+				if isinstance(self.ammo, SilenceAmmunition):
+					if self.target.silenced():
+						self.arena.note("Тишина не срабатывает.")
+					else:
+						SilenceHex(bell(0.8, 1, 1.2)).apply(self.master, self.target, arena=self.arena)
+				elif isinstance(self.ammo, TimestopAmmunition):
+					self.arena.stop_time(self.ammo.turns)
+
+class Dagger(Weapon):
+	def __init__(self, coating=None):
 		super().__init__()
-		self.name = Noun.parse("{отравленный клинок}")
+		self.coating = check(coating, coating in (None, 'poison', 'poison2', 'runes'), "coating")
+		self.name = Noun.parse("{{{}{}{}}}".format(
+			"отравленный " if coating in ('poison', 'poison2') else "ритуальный " if coating == 'runes' else "",
+			"клинок" if coating == 'runes' else "кинжал",
+			" II" if coating == 'poison2' else ""))
 
 	class MeleeBeam(Weapon.MeleeBeam):
 		def on_elements(self):
-			return self.Physical(tuple(x * max(0.1, 1 + (self.master_str() - 10)/10) for x in (0, 1.5, 3)), pierce=0.5)
-
-		def on_cumulative(self): return 'pd-kick'
+			denom = 5 if self.weapon.coating not in ('poison', 'poison2', 'runes') and self.master_str() > 10 else 10
+			return self.Physical(tuple(x * max(0.1, 1 + (self.master_str() - 10)/denom) for x in (0, 1.4, 3)), pierce=0.5)
 
 		def on_hp_damage(self, hp, fatal):
 			def get_note(sink):
 				msg = sink.youify("{Вы/F}", self.master)
 				if hp:
-					roll = randrange(2)
-					if roll == 0: msg += sink.youify(" взмахивает{е/}", self.master)
+					if fatal:
+						dw_roll = randrange(2)
+						if dw_roll == 0: msg += sink.youify(" пронзает{е/}", self.master) + sink.youify("{ ваше/} сердце{/ F:G}", self.target)
+						else: msg += sink.youify(" перерезает{е/}", self.master) + sink.youify("{ вашу/} глотку{/ F:G}", self.target)
 					else:
-						if fatal: msg += sink.youify(" пронзает{е/}", self.master) + sink.youify("{ ваше/} сердце{/ F:G}", self.target)
+						roll = randrange(2)
+						if roll == 0: msg += sink.youify(" взмахивает{е/}", self.master)
 						else: msg += sink.youify(" колет{е/}", self.master) + sink.youify(" {вас/F:A}", self.target)
-					msg += " кинжалом"
-					if fatal and roll != 1: msg += " и"
-					msg += f" ({hp})"
-					if fatal and roll != 1:
-						msg += sink.youify(" попадает{е/}", self.master) + sink.youify(" {вам/F:D}", self.target) + " прямо в сердце"
 				else:
-					msg += sink.youify(" скользит{е/} по", self.master) + sink.youify(" {вам/F:D}", self.target) + " кинжалом" + f" ({hp})"
+					msg += sink.youify(" скользит{е/} по", self.master) + sink.youify(" {вам/F:D}", self.target)
+				msg += (" клинком" if self.weapon.coating == 'runes' else " кинжалом") + Beam.damage_paren(hp)
 				return msg + "."
 			self.arena.note(get_note)
 
-			if hp and not fatal and random() < hp / (hp + 1):
-				Poison(hp ** 0.5).apply(self.target, arena=self.arena)
+			if not fatal:
+				if self.weapon.coating is None:
+					pass
+				elif self.weapon.coating in ('poison', 'poison2'):
+					if hp and random() < hp / (hp + 1):
+						poison = Poison(0.6 * hp ** 0.5)
+						if self.weapon.coating == 'poison2':
+							poison.kind = 'poison2'
+							poison.hp_dam_per_turn = poison.mp_dam_per_turn = 2
+						poison.apply(self.target, arena=self.arena)
+				elif self.weapon.coating == 'runes':
+					if self.master.mp < self.master.mmp and hp and random() < hp / (hp + 1):
+						recover_mp = min(self.master.mmp - self.master.mp, rand_round(random() * (0.7 + 0.3 * random()) * hp))
+						if recover_mp:
+							self.master.note(lambda sink: sink.youify("{Вы/F} восстанавливает{е/}", self.master) + " {} MP".format(recover_mp) + ".")
+							self.master.cur_mp += recover_mp
+				else: impossible(self.weapon.coating, "coating")
 
 class ExecutionerAxe(Weapon):
 	def __init__(self):
@@ -4236,9 +4718,7 @@ class ExecutionerAxe(Weapon):
 
 	class MeleeBeam(Weapon.MeleeBeam):
 		def on_elements(self):
-			return self.Physical(tuple(x * max(0.1, 1 + (self.master_str() - 10)/7) for x in (0, 1.6, 3)))
-
-		def on_cumulative(self): return 'ea-kick'
+			return self.Physical(tuple(x * max(0.1, 1 + (self.master_str() - 10)/5) for x in (0, 1.6, 3)))
 
 		def on_hp_damage(self, hp, fatal):
 			def get_note(sink):
@@ -4251,12 +4731,48 @@ class ExecutionerAxe(Weapon):
 						else: msg += sink.youify(" рубит{е/}", self.master) + sink.youify(" {вас/F:A}", self.target)
 					if not (roll == 1 and fatal): msg += " топором"
 					if fatal and roll != 1: msg += " и"
-					msg += f" ({hp})"
+					msg += Beam.damage_paren(hp)
 					if fatal and roll != 1: msg += sink.youify(" разрубает{е/}", self.master) + sink.youify(" {вас/F:G} надвое", self.target)
 				else:
-					msg += sink.youify(" скользит{е/} по", self.master) + sink.youify(" {вам/F:D}", self.target) + " лезвием топора" + f" ({hp})"
+					msg += sink.youify(" скользит{е/} по", self.master) + sink.youify(" {вам/F:D}", self.target) + " лезвием топора" + Beam.damage_paren(hp)
 				return msg + "."
 			self.arena.note(get_note)
+
+class DeathScythe(Weapon):
+	def __init__(self):
+		super().__init__()
+		self.name = Noun.parse("{коса} Смерти")
+
+	class MeleeBeam(Weapon.MeleeBeam):
+		def on_elements(self):
+			return self.Physical(tuple(x * max(0.1, 1 + (self.master_str() - 10)/5) for x in (0, 1.4, 3)))
+
+		def on_hp_damage(self, hp, fatal):
+			def get_note(sink):
+				msg = sink.youify("{Вы/F}", self.master)
+				if hp:
+					roll = randrange(2)
+					if roll == 0: msg += sink.youify(" взмахивает{е/}", self.master)
+					else:
+						if fatal: msg += sink.youify(" прошивает{е/}", self.master) + sink.youify("{ вас/F:G}", self.target)
+						else: msg += sink.youify(" ранит{е/}", self.master) + sink.youify(" {вас/F:A}", self.target)
+					msg += " косой"
+					if fatal and roll != 1: msg += " и"
+					msg += Beam.damage_paren(hp)
+					if fatal and roll == 1: msg += " насквозь"
+					if fatal and roll != 1: msg += sink.youify(" разрубает{е/}", self.master) + sink.youify(" {вас/F:G} надвое", self.target)
+				else:
+					msg += sink.youify(" скользит{е/} по", self.master) + sink.youify(" {вам/F:D}", self.target) + " лезвием косы" + Beam.damage_paren(hp)
+				return msg + "."
+			self.arena.note(get_note)
+
+			if hp:
+				dw = self.target.find_hex(DeathWordHex)
+				if dw and dw.turns > 1 and random() < 0.75 * hp / (hp + 3):
+					nturns = dw.turns - 1
+					if nturns >= 1:
+						dw.turns = nturns
+						self.arena.note(lambda sink: sink.you == self.target and "Вы слышите, как сыплется песок в часах.")
 
 class Arena(MessageBroadcaster, MessageSink):
 	BASELINE_SPD = 100
@@ -4299,6 +4815,9 @@ class Arena(MessageBroadcaster, MessageSink):
 			with self.fighter.lock_hexes() as hexes:
 				for hex in hexes:
 					if not isinstance(hex, ParasiteHex): hex.cancel()
+
+		def set_cooldown(self, id, value):
+			self.cooldowns[id] = max(self.cooldowns[id], 1 + value)
 
 		def process_cooldowns(self):
 			expired = []
@@ -4352,6 +4871,7 @@ class Arena(MessageBroadcaster, MessageSink):
 		self.squads_frozen = False
 		self.morgue = []
 		self.shadows = []
+		self.time_stop = 0
 
 	# Арена подписывается на сообщения от бойцов, чтобы переслать их своим подписчикам.
 	# Т. е. MessageSink.receive_note перенаправляется в MessageBroadcaster.note.
@@ -4407,9 +4927,9 @@ class Arena(MessageBroadcaster, MessageSink):
 		# Убирать received_attacks НЕ нужно — они нужны для раскидывания опыта.
 		# Если враг получил 60% урона от саммонов, после его смерти 60% опыта улетают в никуда, даже если саммоны давно исчезли.
 
-	def allies(self, fighter):
+	def allies(self, fighter, include_itself=False):
 		battler = self.as_battler(fighter)
-		return (member.fighter for member in self.squads[battler.squad_id].members if member.fighter != fighter and member.fighter.alive)
+		return (member.fighter for member in self.squads[battler.squad_id].members if member.fighter != fighter or include_itself and member.fighter.alive)
 
 	def squads_are_enemies(self, a, b):
 		for v in (a, b): assert not isinstance(v, (Fighter, self.Battler))
@@ -4432,22 +4952,52 @@ class Arena(MessageBroadcaster, MessageSink):
 		except StopIteration:
 			return None if maybe else throw(RuntimeError, f"{fighter.name.cap_first()} не на арене.")
 
+	def stop_time(self, turns):
+		if self.time_stopped():
+			self.note("*Клац* Ничего не происходит.")
+		else:
+			self.note("*Щ-щёлк!* Время останавливается.")
+			self.time_stop = max(self.time_stop, 1 + turns)
+
+	def time_stopped(self):
+		return self.time_stop > 0
+
 	def turn(self):
 		check(self.started, "не вызвана start", not self.inside_turn, "уже внутри turn", self.battlers, "арена пуста")
+		time_was_stopped_before = self.time_stopped()
 		self.inside_turn = True
 		self.last_action_cost = 1.0
 		battler = self.turn_queue[0]
-		if battler.ai and not battler.fighter.paralyzed(): battler.ai.turn()
-		if battler.game and battler.game.performance: battler.game.performance.turns += 1
-		self.delay_by(battler, self.delay_base(battler.fighter) * self.last_action_cost * uniform(0.8, 1.2))
-		self.shift_delays()
+		if battler.fighter.paralyzed():
+			if battler.fighter.props['paralyzed'] > 1:
+				battler.fighter.note(lambda sink: sink.you == battler.fighter and "{Вы/F} парализован{ы//а/о}.")
+		else:
+			if battler.ai: battler.ai.turn()
+			if battler.game and battler.game.performance: battler.game.performance.turns += 1
+
+		if not self.time_stopped():
+			self.delay_by(battler, self.delay_base(battler.fighter) * self.last_action_cost * uniform(0.8, 1.2))
+			self.shift_delays()
 		battler.fighter.end_turn(self)
 		battler.process_cooldowns()
-		self.inside_turn = False
+
+		if self.time_stopped():
+			self.time_stop -= 1
+			if not self.time_stopped(): self.note("*Вр-р-р* Время возобновляет свой бег.")
+			elif time_was_stopped_before: self.note("*ТИК*")
 
 		corpses = [b for b in self.battlers if b.fighter.dead]
 		for corpse in corpses:
+			victim = corpse.fighter.props.get('weapon_stolen_from', None)
+			if victim and victim.alive and not victim.weapon:
+				victim.note(lambda sink: sink.youify("{Вы/F} возвращает{е/} себе", victim) +
+					(corpse.fighter.weapon.gender.ize(" сво{й/ю/ё}") if victim == sink.you else victim.gender.ize(" {его/её}") ) +
+					" " + corpse.fighter.weapon.name.accusative + ".")
+				weapon = corpse.fighter.weapon
+				victim.set_weapon(weapon)
+
 			self.remove(corpse, None if corpse.fighter.transient else self.morgue)
+		self.inside_turn = False
 
 	def whose_turn(self):
 		check(self.battlers, "арена пуста")
@@ -4685,6 +5235,8 @@ class Arena(MessageBroadcaster, MessageSink):
 		for b in self.battlers:
 			if not b.game: b.cleanup_transient()
 
+		self.time_stop = 0
+
 	def xp_for(self, living, squad_id):
 		xp = 0
 		for corpse in self.morgue:
@@ -4695,7 +5247,7 @@ class Arena(MessageBroadcaster, MessageSink):
 					attacks_part = ra.attacks / (sum(con.attacks for con in corpse.received_attacks.values()) or 1)
 					weights_part = ra.weight / (sum(con.weight for con in corpse.received_attacks.values()) or 1)
 					total_part = (attacks_part + 2 * weights_part) / 3
-					xp += 16 * corpse.fighter.xl ** 0.7 * total_part
+					xp += 16 * corpse.fighter.xl ** 0.6 * total_part
 		return xp
 
 	def __getstate__(self):
@@ -4755,7 +5307,7 @@ class PlayerAI(AI):
 #
 # def do_considerations(self):
 # 	self.consider(lambda ai: ai.fighter.act_attack_unarmed(...), 'unarmed', weight=self.fighter.str / 10, soft_cooldown=5)
-# 	self.consider(lambda ai: ai.fighter.act_weapon_shot(...), 'shoot', weight=self.fighter.dex / 10, soft_cooldown=5)
+# 	self.consider(lambda ai: ai.fighter.act_weapon_shoot(...), 'shoot', weight=self.fighter.dex / 10, soft_cooldown=5)
 #
 # 	if self.fighter.can_cast(some_spell):
 # 		self.consider(lambda ai: ai.fighter.act_cast_spell(some_spell, ...), 'some-spell', weight=0.5 * estimate_spell_effectiveness(),
@@ -4827,13 +5379,12 @@ class RandomizedAI(AI):
 		for action_id, track in self.tracks.items():
 			if track is ignore_track: continue
 
-			if track.soft_cooldown_turns:
+			if track.hard_cooldown_turns:
+				track.hard_cooldown_turns -= 1
+			elif track.soft_cooldown_turns:
 				track.soft_cooldown_k += (1 - track.soft_cooldown_k) / track.soft_cooldown_turns
 				track.soft_cooldown_turns -= 1
 				if not track.soft_cooldown_turns: track.soft_cooldown_k = 1
-
-			if track.hard_cooldown_turns:
-				track.hard_cooldown_turns -= 1
 
 			if not track.soft_cooldown_turns and not track.hard_cooldown_turns:
 				expired.append(action_id)
@@ -4853,6 +5404,7 @@ class UniversalAI(RandomizedAI):
 	def __init__(self):
 		super().__init__()
 		self.prev_target = None
+		self.props = {}
 
 	def do_considerations(self):
 		enemies_count = 0
@@ -4860,74 +5412,183 @@ class UniversalAI(RandomizedAI):
 			enemies_count += 1
 		def inertly(target): return 1 if target == self.prev_target else 0.285
 
-		for melee_type in ('unarmed', 'weapon_melee'):
-			consider = None
-			if (self.fighter.unarmed if melee_type == 'unarmed' else
-				self.fighter.weapon if melee_type == 'weapon_melee' else impossible(melee_type, "melee_type")):
-					for target in self.arena.enemies(self.fighter):
-						def consider(melee_type=melee_type, target=target):
-							def attack(ai):
-								if melee_type == 'unarmed': ai.fighter.act_attack_unarmed(target, ai.arena)
-								elif melee_type == 'weapon_melee': ai.fighter.act_weapon_melee(target, ai.arena)
-								else: impossible(melee_type, "melee_type")
-								self.prev_target = target
-							self.consider(attack, melee_type, inertly(target) / enemies_count, soft_cooldown_base=0.8, soft_cooldown=1)
-						consider()
+		for attack_type in ('unarmed', 'weapon_melee', 'weapon_ranged'):
+			if (not self.fighter.unarmed if attack_type == 'unarmed' else
+				not self.fighter.weapon if attack_type == 'weapon_melee' else
+				not self.fighter.weapon or not self.fighter.weapon.ShotBeam if attack_type == 'weapon_ranged' else impossible(attack_type, "attack_type")):
+				continue
 
+			for target in self.arena.enemies(self.fighter):
+				def consider(attack_type=attack_type, target=target):
+					def attack(ai):
+						if attack_type == 'unarmed': ai.fighter.act_attack_unarmed(target, ai.arena)
+						elif attack_type == 'weapon_melee': ai.fighter.act_weapon_melee(target, ai.arena)
+						elif attack_type == 'weapon_ranged':
+							def ammo_weight(ammo, _index):
+								if isinstance(ammo, SilenceAmmunition) and target.silenced() or isinstance(ammo, TimestopAmmunition) and ai.arena.time_stopped():
+									return 0
+								return 1. if ammo.finite_charges else 1.
+							ammo = choose((ammo for ammo in ai.fighter.weapon.ammos if ammo.has_charges()), ammo_weight, default=None)
+							ai.fighter.act_weapon_shoot(target, ai.arena, ammo)
+						else: impossible(attack_type, "attack_type")
+						self.prev_target = target
+					weight = inertly(target) / enemies_count
+					if attack_type == 'weapon_ranged': weight *= (1 + len(self.fighter.weapon.upgrades)) ** 0.5
+					self.consider(attack, attack_type, weight, soft_cooldown_base=0.8, soft_cooldown=1)
+				consider()
+
+		# Я в курсе, что это должны быть виртуальные методы. Просто так проще переделывать, всё в одном месте.
 		if self.fighter.can_cast():
 			for sp in self.fighter.spells:
 				if not self.fighter.can_cast(sp): continue
 
-				if isinstance(sp, HexSpell):
+				if isinstance(sp, ResistibleSpell):
 					for target in self.arena.enemies(self.fighter):
-						existing = next((hex for hex in target.hexes if isinstance(hex, sp.hex_class)), None)
-						if not existing:
-							def consider(sp=sp, target=target):
-								def attack(ai):
-									self.fighter.act_cast_spell(sp, target, ai.arena)
-									self.prev_target = target
+						if isinstance(sp, HexSpell) and target.find_hex(sp.hex_class): continue
+						def consider(sp=sp, target=target):
+							def attack(ai):
+								self.fighter.act_cast_spell(sp, target, ai.arena)
+								self.prev_target = target
 
-								weight = inertly(target) / enemies_count
-								if isinstance(sp, DeathWord): weight *= target.hp / max(self.fighter.str/2, target.mhp)
-								self.consider(attack, sp.cmd(), weight, soft_cooldown=8, soft_cooldown_base=0.1, hard_cooldown=2)
-							consider()
+							weight = inertly(target) / enemies_count
+							if isinstance(sp, DeathWord): weight *= target.hp / max(self.fighter.str/2, target.mhp)
+							self.consider(attack, sp.cmd(), weight, soft_cooldown=4 if isinstance(sp, DrainXP) else 6, soft_cooldown_base=0.1, hard_cooldown=2)
+						consider()
+
+				elif isinstance(sp, SummonGhost):
+					squad = self.arena.squads[self.arena.as_battler(self.fighter).squad_id]
+					if squad.max_members is not None and squad.max_members - len(squad.members) < 1: continue
+					existing_ghosts = sum(1 for b in squad.members if b.fighter.preset == 'ghost')
+					def consider(sp=sp):
+						def summon(ai):
+							self.fighter.act_cast_spell(sp, None, ai.arena)
+						self.consider(summon, sp.cmd(), 1 / (1 + existing_ghosts), hard_cooldown=2, soft_cooldown=6, soft_cooldown_base=0.2)
+					consider()
+
+				elif isinstance(sp, DrainLife):
+					wounded_score = 0
+					for ally in self.arena.allies(self.fighter, include_itself=True):
+						if ally.hp < ally.mhp:
+							wounded_score += (1 - ally.hp / ally.mhp) * (ally.xl / self.fighter.xl if ally.xl < self.fighter.xl else 1)
+					if wounded_score:
+						best_estimated_drain = None
+						for ipass in range(2):
+							for target in self.arena.enemies(self.fighter):
+								estimated_drain = sp.drain_dis(self.fighter, target).estimate_avg()
+								if ipass == 0:
+									best_estimated_drain = max(best_estimated_drain, estimated_drain) if best_estimated_drain is not None else estimated_drain
+								else:
+									def consider(sp=sp, target=target):
+										def drain(ai):
+											self.fighter.act_cast_spell(sp, target, ai.arena)
+											self.prev_target = target
+										self.consider(drain, sp.cmd(), wounded_score * (estimated_drain / best_estimated_drain) * inertly(target),
+											soft_cooldown=3, soft_cooldown_base=0.2, hard_cooldown=1)
+									consider()
+
+				elif isinstance(sp, Barrier):
+					if any(isinstance(hex, BarrierHex) for hex in self.fighter.hexes) or 'barrier' in self.arena.as_battler(self.fighter).cooldowns: continue
+					def consider(sp=sp):
+						def cast(ai):
+							self.fighter.act_cast_spell(sp, self.fighter, ai.arena)
+							self.props['barrier_cast'] = True
+						weight = 3 if 'barrier_cast' not in self.props else 1
+						weight *= clamp(0.7 * self.fighter.mhp / self.fighter.hp, 1, 5)
+						weight += sum(6 / ally.props['remaining_life'] for ally in self.arena.allies(self.fighter) if ally.preset == 'lightning')
+
+						self.consider(cast, 'barrier', weight, soft_cooldown=5, soft_cooldown_base=0.1, hard_cooldown=3)
+					consider()
+
+				elif isinstance(sp, BallLightning):
+					squad = self.arena.squads[self.arena.as_battler(self.fighter).squad_id]
+					if squad.max_members is None or squad.max_members - len(squad.members) >= 1:
+						barrier_hex = self.fighter.find_hex(BarrierHex)
+						barrier_spell = next((sp for sp in self.fighter.spells if isinstance(sp, Barrier)), None)
+						if (not barrier_hex or barrier_hex.turns < 5) and (not barrier_spell or self.fighter.mp < sp.mp_cost() + barrier_spell.mp_cost()): continue
+
+						existing_lightnings = sum(1 for b in squad.members if b.fighter.preset == 'lightning')
+						def consider(sp=sp):
+							def conjure(ai):
+								self.fighter.act_cast_spell(sp, None, ai.arena)
+							self.consider(conjure, sp.cmd(), 1 / (1 + existing_lightnings) ** 1, hard_cooldown=1, soft_cooldown=7, soft_cooldown_base=0.1)
+						consider()
+
+				elif isinstance(sp, Chronosphere):
+					def consider(sp=sp):
+							def cast(ai):
+								self.fighter.act_cast_spell(sp, None, ai.arena)
+							self.consider(cast, sp.cmd(), 0.8, hard_cooldown=sp.turns(self.fighter) + 2, soft_cooldown=8, soft_cooldown_base=0.1)
+					consider()
 
 		for sp in self.fighter.specials:
 			if isinstance(sp, Thievery):
 				for target in self.arena.enemies(self.fighter):
 					target_b = self.arena.as_battler(target)
-					if target_b.game and target_b.game.gold > 0:
-						def consider(sp=sp, target_b=target_b):
-							def steal(ai):
-								sp.act_steal_gold(target_b, ai.arena)
-								self.prev_target = target
-							self.consider(steal, 'steal', 0.5 * inertly(target) * min(target_b.game.gold ** 0.5 / 10, 3) / enemies_count, soft_cooldown=8, soft_cooldown_base=0.25)
-						consider()
+					if not target_b.game or target_b.game.gold <= 0: continue
+
+					def consider(sp=sp, target=target, target_b=target_b):
+						def steal(ai):
+							sp.act_steal_gold(target_b, ai.arena)
+							self.prev_target = target
+						self.consider(steal, 'steal', 0.5 * inertly(target) * min(target_b.game.gold ** 0.5 / 10, 3) / enemies_count,
+							soft_cooldown=7, soft_cooldown_base=0.25, hard_cooldown=1)
+					consider()
+
 			elif isinstance(sp, Grasp):
 				for target in self.arena.enemies(self.fighter):
 					if 'grasp_immunity' in self.arena.as_battler(target).cooldowns: continue
-					grasp = next((hex for hex in target.hexes if isinstance(hex, GraspHex)), None)
-					slime = next((hex for hex in target.hexes if isinstance(hex, SlimeHex)), None)
-					if not grasp:
-						def consider(sp=sp, target=target):
-							def grasp(ai):
-								sp.act_grasp(self.fighter, target, ai.arena)
-							self.consider(grasp, 'grasp', (1 + (slime.power if slime else 0)) * inertly(target) / enemies_count, soft_cooldown=4, soft_cooldown_base=0.2)
-						consider()
+					grasp = target.find_hex(GraspHex)
+					if grasp: continue
+
+					slime = target.find_hex(SlimeHex)
+					def consider(sp=sp, target=target):
+						def grasp(ai):
+							sp.act_grasp(target, ai.arena)
+						self.consider(grasp, 'grasp', (1 + (2 * slime.power if slime else 0)) * inertly(target) / enemies_count, soft_cooldown=4, soft_cooldown_base=0.2)
+					consider()
+
 			elif isinstance(sp, Impregnation):
 				for target in self.arena.enemies(self.fighter):
 					if target.can_be_impregnated:
-						slime = next((hex for hex in target.hexes if isinstance(hex, SlimeHex)), None)
+						slime = target.find_hex(SlimeHex)
 						if not slime: continue
 
-						grasp = next((hex for hex in target.hexes if isinstance(hex, GraspHex)), None)
-						if not grasp or grasp.ticks < 2: continue
+						grasp = target.find_hex(GraspHex)
+						if not grasp or grasp.ticks < 1: continue
 
 						def consider(sp=sp, target=target):
 							def impregnate(ai):
-								sp.act_impregnate(self.fighter, target, ai.arena)
-							self.consider(impregnate, 'impregnate', 0.4 * (grasp.ticks ** 0.5 + slime.power ** 0.5) * inertly(target) / enemies_count)
+								sp.act_impregnate(target, ai.arena)
+							self.consider(impregnate, 'impregnate',
+								0.6 * clamp(self.fighter.mhp / self.fighter.hp, 1, 5) * (grasp.ticks ** 0.5 + slime.power ** 0.5) * inertly(target) / enemies_count)
 						consider()
+
+			elif isinstance(sp, Marauding):
+				if 'stolen_weapon' not in self.fighter.props:
+					for target in self.arena.enemies(self.fighter):
+						if target.weapon:
+							def consider(sp=sp, target=target):
+								def maraud(ai):
+									sp.act_maraud(target, ai.arena)
+								self.consider(maraud, 'steal', (1 + len(target.weapon.upgrades)) ** 0.5 * inertly(target) / enemies_count,
+									soft_cooldown=4, soft_cooldown_base=0.1, hard_cooldown=2)
+							consider()
+
+			elif isinstance(sp, PsionicThievery):
+				for target in self.arena.enemies(self.fighter):
+					if any(isinstance(up, SpellUpgrade) for up in target.upgrades):
+						def consider(sp=sp, target=target):
+							def psi_steal(ai):
+								sp.act_psi_steal(target, ai.arena)
+							self.consider(psi_steal, 'steal', 0.5 * sum(1 for up in target.upgrades if isinstance(up, SpellUpgrade)) ** 0.5 * inertly(target) / enemies_count,
+								soft_cooldown=4, soft_cooldown_base=0.1, hard_cooldown=2)
+						consider()
+
+class BallLightningAI(AI):
+	def do_turn(self):
+		rem, orig = (self.fighter.props[prop_name] for prop_name in ('remaining_life', 'orig_life'))
+		if rem > 1:
+			self.arena.note(lambda sink: sink.youify("{Вы/F}" + (" угрожающе" if (rem - 1) <= orig // 2 else "") + " трещит{е/}.", self.fighter))
 
 class Con:
 	# На данный момент сделано так, что чуть больше нуля даёт [#....] и чуть меньше максимума — [####.]
@@ -4966,7 +5627,7 @@ class VitalBarTest(TestCase):
 class Mode:
 	def __init__(self):
 		self.session = None
-		self.last_screen = self.last_input = self.last_command_chosen = self.force_input = None
+		self.last_screen = self.last_input = self.last_command_chosen = self.input_on_last_command_chosen = self.force_input = None
 		self.invalidated = False
 
 	def process(self):
@@ -5470,9 +6131,7 @@ class HallOfFameView(Mode):
 			return
 
 	def same_orders(self, order_a, order_b):
-		for (rowid_a, _rec_a), (rowid_b, _rec_b) in zip(self.session.HoF.fetch(order_a), self.session.HoF.fetch(order_b)):
-			if rowid_a != rowid_b: return False
-		return True
+		return all(rowid_a == rowid_b for (rowid_a, _rec_a), (rowid_b, _rec_b) in zip(self.session.HoF.fetch(order_a), self.session.HoF.fetch(order_b)))
 
 	def do_render(self, lines, cmds):
 		start = len(lines)
@@ -5903,7 +6562,7 @@ class Game:
 			for index, (field, field_types) in enumerate(complement.store_fields):
 				value = d[index]
 				if not isinstance(value, field_types): raise Game.corrupted(f"{field}: {type(value)}")
-				elif field == 'completed_fights': complement.completed_fights = [value and Game.CompletedFight.unpack(fight_pack) for fight_pack in value]
+				elif field == 'completed_fights': complement.completed_fights = [fight_pack and Game.CompletedFight.unpack(fight_pack) for fight_pack in value]
 				else: setattr(complement, field, value)
 			return complement
 
@@ -6277,19 +6936,18 @@ class Respite(NonCombatMode):
 		return " " * (2 + min(len(name) for name in filter(None, (player.name, player.weapon and player.weapon.name))))
 
 	def describe_player(self, player, cmds, pad):
-		desc = player.living_desc()
-
-		desc += "\n" + pad + player.hp_bar()
+		mp_desc = []
+		line = pad + "[name_pad]" + multipad.escape(player.hp_bar()) + "   [cure_verb]"
 		if player.hp < player.mhp:
 			# Лечение возможно в долг, т. к. если у игрока нет денег — у него и так проблемы.
 			# Бесплатно/по сниженной цене лечить нежелательно, чтобы сократить пространство для эксплоитов.
 			# Оно остаётся всё равно, в виде нобрейн-решения «если денег впритык, купить апгрейды и уже потом лечиться».
 			# Можно запретить покупку апгрейдов при неполном здоровье, или лечение в долг, когда игроку есть что продать, но это как-то не по людски.
 			cost = clamp(round((1 - player.hp / player.mhp) * 16 + 0.2 * (player.mhp - player.hp)), 1, 50)
-			desc += "   восстановить: ${0}".format(cost)
+			line += "восстановить: ${0}".format(cost)
 			notes = ["heal hp"]
 			if not self.game.enough_gold_for(cost): notes.append("в долг")
-			desc += " ({})".format(", ".join(notes))
+			line += " [cure_cmd]({})".format(", ".join(notes))
 
 			def add_heal_hp(cost=cost):
 				def heal_hp():
@@ -6299,6 +6957,7 @@ class Respite(NonCombatMode):
 					self.invalidate().check_for_pending_notes()
 				cmds.add('heal hp', heal_hp, '?', lambda: self.more("Полностью восстановить очки здоровья."))
 			add_heal_hp()
+		mp_desc.append(line)
 
 		if player.has_magic():
 			def dmp_func(d):
@@ -6309,12 +6968,12 @@ class Respite(NonCombatMode):
 			cmds.add('mp+', dmp_func(+1))
 			cmds.add('mp-', dmp_func(-1))
 
-			desc += "\n" + pad + player.mp_bar()
+			line = "[name_pad]" + multipad.escape(player.mp_bar())
 			if player.mp < player.mmp:
 				cost = clamp(round((1 - player.mp / player.mmp) * 45 + 0.9 * (player.mmp - player.mp)), 1, 70)
-				desc += "   восстановить: ${0}".format(cost)
+				line += " [cure_verb]восстановить: ${0}".format(cost)
 				if self.game.enough_gold_for(cost):
-					desc += " (heal mp)"
+					line += " [cure_cmd](heal mp)"
 					def add_heal_mp(cost=cost):
 						def heal_mp():
 							self.game.take_gold(cost)
@@ -6324,8 +6983,67 @@ class Respite(NonCombatMode):
 						cmds.add('heal mp', heal_mp, '?', lambda: self.more("Полностью восстановить ману."))
 					add_heal_mp()
 				else:
-					desc += " :("
-		return desc
+					line += " :("
+			mp_desc.append(line)
+
+		dispell = None
+		if player.can_cast():
+			dispell_instance = next((sp for sp in player.spells if isinstance(sp, Dispell)), None)
+			if dispell_instance and player.can_cast(dispell_instance): dispell = dispell_instance
+
+		for hex in player.hexes:
+			cvp = hex.do_respite_remove_cost_verb_and_prefix(self.game)
+			if cvp:
+				cost, verb, prefix = cvp
+				if cost > 0 and hex.dispell_amount > 0:
+					cost = max(1, round(cost * (1 - hex.dispell_amount / hex.power)))
+				if isinstance(hex, DeathWordHex) and not self.game.enough_gold_for(cost):
+					cost = max(0, self.game.gold)
+
+				prefixes = []
+				can_cure = cost == 0 or self.game.enough_gold_for(cost)
+				cure_cmd = can_cure and prefix + " " + hex.cmd()
+				if can_cure: prefixes.append(prefix)
+
+				dispell_cmd = dispell and hex.dispellable() and "dispell " + hex.cmd()
+				if dispell_cmd: prefixes.append("dispell")
+				cmds_enum = "/".join(prefixes)
+				cmds_enum += (" " if cmds_enum else "") + hex.cmd()
+
+				mp_desc.append(pad + hex.short_desc() + " {}[cure_verb]{}: {}{}{}".format(
+					"" if can_cure else "(",
+					verb,
+					f"${cost}" if cost else "бесплатно",
+					"" if can_cure else ")",
+					f" [cure_cmd]({cmds_enum})" if cmds_enum else ""))
+
+				if cure_cmd:
+					def add_cure(cure_cmd=cure_cmd, hex=hex, cost=cost):
+						def cure():
+							if cost: self.game.take_gold(cost)
+							hex.cancel()
+							self.check_for_pending_notes()
+						cmds.add(cure_cmd, cure, '?', lambda: self.more("{}\nСнять эффект: {}.".format(hex.detail(self.game), "${}".format(cost) if cost else "бесплатно")))
+					add_cure()
+
+				if dispell_cmd:
+					def add_dispell(dispell_cmd=dispell_cmd, hex=hex):
+						def cure():
+							self.player.act_cast_spell(dispell, hex, None)
+							self.check_for_pending_notes()
+						def help():
+							self.more("{}\n{}".format(
+								hex.detail(self.game),
+								Dispell.human_estimate_turns_left(hex, dispell.dispell_hex_amount_dis(self.player, hex, None), respite=True)))
+						cmds.add(dispell_cmd, cure, '?', help)
+					add_dispell()
+
+				if not cure_cmd and not dispell_cmd:
+					def add_help(hex=hex):
+						def help(): self.more(hex.detail(self.game))
+						cmds.add(hex.cmd(), help, '?', help)
+					add_help()
+		return player.living_desc() + "\n" + "\n".join(multipad(mp_desc))
 
 	def describe_weapon(self, weapon, cmds, pad):
 		desc = weapon.living_desc()
@@ -6352,6 +7070,8 @@ class Respite(NonCombatMode):
 							def reload():
 								self.game.take_gold(ammo.recharge_cost())
 								ammo.recharge()
+								weapon.owner.note("Модуль перезаряжен.")
+								self.invalidate().check_for_pending_notes()
 							return reload
 						line += f" [reload_cmd](reload {cmd})"
 						cmds.add('reload ' + cmd, make_reload_func())
@@ -7039,9 +7759,6 @@ class ArenaView(GameMode):
 					self.log.add("_", turn=self.current_player_turn, next_sep="", start_new_line=True)
 					self.your_turn_announced = True
 
-			if do_turn and self.arena.whose_turn() == self.player and self.player.paralyzed():
-				self.player.note(lambda sink: sink.you == self.player and "Вы парализованы.")
-
 			# условие в really означает «прокрутить, если сейчас будет сообщение с (...) или render()».
 			# В противном случае продолжится process и пользователь какое-то время не увидит результат, поэтому скроллить его рано.
 			self.log_lines, pending = self.log.scroll(self.log_area_height, self.safe_term_width, really=lambda pending: pending or not do_turn)
@@ -7260,7 +7977,7 @@ class ArenaView(GameMode):
 				for lines in (im.lines, im.hex_descs, ("",))
 					if lines is not None
 						for line in lines]
-		if len(result) != total_lines: impossible(f"len(result) = {len(result)}, total_lines = {total_lines}")
+		assert len(result) == total_lines, f"len(result) = {len(result)}, total_lines = {total_lines}"
 		return result
 
 	class ScreenLayout:
@@ -7330,7 +8047,7 @@ class ArenaView(GameMode):
 			desc_extra=None,
 			targeting='single',
 			ljust_cmd=True,
-			choose_target_name=None, choose_target_help=None):
+			choose_target_name=None, choose_target_help=None, exec_hook=None and (lambda target, exec: exec())):
 
 			cmd_extra = ""
 
@@ -7340,7 +8057,8 @@ class ArenaView(GameMode):
 				self.decide(lambda ai: perform(target, ai))
 
 			def add_for_target(target, extra, remember_target=None, custom_exec=None, custom_help=None):
-				cmds.add(cmd_base + (' ' + extra if extra else ''), lambda: custom_exec() if custom_exec else remember_and_decide(target, remember_target),
+				exec = custom_exec or (lambda: remember_and_decide(target, remember_target))
+				cmds.add(cmd_base + (' ' + extra if extra else ''), lambda: exec_hook(target, exec) if exec_hook else exec(),
 					'?', lambda: self.more(custom_help() if custom_help else help(target)))
 
 			n_targets = 0
@@ -7360,7 +8078,7 @@ class ArenaView(GameMode):
 				for target in self.arena.enemies(self.player):
 					if cmds: add_for_target(target, self.arena.as_battler(target).shortcut, remember_target=True)
 					n_targets += 1
-			elif targeting == 'mass':
+			elif targeting == 'mass' or targeting == 'n/a':
 				if cmds: add_for_target(None, None)
 				n_targets = None
 			elif targeting == 'dispell-like':
@@ -7500,8 +8218,27 @@ class ArenaView(GameMode):
 							help_noun = ammo and ammo.noun_name()
 							return "Выстрелить в {}{}.\n{}".format(target.name.accusative, (" " + help_noun.instrumental if help_noun else ""),
 								weapon.shot_beam(target, self.arena, ammo).human_stats(do_max=self.game.god_mode))
+
+						exec_hook = None
+						if isinstance(ammo, SilenceAmmunition):
+							def exec_hook(target, exec):
+								if target.silenced():
+									def confirmed(mode):
+										mode.revert()
+										exec()
+									self.yes_no("{} уже под тишиной, новый заряд не продлит её. Вы уверены?".format(target.name.cap_first()), confirmed, default=1)
+								else:
+									exec()
+						elif isinstance(ammo, TimestopAmmunition):
+							if self.arena.time_stopped():
+								def exec_hook(target, exec):
+									def confirmed(mode):
+										mode.revert()
+										exec()
+									self.yes_no("Время уже остановлено, новый заряд не продлит эффект. Вы уверены?", confirmed, default=1)
 						add(cmd_desc=ammo.battle_name() if ammo else "огонь", cmd_base=cmd, perform=perform, help=help, categ='weapon',
-							desc_extra = ammo and ammo.finite_charges and " [bullets]" + Con.bullet_bar(ammo.charges, ammo.MAX_CHARGES))
+							desc_extra = ammo and ammo.finite_charges and " [bullets]" + Con.bullet_bar(ammo.charges, ammo.MAX_CHARGES),
+							exec_hook=exec_hook)
 					add_single_targeted_shot()
 
 			if len(desc) > first_weapon_line:
@@ -7682,7 +8419,7 @@ class BattleResults(NonCombatMode):
 
 			self.player.receive_xp(player_xp)
 			if weapon_xp: self.player.weapon.receive_xp(weapon_xp)
-			self.game.give_gold(sum(160 + round(60 * corpse.fighter.xl ** 0.85 / 10) * 10 for corpse in dead_enemies))
+			self.game.give_gold(sum(200 + round(8 * corpse.fighter.xl ** 0.5) * 10 for corpse in dead_enemies))
 			self.game.forget_arena()
 			self.game.next_level += 1
 			self.is_end = self.game.next_level > FixedLevels.count
@@ -7852,7 +8589,7 @@ class FixedLevels:
 				thief.base_int = 10
 				thief.base_dex = 20
 				thief.base_spd = 150
-				thief.set_weapon(PoisonedDagger())
+				thief.set_weapon(Dagger(coating='poison'))
 				thief.add_special(Thievery())
 			arena.add(thief, Game.MONSTER_SQUAD, UniversalAI(), shortcut_hint="Thief")
 
@@ -7902,6 +8639,76 @@ class FixedLevels:
 				tentacle.add_special(Grasp())
 				tentacle.add_special(Impregnation())
 			arena.add(tentacle, Game.MONSTER_SQUAD, UniversalAI(), shortcut_hint="Tentacle")
+
+	class Necromancer(One):
+		index = 7
+		def do_populate(self, arena):
+			necromancer = Fighter()
+			necromancer.name, necromancer.gender, necromancer.preset = *Noun.parse("{некромант:a}", return_gender=True), 'necromancer'
+			with necromancer.save_relative_vitals():
+				necromancer.xl = 5
+				necromancer.base_ac = 5
+				necromancer.base_str = 20
+				necromancer.base_int = 25
+				necromancer.base_spd = 140
+				necromancer.set_weapon(Dagger())
+				necromancer.learn_spell(SummonGhost())
+				necromancer.learn_spell(DrainLife())
+			arena.add(necromancer, Game.MONSTER_SQUAD, UniversalAI(), shortcut_hint="Necromancer")
+
+	class MasterThief(One):
+		index = 8
+		def do_populate(self, arena):
+			thief = Fighter()
+			thief.name, thief.gender, thief.preset = *Noun.parse("{мастер:a}-{вор:a}", return_gender=True), 'm.thief'
+			with thief.save_relative_vitals():
+				thief.xl = 6
+				thief.base_ac = 4
+				thief.base_ev = 11
+				thief.base_str = 15
+				thief.base_int = 20
+				thief.base_dex = 30
+				thief.base_spd = 220
+				thief.set_weapon(Dagger(coating='poison2'))
+				thief.add_special(Thievery())
+				thief.add_special(Marauding())
+				thief.add_special(PsionicThievery())
+			arena.add(thief, Game.MONSTER_SQUAD, UniversalAI(), shortcut_hint="Masterthief")
+
+	class Magius(One):
+		index = 9
+		def do_populate(self, arena):
+			magius = Fighter()
+			magius.name, magius.gender, magius.preset = *Noun.parse("{Магиус:a}", return_gender=True), 'magius'
+			with magius.save_relative_vitals():
+				magius.xl = 6
+				magius.base_ac = 4
+				magius.base_ev = 8
+				magius.base_str = 20
+				magius.base_int = 30
+				magius.base_dex = 15
+				magius.base_spd = 160
+				magius.set_weapon(Dagger(coating='runes'))
+				magius.learn_spell(Barrier())
+				magius.learn_spell(BallLightning())
+				magius.learn_spell(Chronosphere())
+			arena.add(magius, Game.MONSTER_SQUAD, UniversalAI(), shortcut_hint="Magius")
+
+	class Death(One):
+		index = 10
+		def do_populate(self, arena):
+			death = Fighter()
+			death.name, death.gender, death.preset = *Noun.parse("{Смерть:af}", return_gender=True), 'death'
+			with death.save_relative_vitals():
+				death.xl = 7
+				death.base_ac = 9
+				death.base_str = 30
+				death.base_int = 30
+				death.base_spd = 180
+				death.set_weapon(DeathScythe())
+				death.learn_spell(DrainXP())
+				death.learn_spell(DeathWord())
+			arena.add(death, Game.MONSTER_SQUAD, UniversalAI(), shortcut_hint="Death")
 
 	# динамически выставляются ниже
 	count = 0
@@ -8140,21 +8947,19 @@ class Session():
 			except SystemExit:
 				self.post_quit()
 				raise
-		last_input_was, last_command_chosen_was = mode.last_input, mode.last_command_chosen
-		mode.last_input, mode.last_command_chosen = cmd, None
+		mode.last_input = cmd
 
 		fn, matches, suggestions = cmds.guess(cmd)
 		with catch_warnings(record=True) as warnings:
 			if fn:
 				def execute():
-					mode.last_command_chosen = matches[0]
+					mode.last_command_chosen, mode.input_on_last_command_chosen = matches[0], cmd
 					fn()
 
 				# Если, скажем, игрок использовал команду h, подразумевая hit, получил оковы и h стала означать shoot — на повторный ввод h спросить подтверждение.
-				if (last_input_was and last_input_was == cmd and matches and len(matches) == 1 and last_command_chosen_was and last_command_chosen_was != matches[0]
-					and common_prefix_len(last_command_chosen_was, matches[0]) <= 2):
-					mode.last_command_chosen = last_command_chosen_was
-					self.mode.yes_no("Это значило {}, но теперь значит {}. Вы уверены?".format(last_command_chosen_was, matches[0]),
+				if (cmd and mode.input_on_last_command_chosen == cmd and matches and len(matches) == 1 and mode.last_command_chosen != matches[0]
+					and common_prefix_len(mode.last_command_chosen, matches[0]) <= 2):
+					self.mode.yes_no("Это значило {}, но теперь значит {}. Вы уверены?".format(mode.last_command_chosen, matches[0]),
 						lambda mode: (mode.revert() or True) and execute(), default=1)
 				else:
 					execute()
