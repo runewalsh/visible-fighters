@@ -16,9 +16,8 @@ from itertools import accumulate, count as infinite_range
 from unittest import TestCase, TestSuite, TextTestRunner, defaultTestLoader
 from warnings import warn, catch_warnings
 from traceback import format_exc
-app_version, save_version, HoF_version = (0, 2), 1, 1
+app_version, save_version, HoF_version = (1, 0), 1, 1
 TRACEBACKS = False
-EASY_GOD = False
 
 # FORMAT_RAW не хранит эти настройки в сжатом потоке, поэтому для распаковки нужно указать те же, которыми упаковывались.
 LZMA_OPTIONS = {'format': lzma.FORMAT_RAW, 'filters': [{'id': lzma.FILTER_LZMA2, 'preset': lzma.PRESET_DEFAULT}]}
@@ -618,7 +617,7 @@ class Noun(str):
 		elif word.endswith('ь') and (gender == Gender.UNKNOWN or gender == Gender.MALE):
 			return word[:-len('ь')], ngdip('ь', 'я', 'ю', ('ё' if word.endswith('арь') else 'е') + 'м', 'е')
 		elif word.endswith('ы'):
-			return word[:-len('ы')], ngdip('ы', '', 'ам', 'ами', 'ах')
+			return word[:-len('ы')], ngdip('ы', '' if gender == Gender.FEMALE else 'ов', 'ам', 'ами', 'ах')
 		else:
 			return word, None
 
@@ -1106,7 +1105,7 @@ class Commands:
 		return r
 
 	def has_anything(self):
-		return self.root.childs
+		return not not self.root.childs
 
 	def suggest_something(self, input=sentinel, start_node=None):
 		matches = [start_node or self.root]
@@ -1404,7 +1403,7 @@ class Beam:
 	def ac_reduction(ac, pierce=0):
 		relative = 1 - (1 + ac/10)**-0.4
 		check(relative, 0 <= relative <= 1, "relative")
-		absolute_avg = ac/8 * max(0, 1-check(pierce, 0 <= pierce <= 1, "pierce"))
+		absolute_avg = ac/7 * max(0, 1-check(pierce, 0 <= pierce <= 1, "pierce"))
 		absolute_max = ac/4 * max(0, 1-pierce)
 		return Beam.AC_reduction(relative, absolute_avg, absolute_max)
 
@@ -1554,10 +1553,7 @@ class Beam:
 				self.elem_parts = total and OrderedDict((name, dam/total) for name, dam in ongoing_elems.per_name.items() if name)
 
 			if do_tohit:
-				self.hit_chance = None
-				tohit = beam.on_tohit()
-				if tohit:
-					self.hit_chance = Arena.hit_chance(beam.arena, tohit, beam.on_ev(), beam.get_cumulative())
+				self.hit_chance = beam.hit_chance()
 
 		# https://ru.wikipedia.org/wiki/Свёртка_(математический_анализ)#Свёртка_распределений
 		# Для оценки урона берётся N-кратный интеграл по всем элементам и броне.
@@ -1623,12 +1619,16 @@ class Beam:
 		return c and (c if isinstance(c, Arena.Cumulative) else Arena.Cumulative(self.master, self.target, *(c if isinstance(c, tuple) else (c,))))
 
 	def on_tohit(self): return None
-	def on_ev(self): return self.target.ev
+	def on_ev(self): return self.target.calculate_ev(self.target_imagination)
 	def on_cumulative(self): return None
 	def on_dodged(self, chance, roll): pass
 	def on_elements(self): raise NotImplementedError("on_elements")
 	def on_hp_damage(self, hp, fatal): pass
 	def on_account(self): return 'master'
+
+	def hit_chance(self):
+		tohit = self.on_tohit()
+		return tohit and Arena.hit_chance(self.arena, tohit, self.on_ev(), self.get_cumulative())
 
 	def get_elements(self):
 		elements = self.on_elements()
@@ -1772,23 +1772,23 @@ class Hex:
 		self.unapply()
 		self.do_finish(reason, arena)
 
-	def short_desc(self, cmd_prefix="", for_multipad=False, flip=False, with_cmd=False):
-		# desc [cmd]cmd [turns]turns[/turns]
+	def short_desc(self, cmd_prefix="", for_multipad=False, flip=False, cmd=None):
+		# desc [turns]turns[/turns] [cmd]cmd
 		# или
-		# turns[/turns] cmd[/cmd] desc[/desc]
+		# cmd[/cmd] turns[/turns] desc[/desc]
 		name = self.name(self, flip=flip)
 		if for_multipad: name = multipad.escape(name)
 		desc = cap_first(name)
 		if for_multipad and flip: desc += "[/desc]"
 
-		cmd = with_cmd and ("" if not for_multipad or flip else "[cmd]") + "(" + cmd_prefix + self.cmd() + ")" + ("[/cmd]" if for_multipad and flip else "")
 		turns = self.time_based and ("" if not for_multipad or flip else "[turns]") + str(self.turns) + "t" + ("[/turns]" if for_multipad else "")
+		cmd = cmd and ("" if not for_multipad or flip else "[cmd]") + "(" + cmd + ")" + ("[/cmd]" if for_multipad and flip else "")
 		dispelling = None
 		if self.dispell_amount:
-			bar = self.dispelling_bar()
+			bar = self.dispelling_bar(flip=flip)
 			if for_multipad: bar = multipad.escape(bar)
 			dispelling = ("" if not for_multipad or flip else "[dis]") + bar + ("[/dis]" if for_multipad and flip else "")
-		return left_to_right(desc, cmd, turns, dispelling, flip=flip)
+		return left_to_right(desc, turns, dispelling, cmd, flip=flip)
 
 	def change_power(self, power=None, turns=None):
 		nturns = None
@@ -1831,9 +1831,9 @@ class Hex:
 		else:
 			if hook: hook(False, power / self.power)
 
-	def dispelling_bar(self):
+	def dispelling_bar(self, flip=False):
 		part = (self.power - self.dispell_amount) / self.power
-		return Con.vital_bar(part, 1, 5, fillchar='=') + " {}%".format(percentage(part))
+		return left_to_right(Con.vital_bar(part, 1, 5, fillchar='=', flip=flip), "{}%".format(percentage(part)), flip=flip)
 
 	def exclamations(self, power=None):
 		if power is None: power = self.power
@@ -1875,7 +1875,7 @@ class RageHex(Hex):
 		return "ярость" + (f" {m}x" if m is not None and m != 1.5 else "")
 
 	def do_detail(self, game): return \
-		"Увеличивает физическую атаку (x{:.1g}) и любой получаемый урон (x{:.1g}).".format(self.physdam_x, self.backlash_x)
+		"Увеличивает физическую атаку (x{}) и любой получаемый урон (x{}).".format(round(self.physdam_x, 1), round(self.backlash_x, 1))
 
 	@classmethod
 	def do_cmd(cls): return 'rage'
@@ -1905,10 +1905,10 @@ class DeathWordHex(Hex):
 	@classmethod
 	def do_name(cls, instance, flip): return "смертный приговор"
 	def do_detail(self, game):
-		msg = "Смерть через {turns}.".format(turns = plural(self.turns, "{N} ход{/а/ов}"))
+		msg = "Смерть через {turns}".format(turns = plural(self.turns, "{N} ход{/а/ов}"))
 		if game and self.victim is game.player:
-			msg += "\nВы можете снять этот хекс с помощью Развеивания либо убив мага, наложившего заклинание."
-		return msg
+			msg += ", если маг, наложивший заклинание, останется жив к этому времени"
+		return msg + "."
 
 	def do_respite_remove_cost_verb_and_prefix(self, game):
 		return 40 if self.turns >= 10 else 80, "снять", 'break'
@@ -1933,7 +1933,7 @@ class Bleeding(Hex):
 
 	@classmethod
 	def do_name(cls, instance, flip): return "кровотечение" + (instance.exclamations() if instance else "")
-	def do_detail(self, game): return "-{0:.1g}% HP/ход; уменьшает ловкость (-{1}).".format(self.precise_hp_percentile_decay, round(self.dex_debuff))
+	def do_detail(self, game): return "-{0}% HP/ход; уменьшает ловкость (-{1}).".format(round(self.precise_hp_percentile_decay), round(self.dex_debuff))
 
 	def do_respite_remove_cost_verb_and_prefix(self, game):
 		return clamp(round(self.turns * 2), 5, 30), "вылечить", 'cure'
@@ -1980,7 +1980,7 @@ class FrailnessHex(Hex):
 		ac_with = self.victim.ac
 		ac_without = self.victim.calculate_ac(Imagination().remove(self))
 		if ac_without > ac_with:
-			return "{} броню (AC-{}).".format("Нейтрализует" if ac_with == 0 else "Ослабляет", ac_without - ac_with)
+			return "{} броню (AC-{}).".format("Нейтрализует" if ac_with == 0 else "Расщепляет", ac_without - ac_with)
 		else:
 			return "Нет видимого эффекта."
 
@@ -2099,6 +2099,7 @@ class FetterHex(Hex):
 		return Distribution.Bell(pow * 0.3, pow, pow * 1.5)
 
 	def phys_break(self, attacker, arena):
+		attacker.note(lambda sink: sink.youify("{Вы/F} пытает{есь/ся} вырваться.", attacker))
 		self.dispell(self.phys_break_power_dis(attacker).roll(), magical=False, arena=arena)
 		arena.set_action_cost(attacker, max(0.5, 1 - attacker.str / 50))
 
@@ -2159,7 +2160,7 @@ class GraspHex(Hex):
 		msg = "Не даёт атаковать врукопашную."
 		if ev_with < ev_without: msg += "\nEV-{}.".format(ev_without - ev_with)
 		msg += "\nУдушение: ~{} HP/ход.".format(round(self.asphyxiation_beam(None).estimate_damage().avg, 1))
-		return msg + "."
+		return msg
 
 	def do_finish(self, reason, arena):
 		if reason in (self.TIMEOUT, self.CANCELLED) and self.master.alive:
@@ -2181,6 +2182,7 @@ class GraspHex(Hex):
 
 	def phys_break(self, attacker, arena):
 		self.struggled_on_this_turn = True
+		attacker.note(lambda sink: sink.youify("{Вы/F} пытает{есь/ся} вырваться.", attacker))
 		self.dispell(self.phys_break_power_dis(attacker).roll(), magical=False, arena=arena)
 		arena.set_action_cost(attacker, max(0.5, 1 - attacker.str / 50))
 
@@ -2250,6 +2252,7 @@ class ParasiteHex(Hex):
 		is_you = game and self.victim == game.player
 		msg = "Внутри {} растут личинки с парализующими укусами.".format("вас" if is_you else self.victim.name.genitive)
 		if is_you: msg += "\nВы можете заражать других."
+		return msg
 	def do_turns_from_power(self, power): return 13
 
 	def do_respite_remove_cost_verb_and_prefix(self, game):
@@ -2325,7 +2328,7 @@ class BarrierHex(Hex):
 	def do_cmd(cls): return 'barrier'
 	def victim_usefulness(self): return 'good'
 	def merge_behavior(self): return 'strongest'
-	def do_detail(self, game): return "Щит против физического (+{} AC), и элементального (rFire+, rElec+) урона.".format(self.ac_bonus())
+	def do_detail(self, game): return "Щит против физического (+{} AC) и элементального (rFire+, rElec+) урона.".format(self.ac_bonus())
 	def dispellable(self): return True
 
 	def do_start(self):
@@ -2560,7 +2563,7 @@ class DexUpgrade(StatUpgrade):
 	statname, statgender = Noun.parse("{ловкость:f}", return_gender=True)
 
 	@classmethod
-	def do_gold_cost(cls, target): return 70 + 30 * cls.count(target)
+	def do_gold_cost(cls, target): return 70 + 35 * cls.count(target)
 
 	def do_apply_message(self, target): return "Ваши рефлексы улучшаются."
 	def do_revert_message(self, target): return "Вы чувствуете себя {0}.".format(target.gender.ize("неповоротлив{ым/ой}"))
@@ -2570,7 +2573,7 @@ class SpeedUpgrade(StatUpgrade):
 	statname, statgender = Noun.parse("{скорость:f}", return_gender=True)
 
 	@classmethod
-	def do_gold_cost(cls, target): return 150 + 50 * sum(1 for up in cls.find_all(target))
+	def do_gold_cost(cls, target): return 140 + 60 * sum(1 for up in cls.find_all(target))
 
 	def do_apply_message(self, target): return "Ваша кровь бурлит!"
 	def do_revert_message(self, target): return "Ваша кровь остывает..."
@@ -2646,22 +2649,27 @@ class Firestorm(Spell):
 			self.Beam(master, victim, arena).launch()
 
 	def do_help(self, master, target, arena, game, mode):
-		text = "Огненный вихрь, поражающий всех противников."
+		return ("Огненный вихрь, поражающий всех противников." +
+			"\nУрон: " +
+			self.estimate_mass_damage(arena.enemies(master), lambda target: self.Beam(master, target, arena), do_max=mode == 'entrance' or game.god_mode) +
+			".")
+
+	def do_entrance_preview(self, master, target, arena): return self.Beam(master, target, arena)
+
+	@staticmethod
+	def estimate_mass_damage(targets, make_beam, do_max):
 		dam_descs = []
-		for e in arena.enemies(master):
-			est = self.Beam(master, e, arena).estimate_damage()
-			avg_dam_str = "~" + str(round(est.avg, 1)) + (", макс. " + str(round(est.max, 1)) if mode == 'entrance' else "")
+		for target in targets:
+			est = make_beam(target).estimate_damage()
+			avg_dam_str = "~" + str(round(est.avg, 1)) + (", макс. " + str(round(est.max, 1)) if do_max else "")
 
 			try:
 				item = next(dd for dd in dam_descs if dd[0] == avg_dam_str)
 			except StopIteration:
 				item = (avg_dam_str, [])
 				dam_descs.append(item)
-			if e.name not in item[1]: item[1].append(e.name)
-		text += "\nУрон: " + " / ".join(avg_dam_str + (" ({})".format(", ".join(names)) if len(dam_descs) > 1 else "") for avg_dam_str, names in dam_descs) + "."
-		return text
-
-	def do_entrance_preview(self, master, target, arena): return self.Beam(master, target, arena)
+			if target.name not in item[1]: item[1].append(target.name)
+		return " / ".join(avg_dam_str + (" ({})".format(", ".join(names)) if len(dam_descs) > 1 else "") for avg_dam_str, names in dam_descs)
 
 class Dispell(Spell):
 	LIST_ORDER = 1
@@ -2730,7 +2738,9 @@ class Dispell(Spell):
 					msg += sink.youify(" вокруг {вас/F:G}", target) + Beam.damage_paren(hp) + "."
 					return msg
 				master.note(get_note)
-			target.ouch(hp, master, arena, hook=hook, account='magical')
+			etc = {}
+			if target.preset == 'lightning': etc['dont_explode'] = True
+			target.ouch(hp, master, arena, hook=hook, account='magical', etc=etc)
 		else: impossible(target, "target")
 
 	def dispell_creature_amount_dis(self, master, target, arena):
@@ -2841,8 +2851,8 @@ class Frailness(HexSpell):
 	def do_prologue(self, master, target, arena):
 		arena.note(lambda sink: sink.youify("{Вы/F} сдувает{е/} с ладони воображаемую пыль в", master) + sink.youify("{ вашу/} сторону{/ F:G}.", target))
 
-	def ac_malus(self, master, target, arena):
-		return FrailnessHex.ac_malus(None, target.ac, self.power(master, target))
+	def ac_malus(self, master, target, arena, master_imagination=None, target_imagination=None):
+		return FrailnessHex.ac_malus(None, target.ac, self.power(master, target, master_imagination, target_imagination))
 
 	def do_entrance_preview(self, master, target, arena):
 		malus = self.ac_malus(master, target, arena)
@@ -2878,48 +2888,48 @@ class Fetter(HexSpell):
 			return sink.youify("{Вы/F} проворачивает{е/} руку в", master) + sink.youify("{ вашу/} сторону{/ F:G}", target) + "."
 		arena.note(get_note)
 
-class SummonGhost(Spell):
+class PhantasmalGate(Spell):
 	TARGETING = 'n/a'
 	@classmethod
 	def do_name(cls, mode):
-		return "призыв призрака" if mode == 'long' else "приз. призрака" if mode == 'short' else "призрак" if mode == 'veryshort' else impossible(mode, "mode")
+		return "потусторонние врата" if mode == 'long' else "потуст. врата" if mode == 'short' else "врата" if mode == 'veryshort' else impossible(mode, "mode")
 
 	@classmethod
-	def do_cmd(cls): return 'ghost'
+	def do_cmd(cls): return 'o.w.gate'
 
 	def do_help(self, master, target, arena, game, mode):
 		return "Призывает призрака на сторону заклинателя."
 
 	def do_mp_cost(self): return 5
 
-	GHOST_SUBTYPES = 'magic', 'bread', 'pudding', 'war', 'gun'
+	GHOST_SUBTYPES = {
+		'magic': ("{волшебный призрак:a}", {'str_k': .5, 'int_k': 1, 'spd_k': 2}),
+		'bread': ("{призрак:a} хлеба", {}),
+		'pudding': ("{призрак:a} пудинга", {'str_k': 1, 'int_k': .5, 'dex_k': .5, 'spd_base': 80}),
+		'war': ("{призрак:a} войны", {'dex_k': 1}),
+		'gun': ("{призрак:a} пушки", {'str_k': .5, 'dex_k': 1, 'spd_k': 2}) }
 	def do_cast(self, master, target, arena):
 		master_b = arena.as_battler(master)
 		existing = set()
 		for b in arena.squads[master_b.squad_id].members:
 			if b.fighter.preset == 'ghost':
 				existing.add(b.fighter.props['ghost_subtype'])
-		subtype = choose(self.GHOST_SUBTYPES, lambda item, _index: 0 if item in existing else 1, default=None)
-		if subtype is None: subtype = choose(self.GHOST_SUBTYPES)
+		chosen = choose(self.GHOST_SUBTYPES.items(), lambda item, _index: 0 if item[0] in existing else 1, default=None)
+		if chosen is None: chosen = choose(self.GHOST_SUBTYPES.items())
+		subtype, (name, opts) = chosen
 
 		ghost = Fighter()
-		ghost.preset = 'ghost'
+		ghost.preset, ghost.summoned = 'ghost', True
 		ghost.props['ghost_subtype'] = subtype
-		ghost.summoned = True
-		ghost.name, ghost.gender = (
-			Noun.parse("{волшебный призрак:a}", return_gender=True) if subtype == 'magic' else
-			Noun.parse("{призрак:a} хлеба", return_gender=True) if subtype == 'bread' else
-			Noun.parse("{призрак:a} пудинга", return_gender=True) if subtype == 'pudding' else
-			Noun.parse("{призрак:a} войны", return_gender=True) if subtype == 'war' else
-			Noun.parse("{призрак:a} пушки", return_gender=True) if subtype == 'gun' else impossible(subtype, "subtype"))
+		ghost.name, ghost.gender = Noun.parse(name, return_gender=True)
 
 		with ghost.save_relative_vitals():
 			ghost.xl = max(1, rand_round(master.xl * (1 - (1 + master.int ** 0.5) ** -0.5)))
 			base = master.int * (2/3)
-			ghost.base_str = max(5, rand_round(base if subtype in ('pudding') else base / 2 if subtype in ('magic', 'gun') else base / 1.5))
-			ghost.base_int = max(5, rand_round(base if subtype in ('magic',) else base / 2 if subtype in ('pudding',) else base / 1.5))
-			ghost.base_dex = max(5, rand_round(base if subtype in ('gun', 'war') else base / 2 if subtype in ('pudding',) else base / 1.5))
-			ghost.base_spd = 100 + 2 * master.int if subtype in ('magic', 'gun') else 80 + master.int if subtype in ('pudding',) else 100 + master.int
+			ghost.base_str = max(5, rand_round(base * opts.get('str_k', 1 / 1.5)))
+			ghost.base_int = max(5, rand_round(base * opts.get('int_k', 1 / 1.5)))
+			ghost.base_dex = max(5, rand_round(base * opts.get('dex_k', 1 / 1.5)))
+			ghost.base_spd = opts.get('spd_base', 100) + opts.get('spd_k', 1) * master.int
 		ghost.set_unarmed(BareHands())
 		arena.add(ghost, master_b.squad_id, UniversalAI(), shortcut_hint="Ghost")
 		arena.note(lambda sink: sink.youify("{вы/F} шепчет{е/} заклинание, и рядом с {вами/ним/ней}", master) + " материализуется " + ghost.name + ".")
@@ -2934,10 +2944,10 @@ class DrainLife(Spell):
 
 	def do_help(self, master, target, arena, game, mode):
 		dis = self.drain_dis(master, target)
-		master_has_summons = any(isinstance(sp, SummonGhost) for sp in master.spells)
+		master_has_summons = any(isinstance(sp, PhantasmalGate) for sp in master.spells)
 		return "Высасывает ~{} (макс. {}) ед. жизни противника и {}.".format(
 			round(dis.estimate_avg(), 1), ceil(dis.estimate_max()),
-			"{} её часть {}".format(*("распределяет", "между заклинателем и его друзьями") if master_has_summons else ("передаёт", "заклинателю")))
+			"{} часть {}".format(*("распределяет", "между заклинателем и его друзьями") if master_has_summons else ("передаёт", "заклинателю")))
 
 	def drain_dis(self, master, target, master_imagination=None, target_imagination=None):
 		master_int, target_int = master.calculate_int(master_imagination), target.calculate_int(target_imagination)
@@ -3002,8 +3012,8 @@ class BallLightning(Spell):
 	def do_help(self, master, target, arena, game, mode):
 		est = self.beam(master, game.player, arena).estimate_damage()
 		elem_parts = ", ".join(est.describe_elem_parts())
-		return ("Призывает шаровую молнию, взрыв которой наносит урон (~{}, макс. {}{}) всем окружающим.\n"
-			"Молния наносит меньший урон или не наносит урон вовсе при преждевременном уничтожении.").format(
+		return ("Призывает шаровую молнию, взрыв которой наносит урон (~{}, макс. {}{}) всем окружающим.\n\n"
+			"При преждевременном уничтожении молния наносит меньший урон или не наносит урона вовсе. Также молния может быть развеяна.").format(
 				round(est.avg, 1), round(est.max, 1), ", " + elem_parts if elem_parts else "")
 
 	def do_mp_cost(self): return 5
@@ -3061,13 +3071,12 @@ class BallLightning(Spell):
 	@classmethod
 	def act_explode(cls, lightning, arena):
 		assert lightning.dead
-		fizzled, rem, orig = False, *(lightning.props[prop_name] for prop_name in ('remaining_life', 'orig_life'))
-		if rem > 0:
-			if random() < 0.9 * (rem / orig) ** 1.5:
-				arena.note(lambda sink: sink.youify("{вы/F} тает{е/} в воздухе.", lightning))
-				fizzled = True
+		fizzle, rem, orig = False, *(lightning.props[prop_name] for prop_name in ('remaining_life', 'orig_life'))
+		if rem > 0 and random() < 0.9 * (rem / orig) ** 1.5: fizzle = True
 
-		if not fizzled:
+		if fizzle:
+			arena.note(lambda sink: sink.youify("{вы/F} тает{е/} в воздухе.", lightning))
+		else:
 			power_mod = 0.1 + 0.9 * (1 - rem / orig)
 			arena.note(lambda sink: sink.youify("{вы/F}" + (" взрывает{есь/ся}!" if power_mod > 0.5 else " вспыхивает."), lightning))
 			for victim_b in arena.battlers:
@@ -3114,10 +3123,10 @@ class DrainXP(ResistibleSpell):
 		arena.note(lambda sink: sink.youify("{Вы/F} пытает{есь/ся} высосать", master) + sink.youify(" {вас/F:A}, но {вы/он/она/оно} не поддаёт{есь/ся}.", target))
 
 	def do_apply(self, power, master, target, arena):
-		amount = bell(power / 20, power / 12, power / 8)
+		amount = min(bell(power / 20, power / 10, power / 7), target.xl + target.xp / target.xp_for_levelup())
 		xl, _xp = target.drain_xp(amount, relative=True, emulate=True)
 		def get_note(sink):
-			arena.note(lambda sink: sink.youify("{Вы/F} высасывает", master) + sink.youify(" {вас/F:A} через трубочку", target) + f" (-{amount:.0%}).")
+			arena.note(lambda sink: sink.youify("{Вы/F} высасывает{е/}", master) + sink.youify(" {вас/F:A} через трубочку", target) + f" (-{amount:.0%}).")
 		target.note(get_note)
 
 		if xl != target.xl:
@@ -3266,10 +3275,12 @@ class Ammunition:
 	def shop_name(cls, target): return cls.do_name(None, target, 'battle')
 	def respite_name(self, target): return self.do_name(self, target, 'respite')
 	@classmethod
-	def noun_name(cls, shorter=False): return cls.do_name(None, None, 'noun_shorter' if shorter else 'noun')
+	def noun_name(cls): return cls.do_name(None, None, 'noun')
+	@classmethod
+	def plural_name(cls): return cls.do_name(None, None, 'plural')
 
 	@classmethod
-	# mode = 'battle', 'respite', 'noun'
+	# mode = 'battle', 'respite', 'noun', 'plural'
 	def do_name(cls, instance, target, mode): raise NotImplementedError("do_name")
 
 	@classmethod
@@ -3305,7 +3316,7 @@ class IncendiaryAmmunition(Ammunition):
 		return (
 			"зажиг. патроны" + (cls.name_up(target, 0) or "") if mode == 'battle' else
 			f"заж.{instance.human_times(instance.times())}" if mode == 'respite' else
-			Noun.parse("{зажигательный патрон}") if mode in ('noun', 'noun_shorter') else impossible(mode, 'mode'))
+			Noun.parse("{зажигательный патрон}") if mode == 'noun' else Noun.parse("{зажигательные патроны}") if mode == 'plural' else impossible(mode, 'mode'))
 
 	@classmethod
 	def do_name_up(cls, target, up):
@@ -3326,7 +3337,7 @@ class SilenceAmmunition(Ammunition):
 		return (
 			"тишина" if mode == 'battle' else
 			"тиш." if mode == 'respite' else
-			Noun.parse("{патрон} тишины") if mode in ('noun', 'noun_shorter') else impossible(mode, 'mode'))
+			Noun.parse(("{патроны}" if mode == 'plural' else "{патрон}") + " тишины") if mode in ('noun', 'plural') else impossible(mode, 'mode'))
 
 	@classmethod
 	def do_cmd(cls): return 'silence'
@@ -3336,7 +3347,7 @@ class SilenceAmmunition(Ammunition):
 class TimestopAmmunition(Ammunition):
 	LIST_ORDER = 2
 	MAX_CHARGES = 3
-	turns = 4
+	turns = 3
 
 	def do_recharge_cost(self): return 80
 	@classmethod
@@ -3344,7 +3355,7 @@ class TimestopAmmunition(Ammunition):
 		return (
 			"ост. времени" if mode == 'battle' else
 			"врем." if mode == 'respite' else
-			Noun.parse("{патрон} ост" + ("." if mode == 'noun_shorter' else "ановки") + " времени") if mode in ('noun', 'noun_shorter') else impossible(mode, 'mode'))
+			Noun.parse(("{патроны}" if mode == 'plural' else "{патрон}") + " остановки времени") if mode in ('noun', 'plural') else impossible(mode, 'mode'))
 
 	@classmethod
 	def do_cmd(cls): return 'timestop'
@@ -3409,7 +3420,7 @@ class IncendiaryAmmunitionUpgrade(AmmunitionUpgrade):
 	def do_ap_cost(cls, target): return 1
 
 	@classmethod
-	def do_gold_cost(cls, target): return 100 + 30 * cls.count(target)
+	def do_gold_cost(cls, target): return 100 + 50 * cls.count(target)
 
 	@classmethod
 	def genitive_ammunition_module_name(cls): return "зажигательных патронов"
@@ -3421,7 +3432,7 @@ class SilenceAmmunitionUpgrade(AmmunitionUpgrade):
 	def do_ap_cost(cls, target): return 2
 
 	@classmethod
-	def do_gold_cost(cls, target): return 140
+	def do_gold_cost(cls, target): return 160
 
 	@classmethod
 	def genitive_ammunition_module_name(cls): return "патронов тишины"
@@ -3461,9 +3472,9 @@ class Special(FighterAttribute):
 	def detail(self, game): return self.do_detail(game)
 	def do_detail(self, game): raise NotImplementedError("do_detail")
 
-	def do_ouch(self, arena, elems): pass
+	def do_ouch(self, arena, elems, etc): pass
 	def do_tick(self, arena): pass
-	def do_die(self, arena): pass
+	def do_die(self, arena, etc): pass
 
 	def should_display(self): return self.do_should_display()
 	def do_should_display(self): return True
@@ -3479,7 +3490,7 @@ class RageOnLowHP(Special):
 		return "{}, {} до {} HP, приходит в ярость и начинает наносить и получать повышенный урон.".format(
 			self.fighter.name.cap_first(), self.fighter.gender.ize("ранен{ый/ая}"), self.hp_threshold())
 
-	def do_ouch(self, arena, elems):
+	def do_ouch(self, arena, elems, etc):
 		if not self.proceed and self.fighter.hp <= self.hp_threshold():
 			self.rage().apply(self.fighter, arena=arena)
 			self.proceed = True
@@ -3554,7 +3565,10 @@ class Impregnation(Special):
 		self.hex = hex
 
 	def do_name(self): return "паразиты"
-	def do_detail(self, game): return "{} может отложить яйца внутрь захваченного противника.".format(self.fighter.name.cap_first())
+	def do_detail(self, game):
+		return "{} может отложить яйца внутрь{} противника.{}".format(
+			self.fighter.name.cap_first(), " захваченного" if self.fighter.preset == 'tentacle' else "",
+			"\nУклонение: {:.0%}".format(1 - Arena.hit_chance(None, *self.save_throw(game.player))) if game.player != self.fighter else "")
 	def save_throw(self, target): return 5 + self.fighter.dex, 0.5 * target.dex, Arena.Cumulative(self.fighter, target, 'impregnate')
 
 	def act_impregnate(self, target, arena):
@@ -3573,10 +3587,14 @@ class Impregnation(Special):
 				return msg
 			arena.note(get_note)
 		else:
+			master_b = arena.as_battler(self.fighter)
+			if master_b and master_b.game and master_b.game.performance and not master_b.game.performance.kiss:
+				master_b.game.performance.kiss = target
+
 			def get_note(sink):
 				if self.fighter.is_mammal:
 					msg = sink.youify("{Вы/F} целует{е/}", self.fighter) + sink.youify(" {вас/F:A}", target)
-					msg += sink.youify(" и оставляет{е/}", self.fighter) + (" что-то" if sink.you == self.fighter else "") + sink.youify(" внутри {вас/него/неё}", target)
+					msg += sink.youify(" и оставляет{е/}", self.fighter) + ("" if sink.you == self.fighter else " что-то") + sink.youify(" внутри {вас/него/неё}", target)
 					msg += (" личинок" if sink.you == self.fighter else "")
 				else:
 					msg = sink.youify("{Вам/F:D} удаётся протолкнуть", self.fighter) + " " + something(sink)
@@ -3600,10 +3618,11 @@ class Impregnation(Special):
 		if space:
 			squad_id = choose(space)
 			larva = Fighter()
-			larva.name, larva.gender = Noun.parse("{личинка:af}") + " " + mother.name.genitive, Gender.FEMALE
+			larva.name, larva.gender, larva.preset = Noun.parse("{личинка:af}") + " " + mother.name.genitive, Gender.FEMALE, 'larva'
 			larva.summoned = True
 			larva.dispellable = False
 			with larva.save_relative_vitals():
+				larva.base_mhp = 5
 				larva.base_str = max(5, rand_round(uniform(mother.base_str / 4, mother.base_str / 3)))
 				larva.base_dex = max(5, rand_round(uniform(mother.base_dex / 4, mother.base_dex / 3)))
 			larva.set_unarmed(ParalyzingStinger())
@@ -3683,18 +3702,23 @@ class FireVulnerability(Special):
 		return "{} получает на {:.0%} больший урон от огня.".format(self.fighter.name.cap_first(), self.amount)
 
 class BallLightningTimeoutAndExplodeOnDeathOrTouch(Special):
-	def do_ouch(self, arena, elems):
+	def do_ouch(self, arena, elems, etc):
 		if elems and all(isinstance(elem, (Beam.Fire, Beam.Electricity)) for elem in elems): return
-		self.fighter.die(arena)
+		self.fighter.die(arena, etc=etc)
 
 	def do_tick(self, arena):
 		remaining_life = self.fighter.props['remaining_life'] = self.fighter.props['remaining_life'] - 1
 		if remaining_life <= 0: self.fighter.die(arena)
 
-	def do_die(self, arena):
-		BallLightning.act_explode(self.fighter, arena)
+	def do_die(self, arena, etc):
+		if 'dont_explode' not in etc:
+			BallLightning.act_explode(self.fighter, arena)
+
 	def do_name(self): return "Самоуничтожение"
-	def do_detail(self, game): return BallLightning.beam(self.fighter.props['master'], game.player, None).human_stats()
+	def do_detail(self, game):
+		msg = "Осталось {}.".format(plural(self.fighter.props['remaining_life'], "{N} ход{/а/ов}"))
+		msg += "\n" + BallLightning.beam(self.fighter.props['master'], game.player, None).human_stats()
+		return msg
 
 class UnarmedAttack(FighterAttribute):
 	class Beam(Beam):
@@ -3720,8 +3744,8 @@ class UnarmedAttack(FighterAttribute):
 	def attack(self, target, arena):
 		self.beam(target, arena).launch()
 
-	def beam(self, target, arena):
-		return self.Beam(self, target, arena)
+	def beam(self, target, arena, master_imagination=None, target_imagination=None):
+		return self.Beam(self, target, arena, master_imagination, target_imagination)
 
 	def name(self): return self.do_name()
 	def do_name(self): raise NotImplementedError("do_name")
@@ -3737,7 +3761,7 @@ class BareHands(UnarmedAttack):
 			self.arena.note(lambda sink: self.dodge_msg(chance, roll, sink, your_gen="вашего", atk_gen="удара"))
 
 		def on_elements(self):
-			return self.Physical(tuple(x * (1 + (self.master_str() - 10)/(5 if self.master_str() > 10 else 10)) for x in (0, 1.2, 2)))
+			return self.Physical(tuple(x * (1 + (self.master_str() - 10)/(5 if self.master_str() > 10 else 10)) for x in (0, 1.3, 2)))
 
 		def on_hp_damage(self, hp, fatal):
 			def get_note(sink):
@@ -3864,7 +3888,7 @@ class SlimyTouch(UnarmedAttack):
 			self.arena.note(get_note)
 
 			if slimify:
-				SlimeHex(bell(0.5, 1, 1.5) * ((self.master.str ** 0.5 + 0.5 * hp) / 6)).apply(self.master, self.target, self.arena)
+				SlimeHex(bell(0.5, 1, 1.5) * ((self.master.str ** 0.5 + 0.4 * hp) / 8)).apply(self.master, self.target, self.arena)
 
 	def do_name(self): return "слизь"
 	def do_detail(self, game):
@@ -4197,6 +4221,7 @@ class Fighter(Living, MessageBroadcaster):
 				value += item.AMOUNT if added else -item.AMOUNT
 		for hex in Imagination.hexes(imagination, self):
 			if isinstance(hex, SlimeHex): value -= hex.dex_debuff(value)
+			elif isinstance(hex, Bleeding): value -= hex.dex_debuff
 		return max(1, value)
 
 	def calculate_spd(self, imagination=None):
@@ -4278,7 +4303,7 @@ class Fighter(Living, MessageBroadcaster):
 		else:
 			add_from(master) # засчитается «мистеру None»
 
-	def ouch(self, hp_dam, master, arena, *, hook=lambda fatal: None, account='master', count_as_attack=True, elems=None):
+	def ouch(self, hp_dam, master, arena, *, hook=lambda fatal: None, account='master', count_as_attack=True, elems=None, etc={}):
 		check(hp_dam >= 0, "hp_dam?!")
 		assert account in ('master', 'unarmed', 'melee', 'ranged', 'magical')
 		if self.dead: return
@@ -4288,13 +4313,13 @@ class Fighter(Living, MessageBroadcaster):
 
 		self.cur_hp -= hp_dam
 		if self.cur_hp <= 0:
-			self.die(arena, hook=lambda: hook(True))
+			self.die(arena, hook=lambda: hook(True), etc=etc)
 		else:
 			hook(False)
 			for sp in self.specials:
-				sp.do_ouch(arena, elems)
+				sp.do_ouch(arena, elems, etc)
 
-	def die(self, arena, *, hook=lambda: None):
+	def die(self, arena, *, hook=lambda: None, etc={}):
 		check(not self.dead, "not dead")
 		self.alive = False
 		if hook: hook()
@@ -4311,13 +4336,14 @@ class Fighter(Living, MessageBroadcaster):
 					hex.cancel()
 
 		for sp in self.specials:
-			sp.do_die(arena)
+			sp.do_die(arena, etc)
 
 	def end_turn(self, arena):
 		with self.lock_hexes() as hexes:
 			for hex in hexes:
 				if self.dead: break
 				check(hex.victim == self, "hex.victim != self", not hex.ran_out, "ran_out")
+				if isinstance(hex, DeathWordHex) and self.paralyzed(): continue
 				hex.tick(arena)
 
 		for sp in self.specials:
@@ -4379,7 +4405,7 @@ class Fighter(Living, MessageBroadcaster):
 	def remove_special(self, special):
 		self.specials.remove(special)
 		special.reset_fighter(self)
-	
+
 	def find_hex(self, hex_type):
 		assert issubclass(hex_type, Hex), hex_type
 		return next((hex for hex in self.hexes if isinstance(hex, hex_type)), None)
@@ -4398,6 +4424,10 @@ class Fighter(Living, MessageBroadcaster):
 	def consume_mp(self, mp):
 		assert self.enough_mp(mp)
 		self.cur_mp -= mp
+
+	def castable_dispell(self):
+		dispell = self.can_cast() and next((sp for sp in self.spells if isinstance(sp, Dispell)), None)
+		return dispell and self.can_cast(dispell) and dispell
 
 	def generic_bar(self, name, cur, max, flip):
 		return left_to_right(name + ("" if flip else ":"), Con.vital_bar(cur, max, flip=flip), f"{cur}/{max}", flip=flip)
@@ -4471,7 +4501,7 @@ class Fighter(Living, MessageBroadcaster):
 		self.props['dispellable'] = value
 
 	transient = property(lambda self: self.summoned)
-	is_mammal = property(lambda self: self.preset in ('player', 'rat', 'bear', 'thief', 'executioner', 'necromancer', 'magius'))
+	is_mammal = property(lambda self: self.preset in ('player', 'rat', 'bear', 'thief', 'executioner', 'necromancer', 'magius', 'larva'))
 	is_plant  = property(lambda self: self.preset in ('flower',))
 	is_bone   = property(lambda self: self.preset in ('death',))
 	is_ghost  = property(lambda self: self.preset in ('ghost'))
@@ -4505,9 +4535,6 @@ del _to_props
 class Weapon(Living):
 	ap_limit = property(lambda self: 1 + (self.xl - 1))
 	LEVEL_CAP = 6
-
-	def do_xp_for_levelup(self, xl):
-		return super().do_xp_for_levelup(xl)
 
 	def __init__(self):
 		Living.__init__(self)
@@ -4569,8 +4596,19 @@ class Weapon(Living):
 		self.shot_beam(target, arena, ammo).launch()
 
 	def rapid(self, targets, arena, ammo):
+		self.owner.note(lambda sink: sink.youify("{Вы/F} стреляет{е/} очередью.", self.owner))
+		n = 0
+		def ratata():
+			nonlocal n
+			self.owner.note("Тра!" if n == 0 else "Та!")
+			n += 1
+
 		for target in targets:
+			ratata()
 			self.shot_beam(target, arena, ammo, mode='rapid').launch()
+
+		while n < 3:
+			ratata()
 
 	def detail(self, game): return self.do_detail(game)
 	def do_detail(self, game): return self.melee_beam(game.player, None).human_stats(do_eff=False)
@@ -4581,7 +4619,7 @@ class MachineGun(Weapon):
 			return 8 + self.master_dex()
 
 		def on_elements(self):
-			return self.Physical(tuple(x * (1 + (self.master_str() - 10)/(7 if self.master_str() > 10 else 10)) for x in (0, 1.5, 3)), pierce=0.2)
+			return self.Physical(tuple(x * (1 + (self.master_str() - 10)/(7 if self.master_str() > 10 else 10)) for x in (0, 1.6, 3)), pierce=0.2)
 
 		def on_hp_damage(self, hp, fatal):
 			def get_note(sink):
@@ -4607,22 +4645,38 @@ class MachineGun(Weapon):
 			self.arena.note(get_note)
 
 	class ShotBeam(Weapon.ShotBeamBase):
+		def __init__(self, weapon, target, arena, ammo, mode='single', master_imagination=None, target_imagination=None):
+			super().__init__(weapon, target, arena, ammo, mode, master_imagination, target_imagination)
+			self.imagine_incendiary = 0
+
 		def on_elements(self):
 			elements = [self.Physical((0, 2.4, 7), pierce=1.0),]
 
-			if isinstance(self.ammo, IncendiaryAmmunition):
-				times = self.ammo.times()
-				elements.append(self.Fire((0, 1.6 * times, 4.5 * times), pierce=0.7))
+			incendiary = self.imagine_incendiary
+			if isinstance(self.ammo, IncendiaryAmmunition): incendiary += self.ammo.times()
+			if incendiary > 0:elements.append(self.Fire((0, 1.5 * incendiary, 4.5 * incendiary), pierce=0.6))
 			return elements
 
 		def on_cumulative(self):
 			return self.mode == 'single' and Arena.Cumulative(self.master, self.target, 'shot' + ('-' + self.ammo.cmd() if self.ammo else ''), 0.6)
 
+		def on_dodged(self, chance, roll):
+			if self.mode == 'rapid':
+				def get_note(sink):
+					return sink.youify("Пуля пролетает мимо {вас/F:G}", self.target) + "."
+				self.arena.note(get_note)
+			else:
+				super().on_dodged(chance, roll)
+
 		def on_hp_damage(self, hp, fatal):
 			def get_note(sink):
-				msg = sink.youify("{Вы/F} попадает{е/}", self.master) + " в" + sink.youify(" {вас/F:A}", self.target)
+				if self.mode == 'single': msg = sink.youify("{Вы/F} попадает{е/}", self.master)
+				elif self.mode == 'rapid': msg = "Пуля попадает"
+				else: impossible(self.mode, "mode")
+
+				msg += " в" + sink.youify(" {вас/F:A}", self.target)
 				master_b = self.arena.as_battler(self.master, maybe=True)
-				if not (master_b and master_b.game):
+				if not (master_b and master_b.game) and self.mode == 'single':
 					msg += " " + "пулей"
 
 				if fatal and self.target.flavored_death:
@@ -4638,8 +4692,8 @@ class MachineGun(Weapon):
 							(" " + what_or_heap_adj if what_or_heap_adj and what is not None else "") +
 							(" " + what if what else ""))
 
-					msg += (
-						" и" + Beam.damage_paren(hp) + sink.youify(" превращает{е/}", self.master) + sink.youify(" {вас/его/её}", self.target) +
+					msg += (" и" + Beam.damage_paren(hp) + sink.youify(" превращает" + ("{е/}" if self.mode == 'single' else ""), self.master) +
+						sink.youify("{/ его/ её}" if self.mode == 'rapid' else " {вас/его/её}", self.target) +
 						" в " + (
 							heap_of("мяса", Gender.NEUTER) if self.target.is_mammal else
 							heap_of("листьев", plural=True) if self.target.is_plant else
@@ -4648,7 +4702,7 @@ class MachineGun(Weapon):
 				elif hp:
 					msg += Beam.damage_paren(hp) + "."
 				else:
-					msg += ", но" + Beam.damage_paren(hp) + sink.youify(" не наносит{е/} вреда", self.master) + "."
+					msg += ", но" + Beam.damage_paren(hp) + sink.youify(" не наносит" + ("{е/}" if self.mode == 'single' else "") + " вреда", self.master) + "."
 				return msg
 			self.arena.note(get_note)
 
@@ -4711,6 +4765,14 @@ class Dagger(Weapon):
 							self.master.cur_mp += recover_mp
 				else: impossible(self.weapon.coating, "coating")
 
+	def do_detail(self, game):
+		msg = super().do_detail(game)
+		if self.coating in ('poison', 'poison2'):
+			msg += "\nЯд отнимает HP и MP в течение нескольких ходов."
+		elif self.coating == 'runes':
+			msg += "\nВосполняет ману за счёт крови противника."
+		return msg
+
 class ExecutionerAxe(Weapon):
 	def __init__(self):
 		super().__init__()
@@ -4745,7 +4807,7 @@ class DeathScythe(Weapon):
 
 	class MeleeBeam(Weapon.MeleeBeam):
 		def on_elements(self):
-			return self.Physical(tuple(x * max(0.1, 1 + (self.master_str() - 10)/5) for x in (0, 1.4, 3)))
+			return self.Physical(tuple(x * max(0.1, 1 + (self.master_str() - 10)/6) for x in (0, 1.3, 3)))
 
 		def on_hp_damage(self, hp, fatal):
 			def get_note(sink):
@@ -4773,6 +4835,9 @@ class DeathScythe(Weapon):
 					if nturns >= 1:
 						dw.turns = nturns
 						self.arena.note(lambda sink: sink.you == self.target and "Вы слышите, как сыплется песок в часах.")
+
+	def do_detail(self, game):
+		return super().do_detail(game) + "\nПриближает исполнение Смертного приговора."
 
 class Arena(MessageBroadcaster, MessageSink):
 	BASELINE_SPD = 100
@@ -5437,7 +5502,6 @@ class UniversalAI(RandomizedAI):
 					self.consider(attack, attack_type, weight, soft_cooldown_base=0.8, soft_cooldown=1)
 				consider()
 
-		# Я в курсе, что это должны быть виртуальные методы. Просто так проще переделывать, всё в одном месте.
 		if self.fighter.can_cast():
 			for sp in self.fighter.spells:
 				if not self.fighter.can_cast(sp): continue
@@ -5445,6 +5509,7 @@ class UniversalAI(RandomizedAI):
 				if isinstance(sp, ResistibleSpell):
 					for target in self.arena.enemies(self.fighter):
 						if isinstance(sp, HexSpell) and target.find_hex(sp.hex_class): continue
+						if isinstance(sp, DrainXP) and target.xl == 1 and target.xp == 0: continue
 						def consider(sp=sp, target=target):
 							def attack(ai):
 								self.fighter.act_cast_spell(sp, target, ai.arena)
@@ -5455,7 +5520,7 @@ class UniversalAI(RandomizedAI):
 							self.consider(attack, sp.cmd(), weight, soft_cooldown=4 if isinstance(sp, DrainXP) else 6, soft_cooldown_base=0.1, hard_cooldown=2)
 						consider()
 
-				elif isinstance(sp, SummonGhost):
+				elif isinstance(sp, PhantasmalGate):
 					squad = self.arena.squads[self.arena.as_battler(self.fighter).squad_id]
 					if squad.max_members is not None and squad.max_members - len(squad.members) < 1: continue
 					existing_ghosts = sum(1 for b in squad.members if b.fighter.preset == 'ghost')
@@ -5504,13 +5569,17 @@ class UniversalAI(RandomizedAI):
 					if squad.max_members is None or squad.max_members - len(squad.members) >= 1:
 						barrier_hex = self.fighter.find_hex(BarrierHex)
 						barrier_spell = next((sp for sp in self.fighter.spells if isinstance(sp, Barrier)), None)
-						if (not barrier_hex or barrier_hex.turns < 5) and (not barrier_spell or self.fighter.mp < sp.mp_cost() + barrier_spell.mp_cost()): continue
+						good_barrier = barrier_hex and barrier_hex.turns >= 5
+						if not good_barrier:
+							if not barrier_spell or self.fighter.mp < sp.mp_cost() + barrier_spell.mp_cost(): continue
 
 						existing_lightnings = sum(1 for b in squad.members if b.fighter.preset == 'lightning')
+						weight = 1 / (1 + existing_lightnings) ** 1
+						if not good_barrier: weight /= 2
 						def consider(sp=sp):
 							def conjure(ai):
 								self.fighter.act_cast_spell(sp, None, ai.arena)
-							self.consider(conjure, sp.cmd(), 1 / (1 + existing_lightnings) ** 1, hard_cooldown=1, soft_cooldown=7, soft_cooldown_base=0.1)
+							self.consider(conjure, sp.cmd(), weight, hard_cooldown=1, soft_cooldown=7, soft_cooldown_base=0.1)
 						consider()
 
 				elif isinstance(sp, Chronosphere):
@@ -6311,9 +6380,9 @@ class InvisibleFighters(Mode):
 				os.chdir(Game.SAVE_FOLDER)
 				try:
 					cls(); self.session.cls_once()
-					exec(compile(self.src(), "invisible_fighters.py", 'exec'), {'EXTERNAL': externals, 'input': input, 'print': print})
+					exec(compile(self.src(), "invisible_fighters.py", 'exec'), {'EXTERNAL': externals, 'input': input, 'print': print, 'quit': sys.exit})
 				except InputInterrupt:
-					exit()
+					sys.exit()
 				except SystemExit:
 					pass
 				finally:
@@ -6788,10 +6857,10 @@ class Game:
 
 		if input == '*perf':
 			mode.more(str(self.performance) if self.performance else "Информации о бое нет.")
-		elif EASY_GOD and input == '*d+' or len(input) == 24 and digest(input) == '𦊔揷憒𥶢𐚲𥽕䋮㰈諃瘱𣒋灛𨈜䊞擴𧦂':
+		elif len(input) == 24 and digest(input) == '𦊔揷憒𥶢𐚲𥽕䋮㰈諃瘱𣒋灛𨈜䊞擴𧦂':
 			was_in_god_mode, self.god_mode = self.god_mode, True
 			mode.more("Активирован режим отладки." if not was_in_god_mode else "Вы уже в режиме отладки.")
-		elif EASY_GOD and input == '*d-' or len(input) == 15 and digest(input) == '㾮𡋳𧚩𤢢𢌎𢨛𡺿柯阂㤢𠲐騠𡯏㓐𡱕漗':
+		elif len(input) == 15 and digest(input) == '㾮𡋳𧚩𤢢𢌎𢨛𡺿柯阂㤢𠲐騠𡯏㓐𡱕漗':
 			was_in_god_mode, self.god_mode = self.god_mode, False
 			mode.more("Режим отладки деактивирован." if was_in_god_mode else "Вы не в режиме отладки.")
 		else:
@@ -6856,7 +6925,7 @@ class Game:
 	# Данные, необходимые для подведения итогов текущего боя (оценки + раскидывание опыта между игроком и оружием).
 	# Возможно, отложенного — т. е. либо игрок сейчас на арене, либо существует hibernated_arena, и теоретически это можно было бы упихнуть в Arena.
 	class Performance:
-		__slots__ = 'turns', 'escapes', 'unarmed', 'melee', 'ranged', 'magical', 'starting_hp_percent', 'starting_effective_enemies_xl'
+		__slots__ = 'turns', 'escapes', 'unarmed', 'melee', 'ranged', 'magical', 'starting_hp_percent', 'starting_effective_enemies_xl', 'kiss'
 
 		def __init__(self, game=None, arena=None):
 			self.turns   = 0
@@ -6864,10 +6933,11 @@ class Game:
 			self.unarmed, self.melee, self.ranged, self.magical = tuple(Arena.DamageContribution() for _index in range(4))
 			self.starting_hp_percent = game.player.hp / game.player.mhp if game else 1
 			self.starting_effective_enemies_xl = game and arena and arena.effective_enemies_xl(arena.enemies(game.player))
+			self.kiss = None
 
 		def __getstate__(self):
 			return {name: value for name, value in getattrs(self, self.__slots__) if not (
-				name in ('turns', 'escapes', 'unarmed', 'melee', 'ranged', 'magical') and not value
+				name in ('turns', 'escapes', 'unarmed', 'melee', 'ranged', 'magical', 'kiss') and not value
 				or name == 'starting_hp_percent' and value == 1)}
 
 		def __setstate__(self, state):
@@ -6937,14 +7007,14 @@ class Respite(NonCombatMode):
 
 	def describe_player(self, player, cmds, pad):
 		mp_desc = []
-		line = pad + "[name_pad]" + multipad.escape(player.hp_bar()) + "   [cure_verb]"
+		line = pad + "[name_pad]" + multipad.escape(player.hp_bar()) + "  [cure_verb]"
 		if player.hp < player.mhp:
 			# Лечение возможно в долг, т. к. если у игрока нет денег — у него и так проблемы.
 			# Бесплатно/по сниженной цене лечить нежелательно, чтобы сократить пространство для эксплоитов.
 			# Оно остаётся всё равно, в виде нобрейн-решения «если денег впритык, купить апгрейды и уже потом лечиться».
 			# Можно запретить покупку апгрейдов при неполном здоровье, или лечение в долг, когда игроку есть что продать, но это как-то не по людски.
 			cost = clamp(round((1 - player.hp / player.mhp) * 16 + 0.2 * (player.mhp - player.hp)), 1, 50)
-			line += "восстановить: ${0}".format(cost)
+			line += "восстановить: [cost]${0}".format(cost)
 			notes = ["heal hp"]
 			if not self.game.enough_gold_for(cost): notes.append("в долг")
 			line += " [cure_cmd]({})".format(", ".join(notes))
@@ -6971,7 +7041,7 @@ class Respite(NonCombatMode):
 			line = "[name_pad]" + multipad.escape(player.mp_bar())
 			if player.mp < player.mmp:
 				cost = clamp(round((1 - player.mp / player.mmp) * 45 + 0.9 * (player.mmp - player.mp)), 1, 70)
-				line += " [cure_verb]восстановить: ${0}".format(cost)
+				line += " [cure_verb]восстановить: [cost]${0}".format(cost)
 				if self.game.enough_gold_for(cost):
 					line += " [cure_cmd](heal mp)"
 					def add_heal_mp(cost=cost):
@@ -6986,11 +7056,7 @@ class Respite(NonCombatMode):
 					line += " :("
 			mp_desc.append(line)
 
-		dispell = None
-		if player.can_cast():
-			dispell_instance = next((sp for sp in player.spells if isinstance(sp, Dispell)), None)
-			if dispell_instance and player.can_cast(dispell_instance): dispell = dispell_instance
-
+		dispell = player.castable_dispell()
 		for hex in player.hexes:
 			cvp = hex.do_respite_remove_cost_verb_and_prefix(self.game)
 			if cvp:
@@ -7010,7 +7076,7 @@ class Respite(NonCombatMode):
 				cmds_enum = "/".join(prefixes)
 				cmds_enum += (" " if cmds_enum else "") + hex.cmd()
 
-				mp_desc.append(pad + hex.short_desc() + " {}[cure_verb]{}: {}{}{}".format(
+				mp_desc.append(pad + hex.short_desc(for_multipad=True) + " [cure_verb]{}{}: [cost]{}{}{}".format(
 					"" if can_cure else "(",
 					verb,
 					f"${cost}" if cost else "бесплатно",
@@ -7164,8 +7230,7 @@ class Respite(NonCombatMode):
 					if not input or 'quit'.startswith(input): mode.revert(); return
 					try:
 						n = int(input)
-						if 1 <= n <= last: pass
-						else: raise ValueError("Неверный уровень.")
+						if not (1 <= n <= last): raise ValueError("Неверный уровень.")
 					except ValueError as e:
 						mode.more(exception_msg(e))
 						return
@@ -7240,6 +7305,9 @@ class Shop(NonCombatMode):
 	def do_handle_note(self, msg):
 		self.log.add(msg, start_new_line=True)
 
+	def reference_enemy(self):
+		return FixedLevels.level(self.game.next_level).reference()
+
 	def do_render(self, lines, cmds):
 		lines.append(f"МАГАЗИН{self.game.marks(lspace=True)}")
 		lines.append(f"Золото: {self.game.gold_str()}")
@@ -7264,18 +7332,17 @@ class Shop(NonCombatMode):
 					parenthesize_if(str(ap_cost) + "[/ap]", not enough_ap) + \
 					"[/costs] "
 
-			# TODO: вывод описания *И* всех цен по "upgrade_name?", вместо бесполезных upgrade_name+? etc.
 			cmd_list = []
 			if up.allow(target) and self.game.enough_gold_for(gold_cost):
 				cmd = up.cmd() + '+'
 				cmd_list.append('+' if cmd_list else cmd)
-				cmds.add(cmd, lambda: self.buy_upgrade(target, up), '?', lambda: self.more("Приобрести этот апгрейд."))
+				cmds.add(cmd, lambda: self.buy_upgrade(target, up), '?', lambda: self.more(self.imagine(up(), True) or "Нет дополнительной информации."))
 
 			last = up.last(target)
 			if last:
 				cmd = up.cmd() + '-'
 				cmd_list.append('-' if cmd_list else cmd)
-				cmds.add(cmd, lambda: self.sell_upgrade(target, last), '?', lambda: self.more("Отказаться от этого апгрейда."))
+				cmds.add(cmd, lambda: self.sell_upgrade(target, last), '?', lambda: self.more(self.imagine(last, False) or "Нет дополнительной информации."))
 
 			line += "[cmds]"
 			if cmd_list: line += "(" + ", ".join(cmd_list) + ")"
@@ -7302,15 +7369,82 @@ class Shop(NonCombatMode):
 		lines.append("\nВернуться в лагерь (quit)")
 		cmds.add('quit', lambda: self.switch_to(Respite(self.game)), '?', lambda: self.more("Вернуться в лагерь."))
 
+	def imagine(self, up, add):
+		imagination = Imagination()
+		(imagination.add if add else imagination.remove)(up)
+		sandbagged = self.reference_enemy()
+
+		lines = []
+		def imagine_part(preface, cb):
+			now = str(cb(None))
+			then = str(cb(imagination))
+			if now != then: lines.append("{}: [present]{} [arrow]-> [future]{}.".format(preface, now, then))
+
+		if isinstance(up, StrUpgrade):
+			imagine_part("Макс. HP", lambda imagination: self.player.calculate_mhp(imagination))
+			if self.player.unarmed:
+				imagine_part("Удар по {}".format(sandbagged.name.dative),
+					lambda imagination: "~{}".format(round(self.player.unarmed.beam(sandbagged, None, imagination).estimate_damage().avg, 1)))
+
+		elif isinstance(up, IntUpgrade):
+			imagine_part("Макс. MP", lambda imagination: self.player.calculate_mmp(imagination))
+			for sp in self.player.spells:
+				if isinstance(sp, Firestorm):
+					imagine_part("Огненный шторм по {}".format(sandbagged.name.dative),
+						lambda imagination: round(sp.Beam(self.player, sandbagged, None, imagination).estimate_damage().avg, 1))
+				elif isinstance(sp, Frailness):
+					imagine_part("Хрупкость на {}".format(sandbagged.name.accusative),
+						lambda imagination: "{:.0%}/-{} AC".format(
+							1 - sp.resistance(self.player, sandbagged, imagination), round(sp.ac_malus(self.player, sandbagged, None, imagination))))
+
+			rs = next((sp for sp in sandbagged.spells if isinstance(sp, ResistibleSpell)), None)
+			if rs: imagine_part("Сопротивление ({})".format(rs.name('long')),
+				lambda imagination: "{:.0%}".format(rs.resistance(sandbagged, self.player, target_imagination=imagination)))
+
+		elif isinstance(up, DexUpgrade):
+			has_shot = self.player.weapon and self.player.weapon.ShotBeam
+			imagine_part("Точность удара{} по {}".format("/выстрела" if has_shot else "", sandbagged.name.dative),
+				lambda imagination: "{:.0%}".format(self.player.unarmed.beam(sandbagged, None, imagination).hit_chance()) +
+					("/{:.0%}".format(self.player.weapon.shot_beam(sandbagged, None, None, master_imagination=imagination).hit_chance()) if has_shot else ""))
+			if sandbagged.unarmed:
+				imagine_part("Уклонение от {}".format(sandbagged.name.genitive),
+					lambda imagination: "{:.0%}".format(1 - sandbagged.unarmed.beam(sandbagged, None, target_imagination=imagination).hit_chance()))
+			if sandbagged.weapon:
+				imagine_part("Уклонение от {}".format(sandbagged.name.genitive) + (" (" + sandbagged.weapon.name + ")" if sandbagged.unarmed else ""),
+					lambda imagination: "{:.0%}".format(sandbagged.weapon.melee_beam(sandbagged, None, target_imagination=imagination).hit_chance()))
+
+		elif isinstance(up, IncendiaryAmmunitionUpgrade):
+			def imagine_incendiary(imagination):
+				incendiary = next((ammo for ammo in self.player.weapon.ammos if isinstance(ammo, IncendiaryAmmunition)), None)
+				times = 0
+				for item, added in Imagination.changes(imagination):
+					if isinstance(item, IncendiaryAmmunitionUpgrade): times += (1 if added else -1)
+				beam = self.player.weapon.shot_beam(sandbagged, None, incendiary, imagination)
+				beam.imagine_incendiary = times
+				return "~{}".format(round(beam.estimate_damage().avg, 1))
+			imagine_part("Выстрел по {}".format(sandbagged.name.dative), imagine_incendiary)
+
+		elif isinstance(up, SpellUpgrade):
+			if add:
+				lines.append("{}: {} MP.".format(cap_first(up.SPELL_CLASS.name('long')), up.SPELL_CLASS.do_mp_cost(None)))
+				if isinstance(up, FirestormSpellUpgrade):
+					lines.append("Урон по {}: [present]{}.".format(sandbagged.name.dative, round(Firestorm.Beam(self.player, sandbagged, None).estimate_damage().avg, 1)))
+				elif isinstance(up, FrailnessSpellUpgrade):
+					sp = Frailness()
+					lines.append("На {} ({} AC): {:.0%}/-{} AC.".format(sandbagged.name.accusative, sandbagged.ac,
+						1 - sp.resistance(self.player, sandbagged, imagination), round(sp.ac_malus(self.player, sandbagged, None, imagination))))
+
+		return "\n".join(multipad(lines))
+
 	def buy_upgrade(self, target, up_cls):
-		gold = up_cls.gold_cost(target)
+		up = up_cls()
+		gold = up.gold_cost(target)
 		def confirmed(mode):
 			self.game.take_gold(gold)
-			up = up_cls()
 			up.apply(target)
 			if not self.log.something_new: self.player.note(lambda sink: sink.you == self.player and f"Апгрейд приобретён за ${gold}.")
 			self.check_for_pending_notes(extra_reverts=1)
-		self.yes_no("{0} ${1}. Продолжить?".format(up_cls.cost_preface(target), gold), confirmed, default=1)
+		self.yes_no("{} ${}. Продолжить?".format(up.cost_preface(target), gold), confirmed, default=1)
 
 	def sell_upgrade(self, target, up):
 		gold = up.refund()
@@ -7319,7 +7453,8 @@ class Shop(NonCombatMode):
 			if not self.log.something_new: self.player.note(lambda sink: sink.you == self.player and f"Апгрейд продан за ${gold}.")
 			self.game.give_gold(gold)
 			self.check_for_pending_notes(extra_reverts=1)
-		self.yes_no("В обмен на {what} вы получите ${gold}. Продолжить?".format(what=up.sell_accusative(target), gold=gold), confirmed, default=1)
+		self.yes_no("В обмен на {} вы получите ${}. Продолжить?".format(up.sell_accusative(target), gold),
+			confirmed, default=1)
 
 class ArenaEntrance(GameMode):
 	prev_mode = True
@@ -7328,7 +7463,7 @@ class ArenaEntrance(GameMode):
 		self.arena = arena
 		self.floor_number = floor_number
 
-	class RenderContext:
+	class DescribeFighterContext:
 		def __init__(self): self.cmds_used = set()
 
 		def make_cmd(self, cmd, prefix_func=lambda index: index):
@@ -7353,7 +7488,7 @@ class ArenaEntrance(GameMode):
 	# STR/INT/DEX 5/10/10             STR/INT/DEX 5/15/10
 	# SPD         100                 SPD         90
 	def do_render(self, lines, cmds):
-		ctx = self.RenderContext()
+		ctx = self.DescribeFighterContext()
 		max_width = 0
 		descs     = []
 		max_part_height = []
@@ -7373,7 +7508,7 @@ class ArenaEntrance(GameMode):
 		first = len(lines)
 		BORDER = 2
 		next_command_reserve = 2
-		lines.append(f"{self.floor_number}-й этаж{self.game.marks(lspace=True)}")
+		lines.append("{} этаж{}".format(f"{self.floor_number}-й" if self.floor_number < FixedLevels.count else "Последний", self.game.marks(lspace=True)))
 		empty_lines_before = (self.term_height - 1 - next_command_reserve - sum(max_part_height) - (len(lines) - first)) // 6
 		lines.extend("" for i in range(empty_lines_before))
 		centered_width = self.safe_term_width // len(descs)
@@ -7391,7 +7526,7 @@ class ArenaEntrance(GameMode):
 		back = BORDER * " " + "Вернуться (quit)"
 		nx = "Продолжить (next)"
 		lines.append(back + " " * (self.safe_term_width - BORDER - len(nx) - len(back)) + nx)
-		cmds.add('quit', lambda: self.back_to_camp(), '?', "Вернуться в лагерь.")
+		cmds.add('quit', lambda: self.back_to_camp(), '?', lambda: self.more("Вернуться в лагерь."))
 		cmds.add('next', lambda: self.next(), '?', lambda: self.more("Начать бой."))
 
 	def do_handle_command(self, cmd):
@@ -7401,7 +7536,8 @@ class ArenaEntrance(GameMode):
 			return super().do_handle_command(cmd)
 		return True
 
-	def describe_fighter(self, fighter, battler, cmds, ctx):
+	@classmethod
+	def build_abilities_help_4mp(cls, mode, fighter, battler, game, arena, cmds, ctx, flip=False):
 		def battler_prefix_func(index):
 			if index == 0: return battler.shortcut + '.'
 			impossible(f"make_cmd: {battler.shortcut}")
@@ -7413,6 +7549,35 @@ class ArenaEntrance(GameMode):
 			numeric_cmd += 1
 			return result
 
+		lines = []
+		if fighter.unarmed:
+			cmd = ctx.make_cmd('u', battler_prefix_func)
+			lines.append("{0} [cmd]({1})".format(cap_first(fighter.unarmed.name()), cmd))
+			cmds.add(cmd, lambda: mode.more(fighter.unarmed.name().upper() + "\n" + fighter.unarmed.detail(game)), '?', lambda: mode.more("Безоружная атака."))
+
+		if fighter.weapon:
+			cmd = ctx.make_cmd('w', battler_prefix_func)
+			lines.append("{0} [cmd]({1})".format(fighter.weapon.name.cap_first(), cmd))
+			cmds.add(cmd, lambda: mode.more(fighter.weapon.name.upper() + "\n" + fighter.weapon.detail(game)), '?', lambda: mode.more("Оружие."))
+
+		for sp in fighter.specials:
+			if not sp.should_display(): continue
+			def add_sp(sp=sp):
+				cmd = make_numeric_cmd()
+				lines.append("{0} [cmd]({1})".format(cap_first(sp.name()), cmd))
+				cmds.add(cmd, lambda: mode.more(sp.name().upper() + "\n" + sp.detail(game)), '?', lambda: mode.more("Особенность."))
+			add_sp()
+
+		for sp in fighter.spells:
+			def add_spl(sp=sp):
+				cmd = make_numeric_cmd()
+				lines.append("{0} [cmd]({1})".format(cap_first(sp.name('long')), cmd))
+				cmds.add(cmd, lambda: mode.more("{} ({} MP)\n{}".format(sp.name('long').upper(), sp.mp_cost(), sp.entrance_help(fighter, game.player, arena, game))),
+					'?', lambda: mode.more("Заклинание."))
+			add_spl()
+		return lines
+
+	def describe_fighter(self, fighter, battler, cmds, ctx):
 		def add_help_cmd(cmd, func):
 			cmds.add(cmd, func, '?', func)
 
@@ -7423,52 +7588,30 @@ class ArenaEntrance(GameMode):
 		add_help_cmd(battler.shortcut,
 			lambda: self.more(self.fighter_detail(fighter, disambiguate=any(id for id, enemy in enumerate(self.arena.enemies(self.player))))))
 
-		abil_part = []
-		if fighter.unarmed:
-			cmd = ctx.make_cmd('u', battler_prefix_func)
-			abil_part.append("{0} [cmd]({1})".format(cap_first(fighter.unarmed.name()), cmd))
-			add_help_cmd(cmd, lambda: self.more(fighter.unarmed.name().upper() + "\n" + fighter.unarmed.detail(self.game)))
-
-		if fighter.weapon:
-			cmd = ctx.make_cmd('w', battler_prefix_func)
-			abil_part.append("{0} [cmd]({1})".format(fighter.weapon.name.cap_first(), cmd))
-			add_help_cmd(cmd, lambda: self.more(fighter.weapon.name.upper() + "\n" + fighter.weapon.detail(self.game)))
-
-		for sp in fighter.specials:
-			if not sp.should_display(): continue
-			def add_sp(sp=sp):
-				cmd = make_numeric_cmd()
-				abil_part.append("{0} [cmd]({1})".format(cap_first(sp.name()), cmd))
-				add_help_cmd(cmd, lambda: self.more(sp.name().upper() + "\n" + sp.detail(self.game)))
-			add_sp()
-
-		for spl in fighter.spells:
-			def add_spl(spl=spl):
-				cmd = make_numeric_cmd()
-				abil_part.append("{0} [cmd]({1})".format(cap_first(spl.name('long')), cmd))
-			add_spl()
+		abil_part = self.build_abilities_help_4mp(self, fighter, battler, self.game, self.arena, cmds, ctx)
 		if abil_part:
 			abil_part.append("")
 			abil_part = multipad(abil_part)
 
-		def join_names_and_values(gen_nv):
-			return " [val]".join(filter(None, ("/".join(name for name, value in gen_nv()), "/".join(str(value) for name, value in gen_nv()))))
-
 		stats_part = multipad([part
 			for part in (
-				join_names_and_values(lambda: filter(lambda nv: nv[1], (("AC", fighter.ac), ("EV", fighter.ev)))),
-				join_names_and_values(lambda: filter(lambda nv: nv[1] != 10, (("STR", fighter.base_str), ("INT", fighter.base_int), ("DEX", fighter.base_dex)))),
-				fighter.spd != 100 and f"SPD [val]{fighter.spd}") if part])
+				self.join_names_and_values(filter(lambda nv: nv[1], (("AC", fighter.ac), ("EV", fighter.ev)))),
+				self.join_names_and_values(filter(lambda nv: nv[1] != 10, (("STR", fighter.base_str), ("INT", fighter.base_int), ("DEX", fighter.base_dex)))),
+				fighter.base_spd != 100 and f"SPD [val]{fighter.base_spd}") if part])
 
 		parts = [name_part, vitals_part, abil_part, stats_part]
 		width = max(len(line) for lines in parts for line in lines)
 		name_part[0] = " " * ((width - len(name_part[0])) // 2) + name_part[0]
 		return parts, width
 
+	@staticmethod
+	def join_names_and_values(nv):
+		names, values = tuple(zip(*nv)) or ((), ())
+		return " [val]".join(filter(None, ("/".join(names), "/".join(map(str, values)))))
+
 	ROW_NAMES = {'chance': "шанс", 'dam': "урон", 'effdam': "эфф. урон", 'maxdam': "макс. урон"}
 
 	def fighter_detail(self, fighter, *, disambiguate=True):
-		# если очень надо, self может быть и не ArenaEntrance, а любым Mode с game и arena.
 		result = fighter.name.upper() if disambiguate else ""
 		extra_sep = False
 		def sep():
@@ -7792,9 +7935,12 @@ class ArenaView(GameMode):
 		reserve = self.reserve_lines()
 		squadA, squadB = tuple(self.arena.squads[squad_id] for squad_id in (Game.PLAYER_SQUAD, Game.MONSTER_SQUAD))
 		displayed_hexes = set()
-		imA = self.build_squad_image(squadA, self.term_height - 1 - reserve - self.log_area_height, False, displayed_hexes)
-		imB = self.build_squad_image(squadB, self.term_height - 1 - reserve - self.log_area_height, True, displayed_hexes)
-		cmds_desc = multipad(self.build_commands(cmds, layout.action_lines + layout.squad_lines - len(imA), displayed_hexes)) # там проверяется awaiting_decision
+		displayed_battlers = []
+		imA = self.build_squad_image(squadA, self.term_height - 1 - reserve - self.log_area_height, False, displayed_hexes, displayed_battlers)
+		imB = self.build_squad_image(squadB, self.term_height - 1 - reserve - self.log_area_height, True, displayed_hexes, displayed_battlers)
+
+		# там проверяется awaiting_decision
+		cmds_desc = multipad(self.build_commands(cmds, layout.action_lines + layout.squad_lines - len(imA), displayed_hexes, displayed_battlers))
 
 		for lineno in range(layout.squad_lines + layout.action_lines):
 			left = imA[lineno] if lineno < len(imA) else cmds_desc[lineno - len(imA)] if 0 <= lineno - len(imA) < len(cmds_desc) else ""
@@ -7903,37 +8049,36 @@ class ArenaView(GameMode):
 		self.do_prompt, self.last_input, self.awaiting_decision = False, None, False
 		return self.invalidate()
 
-	def build_squad_image(self, squad, lines_limit=None, flip=False, displayed_hexes=None):
+	def build_battler_header(self, b, flip, paren=True):
+		# (N) Некромант AC:6 EV:10
+		lines = []
+		op, cp = ("(", ")") if paren else ("-", "-")
+		lines.append(left_to_right(f"{op}{b.shortcut}{cp}",
+			b.fighter.name.cap_first(), b.fighter.ac > 0 and f"AC:{b.fighter.ac}", b.fighter.ev > 0 and f"EV:{b.fighter.ev}", b.game and b.game.marks(), flip=flip))
+		if b.fighter.dead:
+			lines.append("RIP")
+		else:
+			lines.append(b.fighter.hp_bar(flip))
+
+			if b.fighter.has_magic():
+				lines.append(b.fighter.mp_bar(flip))
+		return lines
+
+	def build_squad_image(self, squad, lines_limit=None, flip=False, displayed_hexes=None, displayed_battlers=None):
 		if not isinstance(squad, self.arena.Squad): squad = self.arena.squads[squad]
 		class PerBattler:
-			def __init__(self, fighter, battler):
-				self.fighter, self.battler = fighter, battler
-				self.lines = []
+			def __init__(self, battler, lines):
+				self.battler = battler
+				self.lines = lines
 				self.hex_descs = []
-				self.hexes_gen = iter(fighter.hexes)
-		per_battler = []
-		total_lines = max(0, len(squad.members)) # пустые строки после каждого участника
+				self.hexes_gen = iter(battler.fighter.hexes)
 
+		per_battler, total_lines = [], 0
 		# Обязательные строки.
 		for b in squad.members:
-			fighter = b.fighter
-			im = PerBattler(fighter, b)
-			# (N) Некромант AC:6 EV:10
-			im.lines.append(left_to_right(f"({b.shortcut})",
-				fighter.name.cap_first(), fighter.ac > 0 and f"AC:{fighter.ac}", fighter.ev > 0 and f"EV:{fighter.ev}", b.game and b.game.marks(), flip=flip))
-			total_lines += 1
-
-			if fighter.dead:
-				im.lines.append("RIP")
-				total_lines += 1
-			else:
-				im.lines.append(fighter.hp_bar(flip))
-				total_lines += 1
-
-				if fighter.has_magic():
-					im.lines.append(fighter.mp_bar(flip))
-					total_lines += 1
-			per_battler.append(im)
+			lines = self.build_battler_header(b, flip)
+			per_battler.append(PerBattler(b, lines))
+			total_lines += len(lines) + 1 # пустая строка после каждого участника
 
 		if lines_limit is not None and total_lines > lines_limit: raise RuntimeError(
 			"Невозможно уложиться в {0}: {1}.".format(plural(lines_limit, "{N} лини{ю/и/й}"), plural(total_lines, "только неубираем{ая/ых/ых} уже {N}")))
@@ -7951,14 +8096,13 @@ class ArenaView(GameMode):
 		cur = -1
 		while lines_limit is None or total_lines < lines_limit:
 			something_changed = False
-			for i in range(len(per_battler)):
+			for _i in range(len(per_battler)):
 				cur = (cur + 1) % len(per_battler)
 				im = per_battler[cur]
-				fighter = im.fighter
 				hex = next(im.hexes_gen, None)
 				if hex:
 					if displayed_hexes is not None: displayed_hexes.add(hex)
-					desc = hex.short_desc(cmd_prefix=self.hex_cmd_prefix(hex, per_battler[i].battler), for_multipad=True, flip=flip)
+					desc = hex.short_desc(for_multipad=True, flip=flip)
 					im.hex_descs.append(desc)
 					total_lines += 1
 					something_changed = True
@@ -7968,12 +8112,18 @@ class ArenaView(GameMode):
 			im.hex_descs = multipad(im.hex_descs)
 			if next(im.hexes_gen, None):
 				extra = 1 + sum(1 for hex in im.hexes_gen)
-				hint = "  (+{extra}, {cmd}?)".format(extra=extra, cmd=im.battler.shortcut)
+				hint = "  (+{extra}, {cmd})".format(extra=extra, cmd=im.battler.shortcut)
 				if im.hex_descs: im.hex_descs[-1] += hint
 				else: im.lines[-1] += hint
 
+		if displayed_battlers is not None:
+			line = 0
+			for im in per_battler:
+				displayed_battlers.append((im.battler, line, flip))
+				line += len(im.lines) + len(im.hex_descs) + 1
+
 		result = [line
-			for index, im in enumerate(per_battler)
+			for im in per_battler
 				for lines in (im.lines, im.hex_descs, ("",))
 					if lines is not None
 						for line in lines]
@@ -8030,7 +8180,7 @@ class ArenaView(GameMode):
 	def estimate_good_atb_maximum(self):
 		return 1.2 * self.arena.BASELINE_SPD / max(1, min(b.fighter.spd for b in self.arena.turn_queue))
 
-	def build_commands(self, cmds, lines_limit=None, displayed_hexes=None):
+	def build_commands(self, cmds, lines_limit=None, displayed_hexes=None, displayed_battlers=None):
 		desc = []
 		if not self.awaiting_decision or self.player.dead: return desc
 
@@ -8044,10 +8194,10 @@ class ArenaView(GameMode):
 			perform=lambda target, ai: throw(NotImplementedError("perform")),
 			help=lambda target: throw(NotImplementedError("help")),
 			categ='player',
-			desc_extra=None,
+			desc_extra=None, extra_cmds=None,
 			targeting='single',
 			ljust_cmd=True,
-			choose_target_name=None, choose_target_help=None, exec_hook=None and (lambda target, exec: exec())):
+			choose_target_name=None, choose_target_help=None, exec_hook=None and (lambda target, exec: exec()), validate_target=None):
 
 			cmd_extra = ""
 
@@ -8070,12 +8220,14 @@ class ArenaView(GameMode):
 				# выберется A, т. к. запомненная цель — игрок — невалидна для удара.
 				# Интуитивнее будет выбрать снова B, т. е. помнить не только самую последнюю цель, а выбирать последнюю подходящую из прежних.
 				# Мне лень это делать, сейчас для обхода проблемы диспелл вообще не запоминает цель, если применён на заклинании.
-				if not default_target or default_target.dead or not self.arena.are_enemies(default_target, self.player, maybe=True):
-					default_target = next(self.arena.enemies(self.player), None)
+				if (not default_target or default_target.dead or not self.arena.are_enemies(default_target, self.player, maybe=True)
+					or validate_target and not validate_target(default_target)):
+					default_target = next((target for target in self.arena.enemies(self.player) if not validate_target or validate_target(target)), None)
 				if default_target:
 					if cmds: add_for_target(default_target, None)
 
 				for target in self.arena.enemies(self.player):
+					if validate_target and not validate_target(target): continue
 					if cmds: add_for_target(target, self.arena.as_battler(target).shortcut, remember_target=True)
 					n_targets += 1
 			elif targeting == 'mass' or targeting == 'n/a':
@@ -8115,9 +8267,10 @@ class ArenaView(GameMode):
 			if n_targets == 0: return
 			if n_targets and n_targets > 1: cmd_extra = " цель"
 
-			desc.append("[{categ}_cmd_desc]{cmd_desc} [{rjust_cmd}/{categ}_cmd_desc][{categ}_cmd]({cmd_base}{cmd_extra}){desc_extra}".format(
+			desc.append("[{categ}_cmd_desc]{cmd_desc} [{rjust_cmd}/{categ}_cmd_desc][{categ}_cmd]({cmd_base}{cmd_extra}{extra_cmds}){desc_extra}".format(
 				categ=categ, rjust_cmd = '>' if not ljust_cmd else "",
-				cmd_desc=cmd_desc, cmd_base=cmd_base, cmd_extra=cmd_extra, desc_extra=desc_extra or ""))
+				cmd_desc=cmd_desc, cmd_base=cmd_base, cmd_extra=cmd_extra, desc_extra=desc_extra or "",
+				extra_cmds=", " + extra_cmds if extra_cmds else ""))
 
 		first_player_line = len(desc)
 		if fettered:
@@ -8127,10 +8280,7 @@ class ArenaView(GameMode):
 				cmd = 'break' if fetter_index == 0 else 'break ' + mode if fetter_index == 1 else impossible("fetter_index")
 				if cmds:
 					def add_cmd(fet=fet):
-						def act_break():
-							self.player.note(lambda sink: sink.youify("{Вы/F} пытает{есь/ся} вырваться.", self.player))
-							fet.phys_break(self.player, self.arena)
-						cmds.add(cmd, lambda: self.decide(lambda ai: act_break()), '?', lambda: self.more(fet.phys_break_help()))
+						cmds.add(cmd, lambda: self.decide(lambda ai: fet.phys_break(self.player, self.arena)), '?', lambda: self.more(fet.phys_break_help()))
 					add_cmd()
 				desc.append("[player_cmd_desc]вырваться [player_cmd]({}) {}".format(cmd,
 					" " + multipad.escape(fet.dispelling_bar()) if (not displayed_hexes or fet not in displayed_hexes) and fet.dispell_amount else ""))
@@ -8148,6 +8298,14 @@ class ArenaView(GameMode):
 			if cmds:
 				cmds.add('retreat', lambda: self.confirm_retreat(),
 					'?', lambda: self.more("\n".join(filter(None, ("Сбежать из боя.", self.describe_retreat_consequences())))))
+
+			impregnation = next((sp for sp in self.player.specials if isinstance(sp, Impregnation)), None)
+			if impregnation:
+				def perform(target, ai):
+					impregnation.act_impregnate(target, ai.arena)
+				def help(target):
+					return "Заразить {} личинками.\nШанс: {:.0%}.".format(target.name.accusative, self.arena.hit_chance(*impregnation.save_throw(target)))
+				add(cmd_desc="заразить", cmd_base='infest', perform=perform, help=help, validate_target=lambda target: target.can_be_impregnated)
 		player_lines_before_spells = len(desc) - first_player_line
 
 		if self.player.can_cast():
@@ -8169,13 +8327,23 @@ class ArenaView(GameMode):
 									msg += " наложенное на " + whomst + " заклинание"
 								return msg + "."
 
+						def exec_hook(target, exec):
+							def confirmed(mode):
+								mode.revert()
+								exec()
+							if isinstance(spell, Frailness) and not target.base_ac and not target.ac:
+								self.yes_no("{} не имеет брони, и {} не будет иметь эффекта. Скастовать всё равно?".format(
+									target.name.cap_first(), spell.name('long')), confirmed, default=1)
+							else:
+								exec()
+
 						add(cmd_desc="{} [mp]{} MP".format(spell.name('short'), spell.mp_cost()),
 							cmd_base=spell.cmd(), categ='spell' if more_than_one and player_lines_before_spells > 1 else 'player',
 							perform=lambda target, ai: self.player.act_cast_spell(spell, target, ai.arena),
 							help=lambda target: spell.attack_help(self.player, target, self.arena, self.game),
 							targeting=spell.TARGETING,
 							ljust_cmd=False,
-							choose_target_name=choose_target_name, choose_target_help=choose_target_help)
+							choose_target_name=choose_target_name, choose_target_help=choose_target_help, exec_hook=exec_hook)
 					add_spell()
 
 		if len(desc) > first_player_line:
@@ -8197,20 +8365,25 @@ class ArenaView(GameMode):
 			if weapon.ShotBeam:
 				ammo_descs = []
 				had_shoot = False
+				rapid_targets = list(self.arena.enemies(self.player))
+				can_rapid = len(rapid_targets) > 1
+
 				for ammo in weapon.ammos:
 					if ammo.has_charges():
-						cmd = 'shoot'
+						cmd, rapid_cmd = 'shoot', None
+						if can_rapid and not ammo.finite_charges: rapid_cmd = 'rapid'
 						if had_shoot or ammo.finite_charges:
 							cmd += " " + ammo.cmd()
+							if rapid_cmd: rapid_cmd += " " + ammo.cmd()
 						else:
 							had_shoot = True
-						ammo_descs.append((ammo, cmd))
+						ammo_descs.append((ammo, cmd, can_rapid and rapid_cmd))
 
 				if not had_shoot:
-					ammo_descs.insert(0, (None, 'shoot'))
+					ammo_descs.insert(0, (None, 'shoot', can_rapid and 'rapid'))
 
-				for ammo, cmd in ammo_descs:
-					def add_single_targeted_shot(ammo=ammo, cmd=cmd):
+				for ammo, cmd, rapid_cmd in ammo_descs:
+					def add_shoot(ammo=ammo, cmd=cmd):
 						def perform(target, ai):
 							self.player.act_weapon_shoot(target, ai.arena, ammo)
 
@@ -8222,11 +8395,14 @@ class ArenaView(GameMode):
 						exec_hook = None
 						if isinstance(ammo, SilenceAmmunition):
 							def exec_hook(target, exec):
+								def confirmed(mode):
+									mode.revert()
+									exec()
 								if target.silenced():
-									def confirmed(mode):
-										mode.revert()
-										exec()
-									self.yes_no("{} уже под тишиной, новый заряд не продлит её. Вы уверены?".format(target.name.cap_first()), confirmed, default=1)
+									self.yes_no("{} уже под тишиной, новый заряд не продлит её. Выстрелить всё равно?".format(target.name.cap_first()), confirmed, default=1)
+								elif not any(target.can_cast(sp) for sp in target.spells):
+									self.yes_no("Вы собираетесь выстрелить тишиной, но {} {} никаких заклинаний. Выстрелить всё равно?".format(target.name.cap_first(),
+										"и так не может произнести" if target.spells else "не знает"), confirmed, default=1)
 								else:
 									exec()
 						elif isinstance(ammo, TimestopAmmunition):
@@ -8236,10 +8412,21 @@ class ArenaView(GameMode):
 										mode.revert()
 										exec()
 									self.yes_no("Время уже остановлено, новый заряд не продлит эффект. Вы уверены?", confirmed, default=1)
+
 						add(cmd_desc=ammo.battle_name() if ammo else "огонь", cmd_base=cmd, perform=perform, help=help, categ='weapon',
-							desc_extra = ammo and ammo.finite_charges and " [bullets]" + Con.bullet_bar(ammo.charges, ammo.MAX_CHARGES),
-							exec_hook=exec_hook)
-					add_single_targeted_shot()
+							desc_extra=ammo and ammo.finite_charges and " [bullets]" + Con.bullet_bar(ammo.charges, ammo.MAX_CHARGES),
+							exec_hook=exec_hook, extra_cmds=rapid_cmd)
+
+						if cmds and rapid_cmd:
+							def rapid(ai):
+								self.player.act_weapon_rapid(rapid_targets, self.arena, ammo)
+							def help():
+								return "Очередь{} по всем врагам.\nУрон: {}.".format(
+									" " + ammo.plural_name().instrumental if ammo else "",
+									Firestorm.estimate_mass_damage(rapid_targets,
+										lambda target: self.player.weapon.shot_beam(target, self.arena, ammo, 'rapid'), do_max=self.game.god_mode))
+							cmds.add(rapid_cmd, lambda: self.decide(rapid), '?', lambda: self.more(help()))
+					add_shoot()
 
 			if len(desc) > first_weapon_line:
 				desc[first_weapon_line] = multipad.escape(weapon.name.cap_first()) + ": " + desc[first_weapon_line]
@@ -8255,6 +8442,16 @@ class ArenaView(GameMode):
 			while len(desc) > 2 and not desc[-2]: del desc[-2]
 			desc[-2] += " (+{}, cmds)".format(actual_commands_cut)
 			if cmds: cmds.add('cmds', lambda: self.switch_to(ChooseCommandOnSeparateScreen(self)), '?', "Отобразить все команды.")
+
+		if cmds and displayed_battlers:
+			for db in displayed_battlers:
+				def add_highlight(db=db):
+					battler, start_line, flip = db
+					def highlight():
+						self.switch_to(InBattleBattlerDetail(battler, self, start_line, flip))
+					cmds.add(battler.shortcut, highlight,
+						'?', lambda: self.more("Отобразит информацию по " + ("вам" if battler.fighter == self.player else battler.fighter.name.dative) + "."))
+				add_highlight()
 
 		return desc
 
@@ -8293,6 +8490,98 @@ class ArenaView(GameMode):
 		if losses:
 			lines.append("Вы потеряете {}.".format(join_with_lastsep(losses, ", ", " и ")))
 		return "\n".join(lines)
+
+class InBattleBattlerDetail(GameMode):
+	prev_mode = True
+	do_cls = True
+
+	def __init__(self, battler, av, start_line, flip):
+		super().__init__(av.game)
+		self.battler, self.av, self.start_line, self.flip = battler, av, start_line, flip
+
+	def do_render(self, lines, cmds):
+		fighter = self.battler.fighter
+		lines.extend("" for _ in range(self.start_line))
+		desc = self.av.build_battler_header(self.battler, self.flip, paren=False)
+		hexes_desc = []
+		dispell = self.av.awaiting_decision and self.player.castable_dispell()
+		for hex in fighter.hexes:
+			dispell_cmd = dispell and Dispell.valid_target(self.player, hex, self.av.arena) and 'dispell ' + hex.cmd()
+			hexes_desc.append(hex.short_desc(for_multipad=True, flip=self.flip, cmd = ", ".join(filter(None, (hex.cmd(), dispell_cmd)))))
+			def add_commands(hex=hex):
+				def help():
+					self.more(hex.name(hex).upper() + "\n" + hex.detail(self.game))
+				cmds.add(hex.cmd(), help, '?', help)
+
+				if dispell_cmd:
+					def decide_do_dispell():
+						self.av.decide(lambda ai: ai.fighter.act_cast_spell(dispell, hex, self.av.arena))
+						self.revert()
+					cmds.add('dispell ' + hex.cmd(), decide_do_dispell, '?', lambda: self.more(dispell.attack_help(self.player, hex, self.av.arena, self.game)))
+			add_commands()
+		hexes_desc = multipad(hexes_desc)
+
+		abil_desc = None
+		if fighter is not self.player:
+			ctx = ArenaEntrance.DescribeFighterContext()
+			abil_desc = ArenaEntrance.build_abilities_help_4mp(self, fighter, self.battler, self.game, self.av.arena, cmds, ctx, flip=self.flip)
+			abil_desc = multipad(abil_desc)
+
+		stats_part = multipad(list(filter(None, (
+			ArenaEntrance.join_names_and_values((name, str(value)) for name, value, base in nvbs if value != base or base != hide_base)
+			+ (" ({})".format("/".join(str(base) for name, value, base in nvbs if value != base or base != hide_base))
+				if any(value != base for name, value, base in nvbs) else "")
+
+			for nvbs, hide_base in (
+				((("STR", fighter.str, fighter.base_str), ("INT", fighter.int, fighter.base_int), ("DEX", fighter.dex, fighter.base_dex)), 10),
+				((("SPD", fighter.spd, fighter.base_spd),), 100))))))
+		pad_to = max((len(line) for lines in (abil_desc, stats_part, desc[1:]) if lines for line in lines), default=0)
+
+		if hexes_desc:
+			desc.extend(hexes_desc)
+		desc.append("") # если hexes_desc не было — это пустая строка между шапкой и остальным
+
+		if abil_desc:
+			desc.extend(line.ljust(pad_to) for line in abil_desc)
+			desc.append("")
+
+		if stats_part:
+			desc.extend(line.ljust(pad_to) for line in stats_part)
+			desc.append("")
+
+		if self.flip:
+			for lineno, line in enumerate(desc):
+				desc[lineno] = line.rjust(self.safe_term_width)
+		lines.extend(desc)
+
+		summ_start_line = len(lines)
+		if fighter.transient:
+			msg = "Это {} существо.".format("призванное" if fighter.dispellable else "временное")
+			if self.av.arena.are_enemies(self.player, fighter):
+				msg += " Вы не получите за него опыт, но и убивать его не обязательно для победы."
+			lines.append(wrap(msg, self.safe_term_width))
+
+		if self.av.arena.are_enemies(self.player, fighter):
+			dispell = next((sp for sp in self.player.spells if isinstance(sp, Dispell)), None)
+			if dispell and Dispell.valid_target(self.player, fighter, self.av.arena):
+				if fighter.dispellable:
+					if fighter.transient: lines.append("Также вы можете его развеять.")
+					else: lines.append("Вы можете развеять это существо.")
+				elif fighter.transient:
+					if fighter.summoned: lines.append("Тем не менее, развеять его нельзя.")
+		if summ_start_line != len(lines): lines.append("")
+
+		if not hexes_desc and not abil_desc and not stats_part:
+			lines.append("Это вы." if fighter == self.player else "На " + fighter.name.accusative + " не действует никаких эффектов.")
+			lines.append("")
+		lines.append("назад (<enter>)")
+
+	def do_handle_command(self, cmd):
+		if not cmd:
+			self.revert()
+		else:
+			return False
+		return True
 
 class ChooseTarget(Mode):
 	prev_mode = True
@@ -8364,6 +8653,7 @@ class BattleResults(NonCombatMode):
 		player_squad = Game.PLAYER_SQUAD
 		self.lines = []
 		player_xp = weapon_xp = None
+		performance = self.game.performance
 
 		alive_enemies = list(enemy for enemy in self.arena.enemies(self.player) if not enemy.transient)
 		dead_enemies = list(c for c in self.arena.morgue if self.arena.squads_are_enemies(player_squad, c.squad_id))
@@ -8383,15 +8673,43 @@ class BattleResults(NonCombatMode):
 			base_score = 50
 			score = base_score
 			score_desc = []
+			def modify_score(delta, desc):
+				nonlocal score
+				score_desc.append(desc + self.dscore_postfix(delta))
+				score += delta
 
-			# Побеги?
-			if self.game.performance.escapes:
-				dscore = -round(sum((15 if i == 0 else 10 if i == 1 else 5) * min(1.2, severeness) for i, severeness in enumerate(self.game.performance.escapes)))
-				score_desc.append("Вы{} сбегали из боя{}.{}".format(
-					" " + ("дважды", "трижды", "четырежды")[len(self.game.performance.escapes) - 2] if 2 <= len(self.game.performance.escapes) <= 4 else "",
-					plural(len(self.game.performance.escapes), " {N} раз{/а/}") if len(self.game.performance.escapes) > 4 else "",
-					self.dscore_postfix(dscore)))
-				score += dscore
+			if performance.kiss:
+				modify_score(+30, "Вы поцеловали {}.".format(performance.kiss.name.accusative))
+
+			total = performance.unarmed.attacks + performance.melee.attacks + performance.ranged.attacks + performance.magical.attacks
+			total_weight = performance.unarmed.weight + performance.melee.weight + performance.ranged.weight + performance.magical.weight
+			if total:
+				if performance.unarmed.attacks + performance.melee.attacks == total:
+					modify_score(+30, "Вы сражались только врукопашную.")
+				elif performance.melee.attacks + performance.ranged.attacks == total:
+					modify_score(+20, "Вы сражались только оружием.")
+				elif performance.magical.attacks == total:
+					modify_score(+25, "Вы сражались только магией.")
+				elif (total >= 6 and total_weight and
+					(performance.unarmed.attacks + performance.melee.attacks) / total + (performance.unarmed.weight + performance.melee.weight) / total_weight > 1.6):
+					modify_score(+20, "Вы сражались почти только врукопашную.")
+				elif (total >= 6 and total_weight and
+					(performance.melee.attacks + performance.ranged.attacks) / total + (performance.melee.weight + performance.ranged.weight) / total_weight > 1.6):
+					modify_score(+10, "Вы сражались почти только оружием.")
+				elif (total >= 6 and total_weight and
+					(performance.magical.attacks) / total + (performance.magical.weight) / total_weight > 1.6):
+					modify_score(+15, "Вы сражались почти только магией.")
+
+			if (self.player.hp < self.player.mhp and (self.player.hp <= 2 or self.player.hp <= round(self.player.mhp * 0.15))
+				and performance.starting_hp_percent > 0.5):
+				modify_score(-clamp(round(0.9 * self.player.mhp / (self.player.hp or 1)), 5, 15), "Вы едва уцелели.")
+
+			if performance.escapes:
+				modify_score(
+					-round(sum((15 if i == 0 else 10 if i == 1 else 5) * min(1.2, severeness) for i, severeness in enumerate(performance.escapes))),
+					"Вы{} сбегали из боя{}.".format(
+					" " + ("дважды", "трижды", "четырежды")[len(performance.escapes) - 2] if 2 <= len(performance.escapes) <= 4 else "",
+					plural(len(performance.escapes), " {N} раз{/а/}") if len(performance.escapes) > 4 else ""))
 
 			if self.game.god_mode:
 				score_desc.append("Вы в режиме отладки.")
@@ -8402,11 +8720,14 @@ class BattleResults(NonCombatMode):
 			self.lines.extend(multipad(score_desc))
 			if was_something: self.lines.append("")
 
+			unclamped_score = score
+			score = clamp(score, 0, 100)
+
 			grade = Game.grade_for_score(score)
 			weight = self.arena.effective_enemies_xl(c.fighter for c in dead_enemies)
 			fight, xp_percentage_mod = Game.CompletedFight(score, weight), grade.xp_percentage_mod
 
-			self.lines.append("Рейтинг: {} ({}), {}{}.".format(grade.mark, score, grade.verbal_desc,
+			self.lines.append("Рейтинг: {} ({}), {}{}.".format(grade.mark, unclamped_score if self.game.god_mode else score, grade.verbal_desc,
 				", {}{:.0%} XP".format("+" if xp_percentage_mod >= 0 else "", xp_percentage_mod) if xp_percentage_mod else ""))
 			self.lines.append("")
 
@@ -8429,7 +8750,7 @@ class BattleResults(NonCombatMode):
 				player_xp, xp_rel, gold, severeness = self.arena.retreat_penalty(self.game)
 				self.player.drain_xp(player_xp, relative=xp_rel)
 				if gold: self.game.take_gold(gold)
-				self.game.performance.escapes.append(severeness)
+				performance.escapes.append(severeness)
 
 				self.lines.append(detailed_title() or "ПОБЕГ")
 				self.lines.append("")
@@ -8439,7 +8760,7 @@ class BattleResults(NonCombatMode):
 					for enemy in alive_enemies:
 						first_bar = True
 						for bar_name, vcur, vmax, attr in filter(None, (("HP", enemy.hp, enemy.mhp, 'cur_hp'), enemy.has_magic() and ("MP", enemy.mp, enemy.mmp, 'cur_mp'))):
-							heal = vcur < vmax and min(vmax - vcur, ceil(vmax * (1 / (3 + len(self.game.performance.escapes)))))
+							heal = vcur < vmax and min(vmax - vcur, ceil(vmax * (1 / (3 + len(performance.escapes)))))
 							if heal and heal > 0:
 								enemy_name_or_pad = enemy.name.cap_first() + ":"
 								if first_bar: first_bar = False
@@ -8550,7 +8871,7 @@ class FixedLevels:
 		def reference(self):
 			arena = Arena()
 			self.populate(arena)
-			return arena.battlers[0]
+			return arena.battlers[0].fighter
 
 	class CaveRat(One):
 		index = 1
@@ -8652,7 +8973,7 @@ class FixedLevels:
 				necromancer.base_int = 25
 				necromancer.base_spd = 140
 				necromancer.set_weapon(Dagger())
-				necromancer.learn_spell(SummonGhost())
+				necromancer.learn_spell(PhantasmalGate())
 				necromancer.learn_spell(DrainLife())
 			arena.add(necromancer, Game.MONSTER_SQUAD, UniversalAI(), shortcut_hint="Necromancer")
 
@@ -8704,7 +9025,7 @@ class FixedLevels:
 				death.base_ac = 9
 				death.base_str = 30
 				death.base_int = 30
-				death.base_spd = 180
+				death.base_spd = 150
 				death.set_weapon(DeathScythe())
 				death.learn_spell(DrainXP())
 				death.learn_spell(DeathWord())
@@ -8937,8 +9258,8 @@ class Session():
 		# ↑ а такие вот танцы с force_input в этом методе (как и сама force_input) нужны для работы ChooseCommandOnSeparateScreen.
 		# Ввод экрана A передаётся B через force_input, как будто изначально был введён в B, и при этом не нужно моргать старой картинкой B лишний раз.
 
-		has_default_commands = cmds.has_anything()
-		if has_default_commands: self.add_default_commands(cmds)
+		had_custom_commands = cmds.has_anything()
+		self.add_default_commands(cmds)
 		if mode.force_input is not None:
 			cmd, mode.force_input = mode.force_input, None
 		else:
@@ -8966,7 +9287,7 @@ class Session():
 			elif mode.handle_command(cmd): pass
 			elif matches: mode.more("Неоднозначная команда: {0}.".format(", ".join(matches)))
 			elif suggestions: mode.more("Неизвестная команда. Попробуйте {0}.".format(", ".join(suggestions)))
-			elif cmd and not cmd.isspace(): mode.more("Неизвестная команда." + (" Попробуйте \"?\"." if has_default_commands else ""))
+			elif cmd and not cmd.isspace(): mode.more("Неизвестная команда." + (" Попробуйте \"?\"." if had_custom_commands else ""))
 			if warnings: self.mode.more("\n".join(str(warning.message) for warning in warnings))
 		return not self.quit_posted
 
@@ -9657,7 +9978,7 @@ def selftest(verbose):
 	if verbose or not stats.wasSuccessful():
 		print(poop.getvalue().rstrip(), end='')
 		input()
-		if not stats.wasSuccessful(): exit()
+		if not stats.wasSuccessful(): sys.exit()
 
 def main():
 	locale.setlocale(locale.LC_ALL, '') # чтобы даты по-русски печатались :|
