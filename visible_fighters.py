@@ -9259,7 +9259,7 @@ class Session():
 		# Ввод экрана A передаётся B через force_input, как будто изначально был введён в B, и при этом не нужно моргать старой картинкой B лишний раз.
 
 		had_custom_commands = cmds.has_anything()
-		self.add_default_commands(cmds)
+		if had_custom_commands: self.add_default_commands(cmds)
 		if mode.force_input is not None:
 			cmd, mode.force_input = mode.force_input, None
 		else:
