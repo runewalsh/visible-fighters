@@ -16,7 +16,7 @@ from itertools import accumulate, count as infinite_range
 from unittest import TestCase, TestSuite, TextTestRunner, defaultTestLoader
 from warnings import warn, catch_warnings
 from traceback import format_exc
-app_version, save_version, HoF_version = (1, 0), 1, 1
+app_version, save_version, HoF_version = (1, "01"), 1, 1
 TRACEBACKS = False
 
 # FORMAT_RAW не хранит эти настройки в сжатом потоке, поэтому для распаковки нужно указать те же, которыми упаковывались.
@@ -2745,7 +2745,7 @@ class Dispell(Spell):
 
 	def dispell_creature_amount_dis(self, master, target, arena):
 		check(target, isinstance(target, Fighter) and target.dispellable, "target")
-		base = (master.int + (1 - master.int ** -0.15) * target.mhp) * master.int / (master.int + 0.3 * target.int)
+		base = (0.5 * master.int + (1 - master.int ** -0.15) * target.mhp) * master.int / (master.int + 0.3 * target.int)
 		return Distribution.Bell(0.5 * base, base, 1.5 * base)
 
 	def dispell_hex_amount_dis(self, master, hex, arena):
@@ -2803,7 +2803,7 @@ class ResistibleSpell(Spell):
 		return 1 - self.chance(master, target, None, master_imagination, target_imagination)
 
 	def power(self, master, target, master_imagination=None, target_imagination=None):
-		pow = self.do_power(master, target, master_imagination=None, target_imagination=None)
+		pow = self.do_power(master, target, master_imagination, target_imagination)
 		pow *= (1 - self.resistance(master, target, master_imagination, target_imagination))
 		return pow
 
@@ -2925,7 +2925,7 @@ class PhantasmalGate(Spell):
 
 		with ghost.save_relative_vitals():
 			ghost.xl = max(1, rand_round(master.xl * (1 - (1 + master.int ** 0.5) ** -0.5)))
-			base = master.int * (2/3)
+			base = master.int
 			ghost.base_str = max(5, rand_round(base * opts.get('str_k', 1 / 1.5)))
 			ghost.base_int = max(5, rand_round(base * opts.get('int_k', 1 / 1.5)))
 			ghost.base_dex = max(5, rand_round(base * opts.get('dex_k', 1 / 1.5)))
@@ -4538,8 +4538,7 @@ class Weapon(Living):
 
 	def __init__(self):
 		Living.__init__(self)
-		self.owner = None
-		self.ammos = []
+		self.owner, self.ammos = None, []
 
 	def __getstate__(self):
 		return {k: v for k, v in super().__getstate__().items() if k not in (
@@ -7308,7 +7307,13 @@ class Shop(NonCombatMode):
 	def reference_enemy(self):
 		return FixedLevels.level(self.game.next_level).reference()
 
+	class RenderContext:
+		def __init__(self):
+			self.lines_taken = 0
+
 	def do_render(self, lines, cmds):
+		ctx = self.RenderContext()
+		start_lines = len(lines)
 		lines.append(f"МАГАЗИН{self.game.marks(lspace=True)}")
 		lines.append(f"Золото: {self.game.gold_str()}")
 		desc = [self.player.living_desc(for_multipad=True)]
@@ -7336,13 +7341,13 @@ class Shop(NonCombatMode):
 			if up.allow(target) and self.game.enough_gold_for(gold_cost):
 				cmd = up.cmd() + '+'
 				cmd_list.append('+' if cmd_list else cmd)
-				cmds.add(cmd, lambda: self.buy_upgrade(target, up), '?', lambda: self.more(self.imagine(up(), True) or "Нет дополнительной информации."))
+				cmds.add(cmd, lambda: self.buy_upgrade(target, up, ctx), '?', lambda: self.more(self.imagine(up(), True)[0] or "Нет дополнительной информации."))
 
 			last = up.last(target)
 			if last:
 				cmd = up.cmd() + '-'
 				cmd_list.append('-' if cmd_list else cmd)
-				cmds.add(cmd, lambda: self.sell_upgrade(target, last), '?', lambda: self.more(self.imagine(last, False) or "Нет дополнительной информации."))
+				cmds.add(cmd, lambda: self.sell_upgrade(target, last, ctx), '?', lambda: self.more(self.imagine(last, False)[0] or "Нет дополнительной информации."))
 
 			line += "[cmds]"
 			if cmd_list: line += "(" + ", ".join(cmd_list) + ")"
@@ -7368,6 +7373,7 @@ class Shop(NonCombatMode):
 
 		lines.append("\nВернуться в лагерь (quit)")
 		cmds.add('quit', lambda: self.switch_to(Respite(self.game)), '?', lambda: self.more("Вернуться в лагерь."))
+		ctx.lines_taken = len(lines) - start_lines
 
 	def imagine(self, up, add):
 		imagination = Imagination()
@@ -7378,7 +7384,7 @@ class Shop(NonCombatMode):
 		def imagine_part(preface, cb):
 			now = str(cb(None))
 			then = str(cb(imagination))
-			if now != then: lines.append("{}: [present]{} [arrow]-> [future]{}.".format(preface, now, then))
+			if now != then: lines.append("{}: [present]{}[/present] -> [future]{}.".format(preface, now, then))
 
 		if isinstance(up, StrUpgrade):
 			imagine_part("Макс. HP", lambda imagination: self.player.calculate_mhp(imagination))
@@ -7434,9 +7440,9 @@ class Shop(NonCombatMode):
 					lines.append("На {} ({} AC): {:.0%}/-{} AC.".format(sandbagged.name.accusative, sandbagged.ac,
 						1 - sp.resistance(self.player, sandbagged, imagination), round(sp.ac_malus(self.player, sandbagged, None, imagination))))
 
-		return "\n".join(multipad(lines))
+		return "\n".join(multipad(lines)), len(lines)
 
-	def buy_upgrade(self, target, up_cls):
+	def buy_upgrade(self, target, up_cls, ctx):
 		up = up_cls()
 		gold = up.gold_cost(target)
 		def confirmed(mode):
@@ -7444,17 +7450,24 @@ class Shop(NonCombatMode):
 			up.apply(target)
 			if not self.log.something_new: self.player.note(lambda sink: sink.you == self.player and f"Апгрейд приобретён за ${gold}.")
 			self.check_for_pending_notes(extra_reverts=1)
-		self.yes_no("{} ${}. Продолжить?".format(up.cost_preface(target), gold), confirmed, default=1)
 
-	def sell_upgrade(self, target, up):
+		im, im_lines = self.imagine(up_cls(), True)
+		if im and ctx.lines_taken + im_lines + 5 + (1 if im_lines > 1 else 0) >= self.term_height: im = None
+		msg = (im + "\n" + ("\n" if im_lines > 1 else "") if im else "") + "{} ${}. Продолжить?".format(up.cost_preface(target), gold)
+		self.yes_no(msg, confirmed, default=1)
+
+	def sell_upgrade(self, target, up, ctx):
 		gold = up.refund()
 		def confirmed(mode):
 			up.revert(target)
 			if not self.log.something_new: self.player.note(lambda sink: sink.you == self.player and f"Апгрейд продан за ${gold}.")
 			self.game.give_gold(gold)
 			self.check_for_pending_notes(extra_reverts=1)
-		self.yes_no("В обмен на {} вы получите ${}. Продолжить?".format(up.sell_accusative(target), gold),
-			confirmed, default=1)
+
+		im, im_lines = self.imagine(up, False)
+		if im and ctx.lines_taken + im_lines + 5 + (1 if im_lines > 1 else 0) >= self.term_height: im = None
+		msg = (im + "\n" + ("\n" if im_lines > 1 else "") if im else "") + "В обмен на {} вы получите ${}. Продолжить?".format(up.sell_accusative(target), gold)
+		self.yes_no(msg, confirmed, default=1)
 
 class ArenaEntrance(GameMode):
 	prev_mode = True
@@ -7843,10 +7856,8 @@ class ArenaView(GameMode):
 		super().__init__(game)
 		self.arena = arena
 		self.on_leave = on_leave
-		self.awaiting_decision = False
-		self.player_ai = None
-		self.atb_maximum = None
-		self.outcome = None
+		self.awaiting_decision = self.your_turn_announced = self.okay_to_skip_turns = False
+		self.player_ai = self.atb_maximum = self.outcome = self.prev_target = self.death_message = None
 
 		def receive_note(msg):
 			if self.player.alive:
@@ -7858,15 +7869,10 @@ class ArenaView(GameMode):
 
 		self.log = self.MessageLog()
 		self.sink = MessageSink(self.player, receive_note)
-		self.log_lines = None
-		self.log_area_height = None
+		self.log_lines = self.log_area_height = self.start_log_at = None
 		self.current_player_turn = -1
 		self.your_turn_announced = False
-		self.start_log_at = None
 		self.do_prompt = True
-		self.death_message = None
-		self.okay_to_skip_turns = False
-		self.prev_target = None
 
 	def do_activate(self):
 		self.player_ai = check(self.arena.as_battler(self.player).ai, lambda player_ai: isinstance(player_ai, PlayerAI), "player_ai")
@@ -8687,22 +8693,22 @@ class BattleResults(NonCombatMode):
 				if performance.unarmed.attacks + performance.melee.attacks == total:
 					modify_score(+30, "Вы сражались только врукопашную.")
 				elif performance.melee.attacks + performance.ranged.attacks == total:
-					modify_score(+20, "Вы сражались только оружием.")
+					modify_score(+30, "Вы сражались только оружием.")
 				elif performance.magical.attacks == total:
-					modify_score(+25, "Вы сражались только магией.")
+					modify_score(+30, "Вы сражались только магией.")
 				elif (total >= 6 and total_weight and
 					(performance.unarmed.attacks + performance.melee.attacks) / total + (performance.unarmed.weight + performance.melee.weight) / total_weight > 1.6):
 					modify_score(+20, "Вы сражались почти только врукопашную.")
 				elif (total >= 6 and total_weight and
 					(performance.melee.attacks + performance.ranged.attacks) / total + (performance.melee.weight + performance.ranged.weight) / total_weight > 1.6):
-					modify_score(+10, "Вы сражались почти только оружием.")
+					modify_score(+20, "Вы сражались почти только оружием.")
 				elif (total >= 6 and total_weight and
 					(performance.magical.attacks) / total + (performance.magical.weight) / total_weight > 1.6):
-					modify_score(+15, "Вы сражались почти только магией.")
+					modify_score(+20, "Вы сражались почти только магией.")
 
 			if (self.player.hp < self.player.mhp and (self.player.hp <= 2 or self.player.hp <= round(self.player.mhp * 0.15))
 				and performance.starting_hp_percent > 0.5):
-				modify_score(-clamp(round(0.9 * self.player.mhp / (self.player.hp or 1)), 5, 15), "Вы едва уцелели.")
+				modify_score(-clamp(round(self.player.mhp / (self.player.hp or 1)), 5, 15), "Вы едва уцелели.")
 
 			if performance.escapes:
 				modify_score(
