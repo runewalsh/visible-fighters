@@ -3118,7 +3118,6 @@ class DrainXP(ResistibleSpell):
 		return ("Это может снизить ваш уровень. Если вы задействовали больше очков умений, чем позволяет новый уровень, "
 			"вы будете терять апгрейды в порядке, обратном порядку приобретения.\n" + super().do_help(master, target, arena, game, mode))
 
-
 	def do_dodged(self, master, target, arena, chance, roll):
 		arena.note(lambda sink: sink.youify("{Вы/F} пытает{есь/ся} высосать", master) + sink.youify(" {вас/F:A}, но {вы/он/она/оно} не поддаёт{есь/ся}.", target))
 
@@ -3137,8 +3136,7 @@ class SpellUpgrade(FighterUpgrade):
 	SPELL_CLASS = Spell
 	def __init__(self):
 		super().__init__()
-		self.spell = None
-		self.applied = None
+		self.spell = self.applied = None
 
 	def do_apply(self, target):
 		assert not self.spell
@@ -7417,7 +7415,7 @@ class Shop(NonCombatMode):
 					lambda imagination: "{:.0%}".format(1 - sandbagged.unarmed.beam(sandbagged, None, target_imagination=imagination).hit_chance()))
 			if sandbagged.weapon:
 				imagine_part("Уклонение от {}".format(sandbagged.name.genitive) + (" (" + sandbagged.weapon.name + ")" if sandbagged.unarmed else ""),
-					lambda imagination: "{:.0%}".format(sandbagged.weapon.melee_beam(sandbagged, None, target_imagination=imagination).hit_chance()))
+					lambda imagination: "{:.0%}".format(1 - sandbagged.weapon.melee_beam(sandbagged, None, target_imagination=imagination).hit_chance()))
 
 		elif isinstance(up, IncendiaryAmmunitionUpgrade):
 			def imagine_incendiary(imagination):
