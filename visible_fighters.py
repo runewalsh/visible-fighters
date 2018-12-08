@@ -16,7 +16,7 @@ from itertools import accumulate, count as infinite_range
 from unittest import TestCase, TestSuite, TextTestRunner, defaultTestLoader
 from warnings import warn, catch_warnings
 from traceback import format_exc
-app_version, save_version, HoF_version = (1, "01"), 1, 1
+app_version, save_version, HoF_version = (1, "02"), 1, 1
 TRACEBACKS = False
 
 # FORMAT_RAW не хранит эти настройки в сжатом потоке, поэтому для распаковки нужно указать те же, которыми упаковывались.
@@ -7412,10 +7412,10 @@ class Shop(NonCombatMode):
 					("/{:.0%}".format(self.player.weapon.shot_beam(sandbagged, None, None, master_imagination=imagination).hit_chance()) if has_shot else ""))
 			if sandbagged.unarmed:
 				imagine_part("Уклонение от {}".format(sandbagged.name.genitive),
-					lambda imagination: "{:.0%}".format(1 - sandbagged.unarmed.beam(sandbagged, None, target_imagination=imagination).hit_chance()))
+					lambda imagination: "{:.0%}".format(1 - sandbagged.unarmed.beam(self.player, None, target_imagination=imagination).hit_chance()))
 			if sandbagged.weapon:
 				imagine_part("Уклонение от {}".format(sandbagged.name.genitive) + (" (" + sandbagged.weapon.name + ")" if sandbagged.unarmed else ""),
-					lambda imagination: "{:.0%}".format(1 - sandbagged.weapon.melee_beam(sandbagged, None, target_imagination=imagination).hit_chance()))
+					lambda imagination: "{:.0%}".format(1 - sandbagged.weapon.melee_beam(self.player, None, target_imagination=imagination).hit_chance()))
 
 		elif isinstance(up, IncendiaryAmmunitionUpgrade):
 			def imagine_incendiary(imagination):
@@ -8567,17 +8567,21 @@ class InBattleBattlerDetail(GameMode):
 
 		if self.av.arena.are_enemies(self.player, fighter):
 			dispell = next((sp for sp in self.player.spells if isinstance(sp, Dispell)), None)
-			if dispell and Dispell.valid_target(self.player, fighter, self.av.arena):
-				if fighter.dispellable:
+			if dispell:
+				if Dispell.valid_target(self.player, fighter, self.av.arena):
 					if fighter.transient: lines.append("Также вы можете его развеять.")
 					else: lines.append("Вы можете развеять это существо.")
 				elif fighter.transient:
-					if fighter.summoned: lines.append("Тем не менее, развеять его нельзя.")
+					lines.append("Тем не менее, развеять его нельзя.")
 		if summ_start_line != len(lines): lines.append("")
 
-		if not hexes_desc and not abil_desc and not stats_part:
-			lines.append("Это вы." if fighter == self.player else "На " + fighter.name.accusative + " не действует никаких эффектов.")
-			lines.append("")
+		start_line = len(lines)
+		if fighter == self.player:
+			lines.append("Это вы.")
+		elif not hexes_desc and not abil_desc and not stats_part:
+			lines.append("На " + fighter.name.accusative + " не действует никаких эффектов.")
+		if start_line != len(lines): lines.append("")
+
 		lines.append("назад (<enter>)")
 
 	def do_handle_command(self, cmd):
